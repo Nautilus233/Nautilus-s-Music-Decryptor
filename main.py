@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import runpy
 import sys
 from pathlib import Path
@@ -63,6 +64,19 @@ def run_cli(paths, args) -> int:
         config.settings.quality = args.quality
     if args.no_fallback:
         config.settings.enable_fallback = False
+    links: list[str] = []
+    if args.links:
+        links += [x for x in re.split(r"[,\n;]+", args.links) if x.strip()]
+    if args.links_file:
+        try:
+            links += [l.strip() for l in Path(args.links_file).read_text("utf-8").splitlines()
+                      if l.strip()]
+        except OSError as exc:
+            print(f"读取补链文件失败：{exc}")
+            return 2
+    if links:
+        config.settings.manual_links = links
+        print(f"已载入 {len(links)} 条手动补链（将优先使用）")
 
     targets: list[str] = []
     for raw in paths:
@@ -106,6 +120,8 @@ def main(argv=None) -> int:
     parser.add_argument("--selftest", action="store_true", help="运行自检")
     parser.add_argument("--check-qt", action="store_true", help="自检：加载 Qt 并打印版本后退出")
     parser.add_argument("--check-ui", action="store_true", help="自检：校验主窗口与设置弹窗的屏幕自适应")
+    parser.add_argument("--links", help="手动补链：直链或本地路径（逗号/换行分隔），优先于自动音源")
+    parser.add_argument("--links-file", help="从文本文件读取补链（每行一条）")
     parser.add_argument("--sources-report", action="store_true",
                         help="打印音源清单与健康统计后退出")
     args = parser.parse_args(argv)

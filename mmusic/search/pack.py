@@ -23,7 +23,7 @@ from pathlib import Path
 
 __all__ = [
     "ALLOWED_KINDS", "KNOWN_IMPLS", "DEFAULT_ORDER", "PackError", "SourceSpec",
-    "BUILTIN_PACK", "builtin_specs", "load_pack", "load_user_pack",
+    "BUILTIN_PACK", "all_specs", "builtin_specs", "load_pack", "load_user_pack",
     "validate_spec", "validate_pack", "pack_summary",
 ]
 
@@ -32,14 +32,20 @@ __all__ = [
 # ---------------------------------------------------------------------------
 ALLOWED_KINDS = ("adapter", "json_api", "html_scrape", "template_url", "local")
 # P0 只存在这些内置实现；P2 起 json_api/html_scrape/template_url 由通用引擎驱动
-KNOWN_IMPLS = ("kuwo", "kugou", "aggregator", "local")
+KNOWN_IMPLS = ("kuwo", "kugou", "aggregator", "local",
+               "wikimedia", "internet_archive", "manual")
 SPEC_FIELDS = frozenset({
     "id", "label", "kind", "impl", "enabled_by_default", "offline",
     "home", "license_note", "params", "rate_limit", "min_app_version",
 })
 #: sources are tried in this order unless the user reorders them
-DEFAULT_ORDER = ("local", "kuwo", "kugou", "aggregator")
+# 顺序 = 命中概率 × 稳定性：先本地、再中文主流平台、再聚合通道，
+# 最后才是 CC/PD 开放库（它们覆盖"冷门/古典/现场"，但通常不带流行曲）
+DEFAULT_ORDER = ("local", "kuwo", "kugou", "aggregator",
+                 "wikimedia", "internet_archive")
 _ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
+#: 旧版本写死的默认音源名单（用于识别"这份配置其实没被用户改过"）
+_LEGACY_DEFAULT_ORDER = ["local", "kuwo", "kugou", "aggregator"]
 _HTTPS_RE = re.compile(r"^https://[^\s]+$")
 
 
@@ -129,6 +135,11 @@ def validate_spec(raw: object, *, where: str = "spec") -> SourceSpec:
     params = raw.get("params") or {}
     if not isinstance(params, dict):
         raise PackError(f"{where}: params 必须是对象")
+    if params.get("link_regex"):
+        try:
+            re.compile(str(params["link_regex"]))
+        except re.error as exc:
+            raise PackError(f"{where}: params.link_regex 不是合法正则（{exc}）") from exc
 
     return SourceSpec(
         id=sid, label=label, kind=kind, impl=impl or sid,
@@ -181,6 +192,32 @@ BUILTIN_PACK: tuple[SourceSpec, ...] = (
                enabled_by_default=True, home="https://music-api.gdstudio.xyz/",
                license_note="公共聚合网关，地址可由用户改为自建",
                rate_limit={"per_host_rps": 1.0, "burst": 2}),
+    # 注：html_scrape（纯数据、零代码）的**示范**放在本文件顶部的 docstring 与
+    # docs/备用资源获取模块-改进方案.md 里，不放进内置清单 —— 演示条目一旦被
+    # 配置"显式列出"就会被当成真源，每次兜底白请求一次。需要时用用户清单加回：
+    #   {"id": "example_open_audio", "label": "示例站点", "kind": "html_scrape",
+    #    "params": {"search_url": "https://example.org/search?q={query}",
+    #               "link_regex": "/track/(?P<id>[A-Za-z0-9_-]+)"}}
+    # 同一个聚合网关的另一个通道（实测可用）：多一条通道就多一片曲库
+    # 注：GDStudio 网关的 JOOX 通道（provider=joox）实测**能检索但取不到直链**
+    # （url 恒为空）。它取不到文件却会把候选塞进池子、影响跨平台时长参考值，
+    # 因此不放进内置清单。若该通道以后恢复，用用户清单一行即可加回：
+    #   {"id": "aggregator_joox", "label": "聚合(JOOX)", "kind": "adapter",
+    #    "impl": "aggregator", "params": {"provider": "joox"}}
+    # 开放、免 key、允许自动化访问的两个 CC/PD 库：补"冷门/古典/现场"的覆盖
+    SourceSpec(id="wikimedia", label="维基共享(CC/PD)", kind="adapter", impl="wikimedia",
+               enabled_by_default=True, home="https://commons.wikimedia.org/",
+               license_note="Wikimedia Commons：CC / 公有领域，开放 MediaWiki API",
+               rate_limit={"per_host_rps": 0.5, "burst": 1}),
+    SourceSpec(id="internet_archive", label="互联网档案馆(PD/CC)", kind="adapter",
+               impl="internet_archive", enabled_by_default=True,
+               home="https://archive.org/",
+               license_note="Internet Archive：公有领域 / CC，开放检索 API，附官方时长",
+               rate_limit={"per_host_rps": 0.5, "burst": 1}),
+    # 人工补链：只有在用户填了链接（settings.manual_links）时才会被启用
+    SourceSpec(id="manual", label="手动补链", kind="adapter", impl="manual",
+               enabled_by_default=False, offline=True,
+               license_note="用户自行提供的直链或本地文件，仅用于本人合法持有的资源"),
 )
 
 
@@ -224,12 +261,35 @@ def load_pack(settings: "dict | None" = None) -> list[SourceSpec]:
         by_id[spec.id] = spec
 
     requested = settings.get("sources")
+    # 迁移：v1.0.13 及更早版本会把一份写死的四源名单存进 settings.json。
+    # 那**不是**用户的选择，而是旧默认值 —— 若原样当真，新加入的音源永远进不来。
+    # 只有"恰好等于旧默认值"的名单才被忽略；其它任何名单都视为用户显式指定。
+    if requested and [str(n) for n in requested] == _LEGACY_DEFAULT_ORDER:
+        requested = None
     if requested:
         order = [str(n) for n in requested]
     else:
         order = list(DEFAULT_ORDER)
         order += [s.id for s in user if s.enabled_by_default and s.id not in order]
+    # 用户填了补链就优先用它（显式意图优先于任何自动源）
+    if settings.get("manual_links") and "manual" not in order:
+        order = ["manual"] + list(order)
     return [by_id[n] for n in order if n in by_id]
+
+
+def all_specs(settings: "dict | None" = None) -> list[SourceSpec]:
+    """**所有可选**的源条目（内置 + 用户清单），不排序、不筛选。
+
+    与 :func:`load_pack` 的区别：load_pack 返回"实际生效的链路"，
+    这里返回"可选清单" —— 设置界面需要把**默认关闭**的源也列出来
+    （例如只能检索、取不到直链的 JOOX 通道）。
+    """
+    settings = settings or {}
+    by_id = {spec.id: spec for spec in builtin_specs()}
+    user, _problems = load_user_pack(settings.get("source_pack_path"))
+    for spec in user:
+        by_id[spec.id] = spec
+    return list(by_id.values())
 
 
 def pack_summary(specs: "list[SourceSpec]") -> str:

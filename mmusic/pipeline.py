@@ -22,23 +22,26 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .config import default_config_dir
+from .crypto.kwm import KwmDecoder
 from .crypto.ncm import NcmDecoder
 from .crypto.qmc import QmcDecoder
-from .downloader import validate
+from .downloader import check_completeness, validate
 from .duration import TOL_ABS, TOL_REL, audio_duration, consensus, format_seconds
 from .errors import (CancelledError, DecryptionFailedError, MusicDecryptorError,
                      NeedsOnlineError, NetworkError, SearchNoResultError,
                      UnsupportedFormatError)
 from .hashcache import HashCache
-from .match import (filename_query, parse_song_filename_candidates,
+from .match import (best_reading_match, filename_query, parse_song_filename_candidates,
                     rank_tracks_multi, reading_scores, split_originals,
-                    title_match_score, version_markers)
+                    version_markers)
 from .metadata import write_tags
 from .model import AudioResult, Track
 from .net import HttpClient
 from .search.fusion import (collapse_duplicates, dedupe_key,
                             mark_low_confidence)
 from .search.index import ResourceIndex
+from .search.query import MAX_PER_SOURCE as MAX_VARIANTS_PER_SOURCE
+from .search.query import expand as expand_query
 from .search.registry import build_sources
 from .sniff import sniff_path
 from .utils import sha256_file
@@ -47,6 +50,7 @@ _UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 
 MIN_ACCEPT = 0.34          # 低于此分不进入下载候选池
 MIN_TITLE_SIMILARITY = 0.60  # 歌名字段硬门槛：歌名不像就直接淘汰（"同歌手另一首"不许混进来）
+MIN_ARTIST_SIMILARITY = 0.60  # 歌手字段硬门槛：同名翻唱/不同演唱者一律淘汰
 MIN_TRACK_SECONDS = 45.0     # 实测时长下限：低于此秒数视为试听片段/前奏，不是完整原曲
 EARLY_STOP_SCORE = 0.95    # 已拿到高置信度原曲（歌名+歌手几乎完全一致）就不再打扰其它音源
 MAX_DOWNLOADS = 6          # 单文件最多尝试的下载次数（按分数从高到低顺延）
@@ -230,6 +234,12 @@ class Pipeline:
             if fmt.kind == "plain":
                 result = AudioResult(audio=p.read_bytes(), ext=fmt.out_ext)
                 mode = "plain"
+            elif fmt.kind == "kwm":
+                self._log(f"🔧 离线解密 KWM：{name}")
+                result = KwmDecoder(p.read_bytes()).decode()
+                if not result.meta.get("audio_sniffed", True):
+                    self._log(f"    ⚠ {name}：KWM 解出的音频头无法识别（文件可能不完整）")
+                mode = "offline"
             elif fmt.kind == "ncm":
                 self._log(f"🔧 离线解密 NCM：{name}")
                 result = NcmDecoder(p.read_bytes()).decode()
@@ -320,51 +330,29 @@ class Pipeline:
         index = self.index
         pool: list[Track] = []          # 跨音源的"干净"候选池
         dropped_total = 0
+        dropped_artist = 0
+
+        # P3：查询扩展 —— 同一首歌多试几种写法，冷门/名字怪异的曲子命中率明显更高
+        variants = expand_query(query, readings)
+        if len(variants) > 1:
+            self._log("  · 检索变体：" + " / ".join(f"{v.reason}「{v.text}」" for v in variants))
 
         for source in self.sources:
             if self._cancel:
                 raise CancelledError("已取消")
-            # 负缓存：近期该源对这个查询已经确认无结果/出错，就别再打扰它
-            blocked = index.query_block_reason(query, source.name)
-            if blocked:
-                self._log(f"  · [{source.label}] 已跳过（{blocked}，负缓存内）")
+            kept: "list[Track]" = []
+            for variant in variants[:MAX_VARIANTS_PER_SOURCE]:
+                kept, off_title_n, off_artist_n, dropped_ver = self._search_and_gate(
+                    source, variant, readings, requested)
+                dropped_total += dropped_ver
+                dropped_artist += off_artist_n
+                if kept:
+                    if variant is not variants[0]:
+                        self._log(f"  · [{source.label}] ✅ 命中于检索变体「{variant.reason}」")
+                    break
+            if not kept:
                 continue
-            started = time.monotonic()
-            try:
-                tracks = source.search(query, quality=self.settings.quality, limit=8)
-            except MusicDecryptorError as exc:
-                index.note_search(source.name, query, found=False, error=True,
-                                  seconds=time.monotonic() - started)
-                self._log(f"  · [{source.label}] 搜索不可用：{exc.message}")
-                continue
-            index.note_search(source.name, query, found=bool(tracks),
-                              seconds=time.monotonic() - started)
-            tracks = [t for t in tracks if t.title]
-            if not tracks:
-                self._log(f"  · [{source.label}] 无结果")
-                continue
-
-            # 强制过滤：排除伴奏 / 纯器乐 / 现场 / 改编版（除非用户在文件名里点名要）
-            if not requested:
-                originals, dropped = split_originals(tracks)
-                if dropped:
-                    dropped_total += len(dropped)
-                    sample = "、".join(f"“{t.title}”" for t, _m in dropped[:3])
-                    self._log(f"  · [{source.label}] 已排除 {len(dropped)} 个伴奏/改编版本：{sample}")
-                tracks = originals
-                if not tracks:
-                    self._log(f"  · [{source.label}] 无原曲（返回结果均为伴奏/改编版）")
-                    continue
-
-            # 歌名字段硬门槛
-            off_title = [t for t in tracks if title_match_score(readings, t) < MIN_TITLE_SIMILARITY]
-            if off_title:
-                self._log(f"  · [{source.label}] 已排除 {len(off_title)} 个歌名不符的结果："
-                          + "、".join(f"“{t.title}”" for t in off_title[:3]))
-                tracks = [t for t in tracks if title_match_score(readings, t) >= MIN_TITLE_SIMILARITY]
-                if not tracks:
-                    self._log(f"  · [{source.label}] 无歌名匹配的原曲")
-                    continue
+            tracks = kept
 
             rank_tracks_multi(readings, tracks, prefer_ext=self.settings.quality)
             best_t, best_a = reading_scores(readings, tracks[0],
@@ -372,12 +360,16 @@ class Pipeline:
             self._log(f"  · [{source.label}] {len(tracks)} 个原曲候选，最佳“{tracks[0].title}”"
                       f"({tracks[0].artist}) 匹配度 {tracks[0].score:.2f}"
                       f"（采用读法：歌名「{best_t}」/ 歌手「{best_a}」）")
-
-            # 不再"拿到直链就提前收工"：参考时长需要多个平台的标注来交叉印证
-            # （实测同一首歌酷我标注 2:22、酷狗标注 3:55，只信一个平台就会下到截短版）
-            pool.extend(t for t in tracks[:3] if t.score >= MIN_ACCEPT)
+            # 人工补链是用户的显式选择：连"匹配分门槛"也一并跳过
+            # （文件名/标题当然不会与查询相似，但下载校验照旧）。
+            threshold = 0.0 if getattr(source, "trusted_links", False) else MIN_ACCEPT
+            pool.extend(t for t in tracks[:3] if t.score >= threshold)
 
         if not pool:
+            if dropped_artist:
+                raise SearchNoResultError(
+                    "未找到原曲：仅找到同名但演唱者不同的版本（翻唱/翻录），已全部排除。",
+                    detail=f"已排除 {dropped_artist} 个歌手不符的候选")
             if dropped_total and not requested:
                 raise SearchNoResultError(
                     "未找到原曲，当前仅有伴奏/改编版，请确认是否需要下载。",
@@ -529,6 +521,17 @@ class Pipeline:
                 self._log(f"    - [{track.source}] 校验未通过：{v.reason}")
                 _remember(track, ok=False)
                 continue
+
+            # 完整度门禁：下载回来的东西必须真的是一整首歌
+            ok_len, why_len, got_secs = check_completeness(
+                data, reference=reference or 0.0, tolerance=tolerance,
+                min_seconds=MIN_TRACK_SECONDS, measured=track.actual_duration or 0.0)
+            if not ok_len:
+                self._log(f"    ✗ 完整度未通过：{track.source} “{track.title}” —— {why_len}")
+                _remember(track, ok=False)
+                continue
+            if got_secs:
+                track.actual_duration = track.actual_duration or got_secs
             runner = next((t for t in pool if t is not track), None)
             if runner is not None and runner.score < track.score:
                 self._log(f"  · 择优采用：{track.source} “{track.title}”({track.artist}) "
@@ -645,6 +648,76 @@ class Pipeline:
         except MusicDecryptorError as exc:
             self._log(f"❌ {name}：{exc}")
             return JobResult(str(src), name, "failed", message=exc.message, detail=exc.detail)
+
+    def _search_and_gate(self, source, variant, readings, requested):
+        """检索一个源的一个查询变体，并跑完三道门槛。
+
+        返回 ``(可用候选, 歌名淘汰数, 歌手淘汰数, 版本淘汰数)``；
+        出错 / 无结果 / 全被淘汰时返回空列表，由调用方决定是否换下一个变体。
+        """
+        index = self.index
+        text = variant.text
+        blocked = index.query_block_reason(text, source.name)
+        if blocked:
+            self._log(f"  · [{source.label}] 已跳过（{blocked}，负缓存内）")
+            return [], 0, 0, 0
+        started = time.monotonic()
+        try:
+            tracks = source.search(text, quality=self.settings.quality, limit=8)
+        except MusicDecryptorError as exc:
+            index.note_search(source.name, text, found=False, error=True,
+                              seconds=time.monotonic() - started)
+            self._log(f"  · [{source.label}] 搜索不可用：{exc.message}")
+            return [], 0, 0, 0
+        index.note_search(source.name, text, found=bool(tracks),
+                          seconds=time.monotonic() - started)
+        tracks = [t for t in tracks if t.title or t.url]
+        if not tracks:
+            self._log(f"  · [{source.label}] 无结果")
+            return [], 0, 0, 0
+
+        # 人工补链：用户显式给的链接，跳过歌名/歌手门槛（下载仍会做完整校验）
+        if getattr(source, "trusted_links", False):
+            self._log(f"  · [{source.label}] 使用你提供的链接（已跳过歌名/歌手门槛）")
+            return tracks, 0, 0, 0
+
+        dropped_ver = 0
+        # 强制过滤：排除伴奏 / 纯器乐 / 现场 / 改编版（除非用户在文件名里点名要）
+        if not requested:
+            originals, dropped = split_originals(tracks)
+            if dropped:
+                dropped_ver = len(dropped)
+                sample = "、".join(f"“{t.title}”" for t, _m in dropped[:3])
+                self._log(f"  · [{source.label}] 已排除 {len(dropped)} 个伴奏/改编版本：{sample}")
+            tracks = originals
+            if not tracks:
+                self._log(f"  · [{source.label}] 无原曲（返回结果均为伴奏/改编版）")
+                return [], 0, 0, dropped_ver
+
+        # 歌名 + 歌手硬门槛（必须**同一个读法**同时达标）
+        kept: "list[Track]" = []
+        off_artist: "list[Track]" = []
+        off_title: "list[Track]" = []
+        for cand in tracks:
+            ok, _reading, ts, as_ = best_reading_match(
+                readings, cand, min_title=MIN_TITLE_SIMILARITY,
+                min_artist=MIN_ARTIST_SIMILARITY,
+                strict_title=not requested)
+            if ok:
+                kept.append(cand)
+            elif ts >= MIN_TITLE_SIMILARITY and as_ < MIN_ARTIST_SIMILARITY:
+                off_artist.append(cand)
+            else:
+                off_title.append(cand)
+        if off_artist:
+            self._log(f"  · [{source.label}] 已排除 {len(off_artist)} 个歌手不符的结果："
+                      + "、".join(f"“{c.artist}”《{c.title}》" for c in off_artist[:3]))
+        if off_title:
+            self._log(f"  · [{source.label}] 已排除 {len(off_title)} 个歌名不符的结果："
+                      + "、".join(f"“{c.title}”" for c in off_title[:3]))
+        if not kept:
+            self._log(f"  · [{source.label}] 没有歌名与歌手同时匹配的版本")
+        return kept, len(off_title), len(off_artist), dropped_ver
 
     def _probe_durations(self, tracks: "list[Track]") -> None:
         """Resolve + measure the real length of the top candidates.

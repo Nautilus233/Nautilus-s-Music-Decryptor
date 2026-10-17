@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..match import similarity
+from ..match import similarity, split_filename_raw
 from ..model import Track
 from .base import SearchSource
 
@@ -37,10 +37,16 @@ class LocalSource(SearchSource):
                     continue
                 stem = path.stem
                 if query_l in stem.lower() or similarity(query, stem) >= 0.55:
+                    # 本地文件没有标签，只能从文件名拆（**保留括号**，否则
+                    # "伴奏/电台版"这类版本标记会被剥掉、版本过滤就失效了）：
+                    #   1) "歌手硬门槛"对本地曲库同样生效（同名翻唱会被挡掉）；
+                    #   2) 输出名 artist + " - " + title 恰好还原原始文件名。
+                    # 只有歌名的文件拆出 artist 为空 -> 不做歌手判断、不受影响。
+                    parsed_title, parsed_artist = split_filename_raw(stem)
                     results.append(Track(
                         source=self.name,
-                        title=stem,
-                        artist="",
+                        title=parsed_title or stem,
+                        artist=parsed_artist,
                         ext=path.suffix.lstrip(".").lower(),
                         size=path.stat().st_size,
                         url="",                       # filled by resolve() as a file: URI

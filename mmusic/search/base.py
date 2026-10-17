@@ -18,9 +18,13 @@ class SearchSource(ABC):
     label = "base"
     offline = False          # True for sources that never touch the network
 
-    def __init__(self, http, settings: Optional[dict] = None) -> None:
+    #: True 表示"用户显式指定"，可跳过歌名/歌手门槛（仍走下载校验）
+    trusted_links = False
+
+    def __init__(self, http, settings: Optional[dict] = None, spec=None) -> None:
         self.http = http
         self.settings = settings or {}
+        self.spec = spec
 
     @abstractmethod
     def search(self, query: str, *, quality: str = QUALITY_MP3, limit: int = 10) -> list[Track]:

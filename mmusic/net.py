@@ -40,12 +40,22 @@ class HttpClient:
                              "Accept-Encoding": "gzip"}
         if headers:
             self.base_headers.update(headers)
-        if proxy:
-            self._opener = urllib.request.build_opener(
-                urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
-        else:
-            self._opener = urllib.request.build_opener()
+        # NOTE: urllib 默认用**全局** SSL 上下文，因此必须显式装上
+        # HTTPSHandler(context=...)，否则这里的上下文根本不会被使用。
         self._ctx = ssl.create_default_context()
+        # Python 3.13+ 默认打开 VERIFY_X509_STRICT，会把一类"Basic Constraints
+        # 未标 critical"的**合法**证书直接判死（实测 archive.org 就是如此，
+        # 表现为 CERTIFICATE_VERIFY_FAILED）。链式校验与主机名校验全部保留，
+        # 只关掉这条更严格的额外检查 —— 否则会凭空失去一整个音源。
+        try:
+            self._ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT   # type: ignore[attr-defined]
+        except (AttributeError, TypeError):
+            pass
+
+        handlers: list = [urllib.request.HTTPSHandler(context=self._ctx)]
+        if proxy:
+            handlers.append(urllib.request.ProxyHandler({"http": proxy, "https": proxy}))
+        self._opener = urllib.request.build_opener(*handlers)
 
     # ------------------------------------------------------------------ #
     def _headers(self, extra: Optional[dict]) -> dict:
@@ -118,7 +128,23 @@ class HttpClient:
 
     def download(self, url: str, *, on_progress: "Callable[[int, int], None] | None" = None,
                  max_bytes: int = 200 * 1024 * 1024, headers: Optional[dict] = None,
-                 timeout: Optional[float] = None) -> bytes:
+                 timeout: Optional[float] = None, retries: "int | None" = None) -> bytes:
+        # 与 request() 一致：瞬时失败要退避重试。
+        # 实测 upload.wikimedia.org 会对突发请求返回 429，不重试就等于整条源失效。
+        attempts = self.retries if retries is None else retries
+        for attempt in range(attempts + 1):
+            try:
+                return self._download_once(url, on_progress=on_progress, max_bytes=max_bytes,
+                                           headers=headers, timeout=timeout)
+            except urllib.error.HTTPError as exc:
+                if exc.code in _RETRYABLE_STATUS and attempt < attempts:
+                    time.sleep(self._backoff(attempt))
+                    continue
+                raise NetworkError(f"下载失败 HTTP {exc.code}", detail=url) from exc
+
+    def _download_once(self, url: str, *, on_progress: "Callable[[int, int], None] | None" = None,
+                       max_bytes: int = 200 * 1024 * 1024, headers: Optional[dict] = None,
+                       timeout: Optional[float] = None) -> bytes:
         to = self.timeout if timeout is None else timeout
         req = urllib.request.Request(url, headers=self._headers(headers), method="GET")
         try:
@@ -138,6 +164,10 @@ class HttpClient:
                     if on_progress:
                         on_progress(got, total)
                 data = b"".join(chunks)
+                # 截断检测：服务端声明了长度却给少了 -> 宁可判失败也不要半个文件
+                if total and got < total:
+                    raise NetworkError("下载不完整（疑似被截断）",
+                                       detail=f"{got}/{total} bytes :: {url}")
                 if (resp.headers.get("Content-Encoding") or "").lower() == "gzip":
                     try:
                         data = gzip.decompress(data)

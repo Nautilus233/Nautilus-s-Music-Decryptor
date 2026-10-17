@@ -17,6 +17,7 @@ from mmusic.constants import QMC_ALL_EXTS
 from mmusic.paths import resource_path
 
 from . import geometry
+from .manual_links_dialog import ManualLinksDialog
 from .settings_dialog import SettingsDialog
 from .worker import DecryptWorker
 
@@ -107,6 +108,9 @@ class MainWindow(QMainWindow):
         out_row.addWidget(self.out_dir, 1)
         self.btn_out_dir = QPushButton("选择…")
         out_row.addWidget(self.btn_out_dir)
+        self.btn_manual = QPushButton("手动补链…")
+        self.btn_manual.setToolTip("所有音源都找不到时，粘贴直链或本地路径，优先使用")
+        out_row.addWidget(self.btn_manual)
         self.btn_settings = QPushButton("设置…")
         out_row.addWidget(self.btn_settings)
         outer.addLayout(out_row)
@@ -168,6 +172,7 @@ class MainWindow(QMainWindow):
         self.btn_clear.clicked.connect(self._clear)
         self.btn_out_dir.clicked.connect(self._pick_out_dir)
         self.btn_settings.clicked.connect(self._open_settings)
+        self.btn_manual.clicked.connect(self._open_manual_links)
         self.btn_start.clicked.connect(self.start_job)
         self.btn_stop.clicked.connect(self.stop_job)
 
@@ -312,6 +317,19 @@ class MainWindow(QMainWindow):
             self.config.save()
             self._load_settings_into_ui()
             self._log("⚙ 设置已保存")
+
+    def _open_manual_links(self) -> None:
+        dlg = ManualLinksDialog(self.settings.manual_links, self)
+        if not dlg.exec():
+            return
+        self.settings.manual_links = dlg.entries()
+        self.config.save()
+        n = len(self.settings.manual_links)
+        if n:
+            self._log(f"🔗 已保存 {n} 条补链；下次「开始解密」时会**优先**用它们"
+                      f"（跳过歌名/歌手门槛，其余校验照旧）")
+        else:
+            self._log("🔗 已清空补链列表")
 
     # ------------------------------------------------------------------ #
     def start_job(self) -> None:

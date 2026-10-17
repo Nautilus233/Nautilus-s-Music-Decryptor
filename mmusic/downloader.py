@@ -14,10 +14,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .duration import flac_streaminfo, mp3_frame_info
+from .duration import audio_duration, format_seconds
 from .model import Track
 from .sniff import looks_like_audio
 
-__all__ = ["ValidationResult", "validate", "mp3_info", "flac_info"]
+__all__ = ["ValidationResult", "validate", "check_completeness",
+           "mp3_info", "flac_info"]
 
 @dataclass
 class ValidationResult:
@@ -83,3 +85,31 @@ def validate(data: bytes, expected_ext: str = "", *, expected_bitrate: int = 0,
         return ValidationResult(False, ext, bitrate, size, f"码率过低（{bitrate} kbps < {min_bitrate}）")
 
     return ValidationResult(True, ext, bitrate, size, "")
+
+def check_completeness(data: bytes, *, reference: float = 0.0, tolerance: float = 0.0,
+                       min_seconds: float = 45.0, measured: float = 0.0
+                       ) -> "tuple[bool, str, float]":
+    """下载**之后**的完整度门禁：把提示音 / 试听 / 截短挡在播出门外。
+
+    返回 ``(是否通过, 原因, 实测秒数)``。
+
+    为什么必须在下载后再查一次：文件头与码率校验挡不住"这是一段 11 秒的
+    提示音"——那是酷我对未授权请求返回的东西，它本身是合法 MPEG 文件。
+    实测来源：免费接口对某首歌返回 177 KB / 11.1 秒的提示音，而同一首歌的
+    完整文件是 4.2 MB。测不出时长时不额外否决（交给上层"未比对"逻辑），
+    但只要测得出，就必须同时满足三条：不短于下限、不短于探测时测得的自身
+    时长（防止服务端"探测给好的、下载给差的"）、不短于跨平台参考时长。
+    """
+    seconds = audio_duration(data, len(data)) or 0.0
+    if not seconds:
+        return True, "", 0.0
+    if seconds < min_seconds:
+        return False, f"只有 {format_seconds(seconds)}，疑似提示音/试听片段", seconds
+    if measured and seconds < measured - 5.0:
+        return False, (f"下载结果 {format_seconds(seconds)} 短于探测时测得的 "
+                       f"{format_seconds(measured)}（服务端返回了不同文件）"), seconds
+    if reference and seconds < reference - tolerance:
+        return False, (f"下载结果 {format_seconds(seconds)} 短于参考时长 "
+                       f"{format_seconds(reference)}"), seconds
+    return True, "", seconds
+

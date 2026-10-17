@@ -20,10 +20,13 @@ class AggregatorSource(SearchSource):
     name = "aggregator"
     label = "全网聚合(MyFreeMP3)"
 
-    def __init__(self, http, settings=None) -> None:
-        super().__init__(http, settings)
-        self.base = (self.settings.get("aggregator_base") or DEFAULT_BASE).strip()
-        self.provider = (self.settings.get("aggregator_provider") or "netease").strip()
+    def __init__(self, http, settings=None, spec=None) -> None:
+        super().__init__(http, settings, spec)
+        params = dict(getattr(spec, "params", None) or {})
+        self.base = (params.get("base") or self.settings.get("aggregator_base")
+                     or DEFAULT_BASE).strip()
+        self.provider = (params.get("provider")
+                         or self.settings.get("aggregator_provider") or "netease").strip()
 
     def search(self, query: str, *, quality: str = "mp3", limit: int = 10) -> list[Track]:
         url = (f"{self.base}?types=search&source={urllib.parse.quote(self.provider)}"

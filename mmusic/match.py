@@ -8,7 +8,11 @@ from typing import Sequence
 
 from .model import Track
 
-__all__ = ["clean_text", "filename_parts", "filename_query", "has_extra_qualifier",
+__all__ = ["ARTIST_UNKNOWN", "artist_match_score", "best_reading_match",
+           "title_gate_ok",
+           "split_filename_raw",
+           "clean_text",
+           "filename_parts", "filename_query", "has_extra_qualifier",
            "is_original_version", "normalize_for_version", "original_markers",
            "parse_song_filename", "parse_song_filename_candidates",
            "rank_tracks", "rank_tracks_multi", "reading_scores",
@@ -60,6 +64,8 @@ _BLOCK_SUBSTRINGS: "tuple[str, ...]" = (
     # 人声 / 调性 / 速度类改编
     "童声版", "女声版", "男声版", "升调版", "降调版", "变速版",
     "加快版", "放慢版", "慢摇", "蹦迪", "电音版", "抖音版", "鬼畜", "恶搞",
+    "rnb", "爵士版", "摇滚版", "抒情版", "民谣版", "古风版", "加速版", "减速版",
+    "英文版", "中文版", "日语版", "粤语版", "韩语版", "电视剧", "电影版",
     # 教学 / 混剪
     "教学", "教程", "弹唱", "混剪", "混搭", "串歌",
     # 拉丁标记（多词，避免单字误伤）
@@ -175,6 +181,21 @@ def filename_parts(stem: str) -> list[str]:
     return [p.strip() for p in _SEP.split(stem) if p.strip()]
 
 
+def split_filename_raw(stem: str) -> "tuple[str, str]":
+    """把文件名拆成 ``(歌名, 歌手)``，**保留括号等修饰**。
+
+    与 :func:`parse_song_filename` 的关键区别：不做 ``clean_text`` 的去噪，
+    所以「晴天 - 周杰伦 (KTV版伴奏)」会得到歌名「周杰伦 (KTV版伴奏)」——
+    版本过滤（伴奏/电台版…）依赖这些字样，剥掉它们等于把过滤能力关掉。
+    取「第一段=歌手、最后一段=歌名」，这正是本地曲库最常见的命名习惯；
+    只有歌名时返回 ``(stem, "")``，即不提供歌手信息。
+    """
+    parts = [p.strip() for p in _SEP.split(stem or "") if p.strip()]
+    if len(parts) >= 2:
+        return parts[-1], parts[0]
+    return (stem or "").strip(), ""
+
+
 def parse_song_filename_candidates(stem: str) -> list[tuple[str, str]]:
     """Every plausible ``(title, artist)`` reading of a filename stem.
 
@@ -274,6 +295,134 @@ def title_match_score(readings: "Sequence[tuple[str, str]]", track: Track) -> fl
         else:
             best = max(best, similarity(want, track.title))
     return best
+
+
+# 平台常见"没有歌手信息"的写法 —— 这种情况不能拿来淘汰候选
+ARTIST_UNKNOWN = frozenset({
+    "", "未知", "未知艺术家", "未知歌手", "群星", "va", "various artists",
+    "unknown", "unknown artist", "n/a", "na", "无", "不详", "佚名",
+})
+_ARTIST_SEP = re.compile(r"[、,;，；/\\&＋+|]|\sfeat\.?\s|\sft\.?\s|\swith\s")
+_CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
+_LATIN_RE = re.compile(r"[A-Za-z]")
+
+
+def _script_class(text: str) -> str:
+    cjk, latin = bool(_CJK_RE.search(text)), bool(_LATIN_RE.search(text))
+    if cjk and latin:
+        return "mixed"
+    return "cjk" if cjk else ("latin" if latin else "")
+
+
+def _artist_tokens(text: str) -> set:
+    norm = normalize_for_version(text)
+    return {p.strip() for p in _ARTIST_SEP.split(norm) if p and p.strip()}
+
+
+def artist_match_score(readings: "Sequence[tuple[str, str]]", track: Track) -> float:
+    """歌手字段匹配分（与歌名门槛同级使用）。
+
+    返回 1.0 表示"通过或不作判断"，越低越可疑：
+
+    * 候选没有歌手信息（空 / 未知 / 群星）-> 1.0（无法判定，不作为淘汰理由）
+    * 文件名/标签没给出歌手 -> 1.0
+    * 一边只有中文、一边只有拉丁（如「周杰伦」vs「Jay Chou」）-> **不匹配**
+      （强约束：确认不了就不下载；想让英文写法通过，请在文件名里补上该写法）
+    * 多歌手串里有同一个人（「周杰伦/费玉清」对「周杰伦」）-> 0.85
+    * 其余按相似度打分；**不同演唱者的同名版本（翻唱）会得到接近 0 的分数**
+    """
+    cand = normalize_for_version(track.artist)
+    if cand in ARTIST_UNKNOWN:
+        return 1.0
+    want_artists = [a for _t, a in readings if a and a.strip()]
+    if not want_artists:
+        return 1.0
+
+    cand_norm = cand
+    cand_tokens = _artist_tokens(track.artist)
+    cand_script = _script_class(cand_norm)
+    best = 0.0
+    for artist in want_artists:
+        want = normalize_for_version(artist)
+        if not want or want in ARTIST_UNKNOWN:
+            continue
+        if want == cand_norm:
+            return 1.0
+        # 强约束：文字系统不同也**必须**给出一致的名字才算匹配。
+        # 这里曾经是「无法比对就不淘汰」，结果一个演唱者叫 Haohao Music 的
+        # 同名翻唱（歌名还带修饰）就被放行了。现在：确认不了，就不下载。
+        if _artist_tokens(artist) & cand_tokens:
+            best = max(best, 0.85)         # 多歌手串中的同一个人
+        elif want in cand_norm or cand_norm in want:
+            best = max(best, 0.85)
+        else:
+            best = max(best, similarity(artist, track.artist))
+    return best
+
+
+def title_gate_ok(want_title: str, want_artist: str, track: Track) -> bool:
+    """歌名是否**就是这首歌**（强约束）。
+
+    * 完全一致 -> 通过；
+    * **包含**：只允许多出来的词元都能用歌手名解释（平台常把标题写成
+      「晴天 - 周杰伦」）；多出来的是别的修饰（例如「黑色毛衣(R&B)」里的
+      r b）就判为**另一个版本**，直接淘汰；
+    * 其余（只是模糊相似）-> 不通过。
+
+    以前包含关系一律按 0.85 通过，于是一个歌名带 (R&B) 的改编版靠「包含」就过关。
+    """
+    norm_want = normalize_for_version(want_title)
+    norm_cand = normalize_for_version(track.title)
+    if not norm_want or not norm_cand:
+        return False
+    if norm_want == norm_cand:
+        return True
+    if norm_want not in norm_cand:
+        return False
+    leftover = [tok for tok in norm_cand.replace(norm_want, " ").split() if tok]
+    if not leftover:
+        return True
+    artist_tokens = _artist_tokens(want_artist) if (want_artist or "").strip() else set()
+    if not artist_tokens:
+        return False
+    return all(any(tok in a or a in tok for a in artist_tokens) for tok in leftover)
+
+
+def best_reading_match(readings: "Sequence[tuple[str, str]]", track: Track, *,
+                       min_title: float, min_artist: float, strict_title: bool = True
+                       ) -> "tuple[bool, tuple[str, str], float, float]":
+    """歌名与歌手**必须由同一个读法**同时达标。
+
+    返回 ``(是否通过, 采用/最接近的读法, 歌名分, 歌手分)``。
+
+    为什么不能用"两种读法各自取最高分"：文件名「周杰伦 - 黑色毛衣」有两种读法
+    （歌名=黑色毛衣/歌手=周杰伦，或歌名=周杰伦/歌手=黑色毛衣）。若把两种读法的
+    歌名最高分与歌手最高分拼在一起，一个演唱者字段里恰好含"黑色毛衣"字样的
+    翻唱版就会同时"命中"两边的分数而混进来。要求同一读法同时成立，
+    这种候选在两种读法下都会失败（一种错在歌手、另一种错在歌名）。
+    """
+    candidates = [(t, a) for t, a in (readings or []) if (t or "").strip() or (a or "").strip()]
+    if not candidates:
+        candidates = [("", "")]
+    best_ok = None
+    best_any = None
+    best_ok_sum = best_any_sum = -1.0
+    for want_t, want_a in candidates:
+        ts = title_match_score([(want_t, want_a)], track)
+        as_ = artist_match_score([(want_t, want_a)], track) if (want_a or "").strip() else 1.0
+        pair = ((want_t, want_a), ts, as_)
+        title_ok = (title_gate_ok(want_t, want_a, track) if strict_title
+                    else ts >= min_title)      # 用户主动点名版本时放宽歌名规则
+        if title_ok and as_ >= min_artist:
+            if ts + as_ > best_ok_sum:
+                best_ok, best_ok_sum = pair, ts + as_
+        if ts + as_ > best_any_sum:
+            best_any, best_any_sum = pair, ts + as_
+    if best_ok is not None:
+        reading, ts, as_ = best_ok
+        return True, reading, ts, as_
+    reading, ts, as_ = best_any
+    return False, reading, ts, as_
 
 
 def reading_scores(readings: Sequence[tuple[str, str]], track: Track,

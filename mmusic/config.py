@@ -18,8 +18,12 @@ def default_config_dir() -> Path:
 class Settings:
     output_dir: str = ""
     quality: str = "mp3"                                   # mp3 | flac | wav
-    sources: list = field(default_factory=lambda: ["local", "kuwo", "kugou", "aggregator"])
+    # 空列表 = 使用源清单（pack.py）的默认顺序与开关。
+    # 注意：这里**不能**写死一份名单 —— 否则每次新增音源都会被它静默排除。
+    sources: list = field(default_factory=list)
     local_dirs: list = field(default_factory=list)
+    # 手动补链：用户自行提供的直链或本地路径（不是开关，由 CLI/界面动作写入）
+    manual_links: list = field(default_factory=list)
     aggregator_base: str = "https://music-api.gdstudio.xyz/api.php"
     aggregator_provider: str = "netease"
     timeout: float = 12.0

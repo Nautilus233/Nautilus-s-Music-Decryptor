@@ -51,6 +51,16 @@ def sniff(head: bytes, tail: bytes, ext: str) -> FormatInfo:
                               trailing=trailing)
         return FormatInfo("qmc", ext, out_ext, trailing=trailing)
 
+    if ext in ("kwm", "kwd"):
+        from .crypto.kwm import is_kwm
+        if is_kwm(head):
+            return FormatInfo("kwm", ext, "mp3")
+        # 没有 kwm 魔数：少数下载其实没加密（例如裸 AAC），能认出就直接当明文
+        plain = looks_like_audio(head)
+        if plain:
+            return FormatInfo("plain", ext, plain)
+        return FormatInfo("unknown", ext, ext)
+
     audio_ext = looks_like_audio(head)
     if audio_ext:
         return FormatInfo("plain", ext or audio_ext, audio_ext)

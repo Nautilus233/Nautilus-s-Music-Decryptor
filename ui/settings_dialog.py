@@ -16,12 +16,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog,
 
 from . import geometry
 
-_SOURCE_LABELS = {
-    "local": "本地曲库（离线，优先）",
-    "kuwo": "酷我音乐",
-    "kugou": "酷狗音乐",
-    "aggregator": "全网聚合（MyFreeMP3/Netease）",
-}
+from mmusic.search.pack import all_specs, load_pack   # 源列表由清单驱动，新增源自动可见
 
 MIN_SIZE = (460, 380)
 PREFERRED_SIZE = (620, 720)
@@ -58,9 +53,12 @@ class SettingsDialog(QDialog):
         gb_src = QGroupBox("备用音源（按顺序尝试）")
         v = QVBoxLayout(gb_src)
         self.source_boxes: "dict[str, QCheckBox]" = {}
-        for name in _SOURCE_LABELS:
-            cb = QCheckBox(_SOURCE_LABELS[name])
-            self.source_boxes[name] = cb
+        self.specs = all_specs(self.settings.to_dict())
+        for spec in self.specs:
+            cb = QCheckBox(f"{spec.label}  ·  {spec.kind}")
+            if spec.license_note:
+                cb.setToolTip(spec.license_note)
+            self.source_boxes[spec.id] = cb
             v.addWidget(cb)
         body.addWidget(gb_src)
 
@@ -151,8 +149,10 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------------ #
     def _fill(self) -> None:
         s = self.settings
+        # 勾选状态直接反映"当前实际生效的源"（含清单默认开关）
+        active = {spec.id for spec in load_pack(s.to_dict())}
         for name, cb in self.source_boxes.items():
-            cb.setChecked(name in (s.sources or []))
+            cb.setChecked(name in active)
         self.timeout.setValue(float(s.timeout))
         self.retries.setValue(int(s.retries))
         self.min_bitrate.setValue(int(s.min_bitrate))

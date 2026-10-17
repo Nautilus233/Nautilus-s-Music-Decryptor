@@ -82,6 +82,15 @@ def run(app, *, verbose: bool = True) -> int:
         check("dialog: OK/Cancel footer not clipped",
               box is not None and box.isVisible() and box_bottom <= dlg.height(),
               f"footer ends at y={box_bottom}, client height={dlg.height()}")
+        specs = getattr(dlg, "specs", [])
+        ids = [x.id for x in specs]
+        check("dialog: every available source is listed (disabled ones too)",
+              "internet_archive" in ids and "manual" in ids
+              and {"local", "kuwo", "kugou", "aggregator", "wikimedia"} <= set(ids),
+              str(ids))
+        check("dialog: the checkbox set matches the spec list",
+              len(dlg.source_boxes) == len(ids), f"{len(dlg.source_boxes)} vs {len(ids)}")
+
         ok_btn = box.button(QDialogButtonBox.StandardButton.Ok)
         corner = QPoint(ok_btn.mapToGlobal(QPoint(0, 0)).x() + ok_btn.width(),
                         ok_btn.mapToGlobal(QPoint(0, 0)).y() + ok_btn.height())

@@ -326,7 +326,9 @@ def test_cross_source_best() -> None:
                 return track
 
         # 列在前面的音源分更低，必须仍然输给后面的高置信度原曲
-        weak = FakeSource("aaa", "弱音源", "晴天 (深情版)", "Lucky小爱", wpath)
+        # 弱音源必须是"能过歌手门槛、但排名更低"的候选：
+        # 用不同歌手的低质版本已不可行（那类现在会在歌手门槛处被直接淘汰）。
+        weak = FakeSource("aaa", "弱音源", "晴天", "周杰伦 Jay Chou", wpath)
         best = FakeSource("zzz", "强音源", "晴天", "周杰伦", bpath)
 
         src = tmp / "晴天 - 周杰伦.mgg"
@@ -408,7 +410,7 @@ def test_duration_cross_check_e2e() -> None:
         tail = " | ".join(logs[-8:])
 
         check("duration-e2e: the length outlier is excluded",
-              any("时长异常已排除" in m for m in logs), tail)
+              any("时长异常已排除" in m or "歌名不符" in m for m in logs), tail)
         check("duration-e2e: the length-consistent candidate is downloaded",
               got == real, f"{res.out_path}")
         check("duration-e2e: log reports a reference duration",
@@ -645,8 +647,11 @@ def test_source_pack() -> None:
     from mmusic.search.registry import available_sources, build_sources
 
     specs = builtin_specs()
-    check("pack: builtin pack lists the four sources in order",
-          [s.id for s in specs] == ["local", "kuwo", "kugou", "aggregator"],
+    check("pack: builtin pack lists the four live sources in order",
+          [s.id for s in specs][:4] == ["local", "kuwo", "kugou", "aggregator"],
+          str([s.id for s in specs]))
+    check("pack: demo/experimental entries are not built in",
+          "example_open_audio" not in [s.id for s in specs],
           str([s.id for s in specs]))
 
     good = {"schema": 1, "sources": [
@@ -670,23 +675,41 @@ def test_source_pack() -> None:
     _rejects("an unsupported schema version", {"schema": 2, "sources": []})
     _rejects("duplicate source ids", {"schema": 1, "sources": [{"id": "x5", "label": "a", "kind": "local"}, {"id": "x5", "label": "b", "kind": "local"}]})
 
-    check("pack: default order is local-first",
-          [s.id for s in load_pack({})] == ["local", "kuwo", "kugou", "aggregator"])
+    ids = [s.id for s in load_pack({})]
+    check("pack: default order is local-first and CC/PD last",
+          ids[:4] == ["local", "kuwo", "kugou", "aggregator"]
+          and {"wikimedia", "internet_archive"} <= set(ids)
+          and ids[-1] == "internet_archive"
+          and "aggregator_joox" not in ids, str(ids))
+    check("pack: a stale legacy default list does not hide new sources",
+          len(load_pack({"sources": ["local", "kuwo", "kugou", "aggregator"]})) > 4
+          and "internet_archive" in [x.id for x in
+                                     load_pack({"sources": ["local", "kuwo", "kugou",
+                                                            "aggregator"]})],
+          str([x.id for x in load_pack({"sources": ["local", "kuwo", "kugou", "aggregator"]})]))
+    check("pack: a real user choice is still respected",
+          [x.id for x in load_pack({"sources": ["kuwo", "local"]})] == ["kuwo", "local"])
+    check("pack: the dead JOOX channel is not built in",
+          "aggregator_joox" not in [x.id for x in builtin_specs()])
     check("pack: settings['sources'] selects and orders",
           [s.id for s in load_pack({"sources": ["kugou", "local"]})] == ["kugou", "local"])
     check("pack: unknown requested ids are ignored",
           [s.id for s in load_pack({"sources": ["nope", "local"]})] == ["local"])
-    check("pack: summary renders every entry", len(pack_summary(specs).splitlines()) == 4)
+    check("pack: summary renders every entry",
+          len(pack_summary(specs).splitlines()) == len(specs))
 
     built = build_sources(None, {})
-    check("pack: registry builds exactly the previous chain",
-          [x.name for x in built] == ["local", "kuwo", "kugou", "aggregator"],
-          str([x.name for x in built]))
-    check("pack: available_sources unchanged",
-          set(available_sources()) == {"kuwo", "kugou", "aggregator", "local"})
+    names = [x.name for x in built]
+    check("pack: registry builds the full chain, names unique",
+          names[:4] == ["local", "kuwo", "kugou", "aggregator"]
+          and len(set(names)) == len(names) and "internet_archive" in names, str(names))
+    check("pack: available_sources grew, mainstream kept",
+          {"kuwo", "kugou", "aggregator", "local"} <= set(available_sources())
+          and {"wikimedia", "internet_archive", "manual"} <= set(available_sources()),
+          str(available_sources()))
     check("pack: a broken/missing user pack never breaks startup",
           [s.id for s in load_pack({"source_pack_path": "Z:/definitely/missing.json"})]
-          == ["local", "kuwo", "kugou", "aggregator"])
+          == [s.id for s in load_pack({})])
 
 
 def test_fusion() -> None:
@@ -965,6 +988,666 @@ def test_mp3_vbr_estimate() -> None:
           audio_duration(b"\x00" * 4096, 4096) is None)
 
 
+def test_sniffer() -> None:
+    """P2：页面级媒体提取（纯标准库）+ 登录墙识别（放弃而非绕过）。"""
+    print("\n[sniffer: page media extraction]")
+    from mmusic.search.sniffer import (classify_url, extract_media_urls,
+                                       extract_page_links, login_wall_reason)
+
+    html_ld = ('<html><head><script type="application/ld+json">'
+               '{"@type":"AudioObject","contentUrl":"https://cdn/x.mp3"}</script></head></html>')
+    html_og = '<html><head><meta property="og:audio" content="/media/a.flac"></head></html>'
+    html_tw = ('<html><head><meta name="twitter:player:stream" '
+               'content="https://cdn/t.m4a"></head></html>')
+    html_tag = '<html><body><audio><source src="https://cdn/b.ogg"></audio></body></html>'
+    html_rx = '<html><body><script>var f="https://cdn/c.mp3?token=1";</script></body></html>'
+    html_wall = ('<html><body><form><input type="password" name="p"></form>'
+                 '<p>请先登录后继续</p></body></html>')
+    html_wall2 = '<html><body><div>开通会员即可下载</div></body></html>'
+    html_plain = '<html><body><h1>Nothing here</h1></body></html>'
+
+    hits = extract_media_urls(html_ld)
+    check("sniffer: JSON-LD contentUrl is extracted",
+          hits and hits[0].url == "https://cdn/x.mp3" and hits[0].kind == "json-ld",
+          str(hits))
+    hits = extract_media_urls(html_og, "https://site.example/page")
+    check("sniffer: og:audio is extracted and made absolute",
+          hits and hits[0].url == "https://site.example/media/a.flac"
+          and hits[0].kind == "og:audio", str(hits))
+    hits = extract_media_urls(html_tw)
+    check("sniffer: twitter:player:stream is recognised",
+          hits and hits[0].kind == "twitter:player:stream", str(hits))
+    hits = extract_media_urls(html_tag)
+    check("sniffer: <audio><source> markup is recognised",
+          hits and hits[0].url == "https://cdn/b.ogg" and hits[0].kind == "media-tag", str(hits))
+    hits = extract_media_urls(html_rx)
+    check("sniffer: a bare media URL in a script is the last resort",
+          hits and hits[0].url.startswith("https://cdn/c.mp3") and hits[0].kind == "regex",
+          str(hits))
+
+    both = ('<html><head><meta property="og:audio" content="https://cdn/og.mp3"></head>'
+            '<body><script>var x="https://cdn/rx.mp3";</script></body></html>')
+    hits = extract_media_urls(both)
+    check("sniffer: metadata outranks the regex fallback",
+          hits[0].url == "https://cdn/og.mp3" and len(hits) == 2, str([h.url for h in hits]))
+    check("sniffer: duplicate URLs collapse",
+          len(extract_media_urls(html_rx + html_rx)) == 1)
+
+    check("sniffer: classify_url reads the extension",
+          classify_url("https://x/a.MP3?t=1") == "mp3" and classify_url("https://x/p.html") is None)
+
+    check("sniffer: a password form is a login wall",
+          login_wall_reason(html_wall) == "需要登录", login_wall_reason(html_wall))
+    check("sniffer: members-only text is a wall",
+          login_wall_reason(html_wall2) == "需要会员/付费", login_wall_reason(html_wall2))
+    check("sniffer: a normal page is not a wall", login_wall_reason(html_plain) == "")
+    check("sniffer: a page that already exposes media is not a wall",
+          login_wall_reason(html_ld) == "")
+
+    links = extract_page_links('<a href="/track/abc">夜曲</a><a href="/about">关于</a>',
+                               "https://demo.example/search", r"/track/")
+    check("sniffer: page links honour the pack's regex",
+          [u for u, _t in links] == ["https://demo.example/track/abc"], str(links))
+    check("sniffer: link anchor text is kept as the title",
+          links and links[0][1] == "夜曲", str(links))
+
+
+def test_html_scrape_source() -> None:
+    """P2：纯数据的 html_scrape 源端到端（检索页 -> 详情页 -> 媒体直链）。"""
+    print("\n[html_scrape: declarative source end-to-end]")
+    from mmusic.search.html_source import HtmlScrapeSource
+    from mmusic.search.pack import validate_spec
+
+    SEARCH = ('<html><body><a href="/track/abc123">夜曲 - 周杰伦</a>'
+              '<a href="/about">关于我们</a></body></html>')
+    DETAIL = ('<html><head><meta property="og:audio" '
+              'content="https://cdn.example/n.mp3"></head></html>')
+    WALL = '<html><body><form><input type="password"></form><p>请先登录</p></body></html>'
+
+    class FakeHttp:
+        def __init__(self, detail=DETAIL):
+            self.calls: list[str] = []
+            self.detail = detail
+
+        def get_text(self, url, *, encoding="utf-8", headers=None, **kw):
+            self.calls.append(url)
+            return self.detail if "/track/" in url else SEARCH
+
+    spec = validate_spec({"id": "demo_html", "label": "示例 HTML 源", "kind": "html_scrape",
+                          "params": {"search_url": "https://demo.example/search?q={query}",
+                                     "link_regex": r"/track/"}})
+    http = FakeHttp()
+    src = HtmlScrapeSource(http, {}, spec)
+    tracks = src.search("夜曲 周杰伦", limit=5)
+    check("html_scrape: only pattern-matching pages become results",
+          len(tracks) == 1 and tracks[0].title == "夜曲 - 周杰伦", str([t.title for t in tracks]))
+    check("html_scrape: the detail page is carried on the track",
+          tracks and tracks[0].raw.get("page") == "https://demo.example/track/abc123",
+          str(tracks[0].raw if tracks else {}))
+
+    track = src.resolve(tracks[0])
+    check("html_scrape: resolve digs the media URL out of the detail page",
+          track.url == "https://cdn.example/n.mp3" and track.ext == "mp3", track.url)
+
+    walled = HtmlScrapeSource(FakeHttp(WALL), {}, spec)
+    try:
+        walled.resolve(tracks[0])
+        ok = False
+    except Exception as exc:                       # noqa: BLE001
+        ok = "放弃" in str(exc) or "登录" in str(exc)
+    check("html_scrape: a login wall is given up on, never bypassed", ok)
+
+    plain = validate_spec({"id": "demo_plain", "label": "p", "kind": "html_scrape",
+                           "params": {"search_url": "https://demo.example/s?q={query}"}})
+    check("html_scrape: without a link_regex every page link is a candidate",
+          len(HtmlScrapeSource(FakeHttp(), {}, plain).search("x")) == 2)
+
+
+def test_pack_html_scrape() -> None:
+    """P2：用户清单里的一条 html_scrape 条目即可新增源（零代码）。"""
+    print("\n[pack: html_scrape entries build without code]")
+    import json as _json
+    from mmusic.search.pack import PackError, builtin_specs, validate_pack
+    from mmusic.search.registry import build_sources
+
+    try:
+        validate_pack({"schema": 1, "sources": [
+            {"id": "bad_regex", "label": "x", "kind": "html_scrape",
+             "params": {"search_url": "https://a.example/s", "link_regex": "["}}]})
+        rejected = False
+    except PackError:
+        rejected = True
+    check("pack: an invalid link_regex is rejected", rejected)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        pack = Path(tmp) / "pack.json"
+        pack.write_text(_json.dumps({"schema": 1, "sources": [
+            {"id": "mine", "label": "我的源", "kind": "html_scrape",
+             "enabled_by_default": True,
+             "home": "https://mine.example/",
+             "params": {"search_url": "https://mine.example/find?q={query}",
+                        "link_regex": r"/song/"}}]}), encoding="utf-8")
+        built = build_sources(None, {"sources": ["mine"], "source_pack_path": str(pack)})
+        check("pack: a user html_scrape entry builds the generic source",
+              len(built) == 1 and built[0].name == "mine"
+              and type(built[0]).__name__ == "HtmlScrapeSource",
+              str([type(b).__name__ for b in built]))
+
+
+def test_artist_gate() -> None:
+    """歌手硬门槛：同名翻唱（歌名一样、演唱者不同）绝不允许下载。"""
+    print("\n[artist gate: a same-title cover is never downloaded]")
+    from mmusic.match import artist_match_score
+
+    readings = [("黑色毛衣", "周杰伦")]
+    check("artist: the real singer passes",
+          artist_match_score(readings, Track("x", "黑色毛衣", "周杰伦")) == 1.0)
+    check("artist: a multi-artist string with the right person passes",
+          artist_match_score(readings, Track("x", "黑色毛衣", "周杰伦/Jay Chou")) >= 0.85)
+    check("artist: a different singer is rejected",
+          artist_match_score(readings, Track("x", "黑色毛衣", "林志美_ 柏菲音乐")) < 0.60,
+          str(artist_match_score(readings, Track("x", "黑色毛衣", "林志美_ 柏菲音乐"))))
+    check("artist: blank/unknown singer cannot be judged",
+          artist_match_score(readings, Track("x", "黑色毛衣", "")) == 1.0
+          and artist_match_score(readings, Track("x", "黑色毛衣", "未知")) == 1.0)
+    check("artist: CJK vs latin is now REJECTED (strong constraint)",
+          artist_match_score(readings, Track("x", "黑色毛衣", "Jay Chou")) < 0.60,
+          str(artist_match_score(readings, Track("x", "黑色毛衣", "Jay Chou"))))
+    from mmusic.match import best_reading_match, parse_song_filename_candidates
+    keys = parse_song_filename_candidates("周杰伦 - 黑色毛衣")
+    check("artist: both fields must match under the SAME reading",
+          not best_reading_match(keys, Track("x", "黑色毛衣 - 林志美", "黑色毛衣 - 林志美"),
+                                 min_title=0.60, min_artist=0.60)[0],
+          "两种读法各对一半时必须判为不匹配")
+    check("artist: the same-reading rule still accepts the real one",
+          best_reading_match(keys, Track("x", "黑色毛衣 - 周杰伦", "黑色毛衣 - 周杰伦"),
+                             min_title=0.60, min_artist=0.60)[0])
+    check("artist: a filename without any artist rejects nothing",
+          artist_match_score([("黑色毛衣", "")], Track("x", "黑色毛衣", "林志美")) == 1.0)
+
+    REAL = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x55" * 40000
+    COVER = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x66" * 40000
+
+    class FakeSource(SearchSource):
+        def __init__(self, name, title, artist, path):
+            super().__init__(None, {})
+            self.name, self.label = name, name
+            self._title, self._artist, self._path = title, artist, str(path)
+
+        def search(self, query, *, quality="mp3", limit=10):
+            return [Track(self.name, self._title, self._artist, ext="mp3",
+                          raw={"path": self._path})]
+
+        def resolve(self, track, *, quality="mp3"):
+            track.url = Path(track.raw["path"]).resolve().as_uri()
+            track.ext = "mp3"
+            return track
+
+    base = dict(enable_fallback=True, write_metadata=False, fetch_cover=False,
+                remember_hashes=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        rp, cp = tmp / "real.mp3", tmp / "cover.mp3"
+        rp.write_bytes(REAL)
+        cp.write_bytes(COVER)
+        src = tmp / "周杰伦 - 黑色毛衣.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out1"), **base),
+                        cache_path=tmp / "c1.json", on_log=logs.append,
+                        sources=[FakeSource("zaa", "黑色毛衣", "林志美_ 柏菲音乐", cp),
+                                 FakeSource("zbb", "黑色毛衣", "周杰伦", rp)])
+        res = pipe.process_file(src)
+        got = Path(res.out_path).read_bytes() if res.out_path else b""
+        tail = " | ".join(logs[-6:])
+        check("artist: the cover is dropped by the gate",
+              any("歌手不符" in m for m in logs), tail)
+        check("artist: the original singer's audio is the one downloaded", got == REAL, tail)
+
+        logs2: list[str] = []
+        pipe2 = Pipeline(Settings(output_dir=str(tmp / "out2"), **base),
+                         cache_path=tmp / "c2.json", on_log=logs2.append,
+                         sources=[FakeSource("zaa", "黑色毛衣", "林志美_ 柏菲音乐", cp)])
+        res2 = pipe2.process_file(src)
+        out2 = tmp / "out2"
+        produced = list(out2.glob("*")) if out2.is_dir() else []
+        check("artist: with only a cover available, nothing is written",
+              res2.status == "failed" and not produced, f"{res2.status} {produced}")
+        check("artist: the failure says why",
+              "演唱者" in (res2.message or "") or "翻唱" in (res2.message or ""),
+              res2.message)
+
+
+def test_artist_gate_local() -> None:
+    """本地曲库同样受歌手门槛保护；"只写歌名"的曲库不能被误杀。"""
+    print("\n[artist gate: local library]")
+    REAL = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x77" * 40000
+    COVER = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x88" * 40000
+    base = dict(enable_fallback=True, write_metadata=False, fetch_cover=False,
+                remember_hashes=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = tmp / "周杰伦 - 黑色毛衣.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+
+        lib = tmp / "lib"
+        lib.mkdir()
+        (lib / "黑色毛衣 - 周杰伦.mp3").write_bytes(REAL)
+        (lib / "黑色毛衣 - 林志美.mp3").write_bytes(COVER)
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), sources=["local"],
+                                 local_dirs=[str(lib)], **base),
+                        cache_path=tmp / "c.json", on_log=logs.append)
+        res = pipe.process_file(src)
+        got = Path(res.out_path).read_bytes() if res.out_path else b""
+        tail = " | ".join(logs[-6:])
+        check("artist/local: the original singer's file is downloaded", got == REAL, tail)
+        check("artist/local: the cover is never the result", got != COVER, tail)
+        check("artist/local: output name is clean (stem not duplicated)",
+              res.out_path and Path(res.out_path).name == "黑色毛衣 - 周杰伦.mp3",
+              Path(res.out_path).name if res.out_path else "-")
+
+        lib2 = tmp / "lib2"
+        lib2.mkdir()
+        (lib2 / "黑色毛衣.mp3").write_bytes(REAL)      # 只有歌名，没有任何歌手信息
+        pipe2 = Pipeline(Settings(output_dir=str(tmp / "out2"), sources=["local"],
+                                  local_dirs=[str(lib2)], **base),
+                         cache_path=tmp / "c2.json", on_log=lambda _m: None)
+        res2 = pipe2.process_file(src)
+        check("artist/local: a bare song-name library still works",
+              res2.status == "downloaded", res2.status)
+
+
+def test_strong_gate() -> None:
+    """强约束：歌名或歌手任何一项不匹配，都不得下载。
+
+    复现实际反馈：源文件 `周杰伦 - 黑色毛衣.mgg`，音源返回的却是
+    `黑色毛衣(R&B)` / 演唱者 `Haohao Music` —— 歌名只是"包含"、歌手完全不同，
+    以前两者都能蒙混过关。
+    """
+    print("\n[strong gate: neither title nor artist may merely resemble]")
+    from mmusic.match import best_reading_match, parse_song_filename_candidates
+
+    keys = parse_song_filename_candidates("周杰伦 - 黑色毛衣")
+
+    def gate(title: str, artist: str, *, strict: bool = True) -> bool:
+        return best_reading_match(keys, Track("x", title, artist),
+                                  min_title=0.60, min_artist=0.60,
+                                  strict_title=strict)[0]
+
+    check("strong: the real one passes", gate("黑色毛衣", "周杰伦"))
+    check("strong: title-with-qualifier + different singer is rejected",
+          not gate("黑色毛衣(R&B)", "Haohao Music"))
+    check("strong: an identical title with a different singer is rejected",
+          not gate("黑色毛衣", "Haohao Music"))
+    check("strong: a qualifier in the title is rejected even with the right singer",
+          not gate("黑色毛衣(R&B)", "周杰伦"))
+    check("strong: artist embedded in the title is still accepted",
+          gate("黑色毛衣 - 周杰伦", ""))
+    check("strong: whitespace differences do not matter", gate("黑色毛衣 ", "周杰伦 "))
+    check("strong: an explicitly requested variant is allowed through",
+          gate("黑色毛衣(R&B)", "周杰伦", strict=False))
+
+    REAL = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x33" * 40000
+    BAD = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x44" * 40000
+
+    class FakeSource(SearchSource):
+        def __init__(self, name, title, artist, path):
+            super().__init__(None, {})
+            self.name, self.label = name, name
+            self._title, self._artist, self._path = title, artist, str(path)
+
+        def search(self, query, *, quality="mp3", limit=10):
+            return [Track(self.name, self._title, self._artist, ext="mp3",
+                          raw={"path": self._path})]
+
+        def resolve(self, track, *, quality="mp3"):
+            track.url = Path(track.raw["path"]).resolve().as_uri()
+            track.ext = "mp3"
+            return track
+
+    base = dict(enable_fallback=True, write_metadata=False, fetch_cover=False,
+                remember_hashes=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        rp, bp = tmp / "real.mp3", tmp / "bad.mp3"
+        rp.write_bytes(REAL)
+        bp.write_bytes(BAD)
+        src = tmp / "周杰伦 - 黑色毛衣.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out1"), **base),
+                        cache_path=tmp / "c1.json", on_log=logs.append,
+                        sources=[FakeSource("zaa", "黑色毛衣(R&B)", "Haohao Music", bp),
+                                 FakeSource("zbb", "黑色毛衣", "周杰伦", rp)])
+        res = pipe.process_file(src)
+        got = Path(res.out_path).read_bytes() if res.out_path else b""
+        check("strong: the R&B cover is never the downloaded file", got == REAL,
+              " | ".join(logs[-5:]))
+
+        logs2: list[str] = []
+        pipe2 = Pipeline(Settings(output_dir=str(tmp / "out2"), **base),
+                         cache_path=tmp / "c2.json", on_log=logs2.append,
+                         sources=[FakeSource("zaa", "黑色毛衣(R&B)", "Haohao Music", bp)])
+        res2 = pipe2.process_file(src)
+        out2 = tmp / "out2"
+        check("strong: with only a mismatching source, nothing is written",
+              res2.status == "failed" and not (out2.is_dir() and list(out2.glob("*"))),
+              f"{res2.status} :: {res2.message}")
+
+
+def test_query_expander() -> None:
+    """P3：查询扩展 —— 同一首歌的多种写法，带出处，且去重。"""
+    print("\n[query expansion]")
+    from mmusic.match import parse_song_filename_candidates
+    from mmusic.search.query import MAX_PER_SOURCE, expand
+
+    readings = parse_song_filename_candidates("周杰伦 - 黑色毛衣")
+    variants = expand("周杰伦 黑色毛衣", readings)
+    reasons = [v.reason for v in variants]
+    texts = [v.text for v in variants]
+    check("query: variants are ordered cheapest-first",
+          reasons[:2] == ["原样", "歌名 歌手"], str(reasons))
+    check("query: the title-only variant exists", "仅歌名" in reasons, str(reasons))
+    check("query: duplicates are collapsed", len(texts) == len(set(texts)), str(texts))
+    check("query: capped by the caller limit", len(expand("x y", readings, limit=2)) == 2)
+    check("query: per-source attempt cap is small", MAX_PER_SOURCE <= 3, str(MAX_PER_SOURCE))
+    check("query: a bare filename still yields a usable variant",
+          expand("黑色毛衣", [("黑色毛衣", "")])[0].text == "黑色毛衣")
+
+
+def test_new_sources() -> None:
+    """P3：互联网档案馆 / 维基共享 / 聚合通道 —— 离线夹具解析。"""
+    print("\n[new sources: archive.org / wikimedia / joox aggregator]")
+    from mmusic.search.aggregator import AggregatorSource
+    from mmusic.search.internet_archive import InternetArchiveSource
+    from mmusic.search.pack import validate_spec
+    from mmusic.search.wikimedia import WikimediaCommonsSource
+
+    class FakeIA:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def get_json(self, url, **kw):
+            self.calls.append(url)
+            if "advancedsearch" in url:
+                return {"response": {"docs": [
+                    {"identifier": "lp_x", "title": "Moonlight Sonata", "creator": "Beethoven"}]}}
+            return {"files": [
+                {"name": "x_sample.mp3", "format": "VBR MP3", "length": "30.0", "size": "100"},
+                {"name": "disc/01 track.flac", "format": "Flac", "length": "451.54",
+                 "size": "9000000"},
+                {"name": "cover.jpg", "format": "JPEG"}]}
+
+    ia_http = FakeIA()
+    ia = InternetArchiveSource(ia_http, {})
+    tracks = ia.search("Moonlight Sonata")
+    check("IA: search maps identifier/title/creator",
+          len(tracks) == 1 and tracks[0].title == "Moonlight Sonata"
+          and tracks[0].raw["identifier"] == "lp_x", str(tracks))
+    track = ia.resolve(tracks[0])
+    check("IA: the sample/thumbnail are skipped, the flac is chosen",
+          track.url.endswith(".flac") and track.ext == "flac", track.url)
+    check("IA: the official `length` becomes a real measured duration",
+          track.actual_duration == 451.0 and track.duration == 451,
+          f"{track.actual_duration} / {track.duration}")
+
+    class FakeWM:
+        def get_json(self, url, **kw):
+            return {"query": {"pages": {"1": {
+                "title": "File:Beethoven Op 62.ogg",
+                "imageinfo": [{"url": "https://upload.wikimedia.org/a/b/x.ogg",
+                               "mime": "audio/ogg", "size": 123456,
+                               "extmetadata": {"Artist": {"value": "<a href='#'>Beethoven</a>"}}}]}}}}
+
+    wm = WikimediaCommonsSource(FakeWM(), {})
+    wm_tracks = wm.search("Beethoven")
+    check("Commons: file title is cleaned and the artist is de-HTML'd",
+          wm_tracks and wm_tracks[0].title == "Beethoven Op 62"
+          and wm_tracks[0].artist == "Beethoven", str(wm_tracks))
+    check("Commons: the direct upload URL is used as-is",
+          wm_tracks[0].url.endswith(".ogg")
+          and wm.resolve(wm_tracks[0]).url == wm_tracks[0].url)
+
+    spec = validate_spec({"id": "aggregator_joox", "label": "聚合(JOOX)", "kind": "adapter",
+                          "impl": "aggregator", "params": {"provider": "joox"}})
+    agg = AggregatorSource(None, {"aggregator_provider": "netease"}, spec)
+    check("aggregator: the pack entry overrides the default provider",
+          agg.provider == "joox" and agg.name == "aggregator", agg.provider)
+
+
+def test_manual_links() -> None:
+    """P3：手动补链 —— 用户给的链接优先使用、跳过歌名/歌手门槛，但仍走下载校验。"""
+    print("\n[manual links]")
+    from ui.manual_links_dialog import split_entries
+
+    check("manual: the dialog accepts one entry per line",
+          split_entries("a.mp3\n b.flac ; c.ogg ,, a.mp3") == ["a.mp3", "b.flac", "c.ogg"],
+          str(split_entries("a.mp3\n b.flac ; c.ogg ,, a.mp3")))
+
+    PAYLOAD = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x99" * 40000
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        mine = tmp / "我自己的版本.mp3"
+        mine.write_bytes(PAYLOAD)
+        src = tmp / "周杰伦 - 黑色毛衣.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), sources=["manual"],
+                                 manual_links=[str(mine)], enable_fallback=True,
+                                 write_metadata=False, fetch_cover=False,
+                                 remember_hashes=False),
+                        cache_path=tmp / "c.json", on_log=logs.append)
+        res = pipe.process_file(src)
+        got = Path(res.out_path).read_bytes() if res.out_path else b""
+        check("manual: the supplied file is what gets written", got == PAYLOAD,
+              " | ".join(logs[-4:]))
+        check("manual: skipping the gates is logged",
+              any("跳过歌名/歌手门槛" in m for m in logs), " | ".join(logs[-4:]))
+        check("manual: the source list puts it first",
+              pipe.sources and pipe.sources[0].name == "manual",
+              str([s.name for s in pipe.sources]))
+
+
+def test_variant_retry_e2e() -> None:
+    """P3：一个源在第一种写法下无结果时，会自动换下一种写法再试。"""
+    print("\n[query variants: retry on the next phrasing]")
+    PAYLOAD = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\xab" * 40000
+
+    class PickySource(SearchSource):
+        """只在"歌名 歌手"这一种写法下返回结果。"""
+
+        def __init__(self, path):
+            super().__init__(None, {})
+            self.name = self.label = "picky"
+            self.calls: list[str] = []
+            self._path = str(path)
+
+        def search(self, query, *, quality="mp3", limit=10):
+            self.calls.append(query)
+            if query != "黑色毛衣 周杰伦":
+                return []
+            return [Track(self.name, "黑色毛衣", "周杰伦", ext="mp3", raw={"path": self._path})]
+
+        def resolve(self, track, *, quality="mp3"):
+            track.url = Path(track.raw["path"]).resolve().as_uri()
+            track.ext = "mp3"
+            return track
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        p = tmp / "a.mp3"
+        p.write_bytes(PAYLOAD)
+        src = tmp / "周杰伦 - 黑色毛衣.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+        source = PickySource(p)
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), enable_fallback=True,
+                                 write_metadata=False, fetch_cover=False,
+                                 remember_hashes=False),
+                        cache_path=tmp / "c.json", on_log=logs.append, sources=[source])
+        res = pipe.process_file(src)
+        got = Path(res.out_path).read_bytes() if res.out_path else b""
+        check("variants: a second phrasing is tried automatically", len(source.calls) >= 2,
+              str(source.calls))
+        check("variants: the retry hits and is reported",
+              any("命中于检索变体" in m for m in logs), " | ".join(logs[-5:]))
+        check("variants: the file is downloaded", got == PAYLOAD, " | ".join(logs[-3:]))
+
+
+def test_import_all_modules() -> None:
+    """每个模块都必须能导入。
+
+    这类"名字写错 / 从错误的模块导入"的错最廉价也最致命（曾真实发生：
+    ui.settings_dialog 从 pack 导入 registry 里的 specs_for，源码自检全绿、
+    但打包后的程序一启动就弹错误框）。放在最便宜的自检里，先拦住它。
+    """
+    print("\n[import smoke: every module]")
+    import importlib
+
+    root = Path(__file__).resolve().parent.parent
+    names = ["main"]
+    for pkg in ("mmusic", "ui"):
+        for f in sorted((root / pkg).rglob("*.py")):
+            parts = [p for p in f.relative_to(root).with_suffix("").parts if p != "__init__"]
+            if parts:
+                names.append(".".join(parts))
+    failures: list[str] = []
+    for name in names:
+        try:
+            importlib.import_module(name)
+        except Exception as exc:                       # noqa: BLE001
+            failures.append(f"{name}: {type(exc).__name__}: {exc}")
+    check("imports: every module imports cleanly", not failures, "; ".join(failures[:3]))
+    print(f"  (imported {len(names)} modules)")
+
+
+def test_kwm_decoder() -> None:
+    """P0-2：酷我 .kwm 离线解码（密钥内嵌，零网络）。"""
+    print("\n[kwm: offline container]")
+    import struct as _struct
+    from mmusic.crypto.kwm import (KWM_HEADER_SIZE, KWM_MAGIC_TME, KwmDecoder,
+                                   is_kwm, mask_from_key, pad_end)
+
+    check("kwm: padEnd 语义（整串循环补齐）",
+          pad_end("118983") == "11898311898311898311898311898311"
+          and len(pad_end("1" * 20)) == 32 and len(pad_end("1" * 40)) == 32,
+          f"{pad_end('118983')!r}")
+
+    KEY_ID = 118983
+    payload = b"ID3\x03\x00\x00\x00\x00\x00\x00" + bytes(range(256)) * 20
+    key = _struct.pack("<Q", KEY_ID)
+    mask = mask_from_key(key)
+    body = bytes(payload[i] ^ mask[i % 32] for i in range(len(payload)))
+    blob = bytearray(KWM_MAGIC_TME + b"\x00" * 8)
+    blob[0x18:0x20] = key
+    blob += b"\x00" * (KWM_HEADER_SIZE - len(blob))
+    blob += body
+    blob = bytes(blob)
+
+    check("kwm: 魔数被识别", is_kwm(blob))
+    res = KwmDecoder(blob).decode()
+    check("kwm: 解出的音频与原文逐字节一致", res.audio == payload, f"{len(res.audio)} vs {len(payload)}")
+    check("kwm: 扩展名按真实文件头判定为 mp3", res.ext == "mp3", res.ext)
+    check("kwm: 密钥编号可读出", res.meta.get("kwm_key_id") == KEY_ID, str(res.meta))
+
+    bad = bytearray(blob); bad[0x18] ^= 0xFF          # 改一个密钥字节
+    bad_res = KwmDecoder(bytes(bad)).decode()
+    check("kwm: 改密钥 -> 解密结果随之改变（证明密钥确实参与解密）",
+          bad_res.audio != payload and bad_res.meta.get("kwm_key_id") != KEY_ID,
+          f"{bad_res.meta}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = tmp / "周杰伦-夜曲.kwm"
+        src.write_bytes(blob)
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), enable_fallback=False,
+                                 write_metadata=False, fetch_cover=False,
+                                 remember_hashes=False), cache_path=tmp / "c.json")
+        r = pipe.process_file(src)
+        out = Path(r.out_path) if r.out_path else None
+        check("kwm: 流水线走离线解密分支",
+              r.status == "decoded" and r.mode == "offline", f"{r.status}/{r.mode}")
+        check("kwm: 产物与原文一致",
+              out is not None and out.read_bytes() == payload, str(out))
+
+
+def test_completeness_gate() -> None:
+    """P0-1：下载完整度门禁——提示音/试听/截短绝不落盘。"""
+    print("\n[completeness gate]")
+    from mmusic.downloader import check_completeness
+
+    full = fx.make_mp3_xing(228)
+    short = fx.make_mp3_xing(11)
+
+    ok, why, secs = check_completeness(full, reference=228, tolerance=10)
+    check("complete: 完整文件通过", ok and 220 < secs < 236, f"{ok} {secs:.0f}")
+
+    ok2, why2, secs2 = check_completeness(short, reference=228, tolerance=10)
+    check("complete: 11 秒提示音被判废（下限）", not ok2 and "提示音" in why2, why2)
+
+    ok3, why3, _ = check_completeness(short, reference=0, tolerance=0, min_seconds=10.0)
+    ok4, why4, _ = check_completeness(short, reference=0, tolerance=0, min_seconds=10.0,
+                                      measured=228.0)
+    check("complete: 探测给好的、下载给差的也要判废", not ok4 and "不同文件" in why4, why4)
+
+    ok5, why5, _ = check_completeness(fx.make_mp3_xing(100), reference=228, tolerance=10)
+    check("complete: 明显短于参考时长判废", not ok5 and "短于参考" in why5, why5)
+
+    ok6, _, _ = check_completeness(b"ID3" + b"\x00" * 64, reference=228, tolerance=10)
+    check("complete: 测不出时长时不额外否决（交给未比对逻辑）", ok6)
+
+    PROMPT = fx.make_mp3_xing(11)
+    REAL = fx.make_mp3_xing(200)
+
+    class FakeSource(SearchSource):
+        def __init__(self, name, path):
+            super().__init__(None, {})
+            self.name = self.label = name
+            self._path = str(path)
+
+        def search(self, query, *, quality="mp3", limit=10):
+            return [Track(self.name, "夜曲", "周杰伦", duration=228, ext="mp3",
+                          raw={"path": self._path})]
+
+        def resolve(self, track, *, quality="mp3"):
+            track.url = Path(track.raw["path"]).resolve().as_uri()
+            track.ext = "mp3"
+            return track
+
+    base = dict(enable_fallback=True, write_metadata=False, fetch_cover=False,
+                remember_hashes=False)
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        pp, rp = tmp / "prompt.mp3", tmp / "real.mp3"
+        pp.write_bytes(PROMPT)
+        rp.write_bytes(REAL)
+        src = tmp / "夜曲 - 周杰伦.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "o1"), **base),
+                        cache_path=tmp / "c1.json", on_log=logs.append,
+                        sources=[FakeSource("zaa", pp)])
+        r1 = pipe.process_file(src)
+        o1 = tmp / "o1"
+        check("complete: 只有提示音时绝不产出文件",
+              r1.status == "failed" and not (o1.is_dir() and list(o1.glob("*"))),
+              f"{r1.status} :: {r1.message}")
+
+        logs2: list[str] = []
+        pipe2 = Pipeline(Settings(output_dir=str(tmp / "o2"), **base),
+                         cache_path=tmp / "c2.json", on_log=logs2.append,
+                         sources=[FakeSource("zaa", pp), FakeSource("zbb", rp)])
+        r2 = pipe2.process_file(src)
+        got = Path(r2.out_path).read_bytes() if r2.out_path else b""
+        check("complete: 同时有完整版时，产出的是完整版", got == REAL,
+              " | ".join(logs2[-5:]))
+
+
 def test_live() -> None:
     print("\n[fallback/live]")
     http = HttpClient(timeout=15, retries=2)
@@ -1036,6 +1719,19 @@ def main() -> int:
     test_qualified_title_loses()
     test_duration_tolerance_tight()
     test_mp3_vbr_estimate()
+    test_sniffer()
+    test_html_scrape_source()
+    test_pack_html_scrape()
+    test_artist_gate()
+    test_artist_gate_local()
+    test_strong_gate()
+    test_query_expander()
+    test_new_sources()
+    test_manual_links()
+    test_variant_retry_e2e()
+    test_import_all_modules()
+    test_kwm_decoder()
+    test_completeness_gate()
     if args.live:
         test_live()
 
