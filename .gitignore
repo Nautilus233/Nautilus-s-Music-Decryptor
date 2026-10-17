@@ -1,0 +1,33 @@
+# ---- build artifacts (never commit) -------------------------------------
+/dist/
+/build/work/
+/build/work_*/
+*.pkg
+
+# ---- python -------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- app runtime leftovers ---------------------------------------------
+.mmusic-hashcache.json
+hashcache.json
+*.meta.json
+
+# ---- local test material -----------------------------------------------
+# 公开仓库严禁包含受版权保护的音频（_testfile 内是真实的 QQ 音乐文件）
+/_testfile/
+/_remote_inspect/
+/_exetest/
+_ui_*.png
+_dlg_*.png
+_g1.png
+_g2.png
+
+# ---- editors / OS ------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini

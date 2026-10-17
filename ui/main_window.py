@@ -1,0 +1,400 @@
+"""The main application window."""
+from __future__ import annotations
+
+from pathlib import Path
+
+from PySide6.QtCore import QRect, QSettings, Qt, QUrl
+from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QIcon
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
+                               QFileDialog, QFrame, QHBoxLayout, QHeaderView,
+                               QLabel, QLineEdit, QMainWindow, QMessageBox,
+                               QPlainTextEdit, QProgressBar, QPushButton,
+                               QTableWidget, QTableWidgetItem, QVBoxLayout,
+                               QWidget)
+
+from mmusic.config import AppConfig
+from mmusic.constants import QMC_ALL_EXTS
+from mmusic.paths import resource_path
+
+from . import geometry
+from .settings_dialog import SettingsDialog
+from .worker import DecryptWorker
+
+SUPPORTED_EXT = ({".ncm"} | {"." + e for e in QMC_ALL_EXTS}
+                 | {".mp3", ".flac", ".ogg", ".m4a", ".wav", ".aac", ".ape", ".wma", ".dff", ".opus"})
+
+_STATUS = {
+    "decoded":    ("已解密", "#36c07a"),
+    "downloaded": ("备用下载", "#5b9bff"),
+    "copied":     ("已复制", "#36c07a"),
+    "skipped":    ("已跳过", "#8b93a7"),
+    "failed":     ("失败", "#ef5350"),
+    "pending":    ("等待", "#8b93a7"),
+    "working":    ("处理中", "#f0a83c"),
+}
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, config: AppConfig, initial_paths=None) -> None:
+        super().__init__()
+        self.config = config
+        self.settings = config.settings
+        self._rows: "dict[str, int]" = {}
+        self._worker: "DecryptWorker | None" = None
+
+        self.setWindowTitle("音乐解密工具 · Music Decryptor")
+        icon = resource_path("assets", "icon.ico")
+        if icon.is_file():
+            self.setWindowIcon(QIcon(str(icon)))
+        # every control must stay reachable even on a short screen / tall
+        # taskbar; the final size is applied in showEvent(), where the window
+        # frame (title bar/borders) is known and can be kept fully on-screen.
+        self.setMinimumSize(820, 520)
+        self._geometry_ready = False
+        self.setAcceptDrops(True)
+
+        self.resize(1020, 700)          # pre-show size, corrected by showEvent
+        self._build_ui()
+        self._load_settings_into_ui()
+        if initial_paths:
+            self.add_paths(initial_paths)
+
+    # ------------------------------------------------------------------ #
+    def _build_ui(self) -> None:
+        root = QWidget()
+        self.setCentralWidget(root)
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setSpacing(10)
+
+        # header
+        head = QVBoxLayout()
+        head.setSpacing(2)
+        title = QLabel("音乐解密工具")
+        title.setProperty("role", "title")
+        subtitle = QLabel("本地优先 · 离线解密 NCM / QMC / MGG，失败自动切换备用音源搜索下载")
+        subtitle.setProperty("role", "subtitle")
+        head.addWidget(title)
+        head.addWidget(subtitle)
+        outer.addLayout(head)
+
+        # toolbar
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self.btn_add_files = QPushButton("添加文件")
+        self.btn_add_dir = QPushButton("添加文件夹")
+        self.btn_remove = QPushButton("移除所选")
+        self.btn_clear = QPushButton("清空列表")
+        for b in (self.btn_add_files, self.btn_add_dir, self.btn_remove, self.btn_clear):
+            bar.addWidget(b)
+        bar.addStretch(1)
+
+        bar.addWidget(QLabel("目标音质"))
+        self.quality = QComboBox()
+        self.quality.addItem("MP3（默认）", "mp3")
+        self.quality.addItem("FLAC", "flac")
+        self.quality.addItem("WAV（有则取，无则降级）", "wav")
+        self.quality.setFixedWidth(190)
+        bar.addWidget(self.quality)
+        outer.addLayout(bar)
+
+        # output dir
+        out_row = QHBoxLayout()
+        out_row.setSpacing(8)
+        out_row.addWidget(QLabel("输出目录"))
+        self.out_dir = QLineEdit()
+        self.out_dir.setPlaceholderText("默认：源文件所在目录")
+        out_row.addWidget(self.out_dir, 1)
+        self.btn_out_dir = QPushButton("选择…")
+        out_row.addWidget(self.btn_out_dir)
+        self.btn_settings = QPushButton("设置…")
+        out_row.addWidget(self.btn_settings)
+        outer.addLayout(out_row)
+
+        # table
+        self.table = QTableWidget(0, 5)
+        self.table.setHorizontalHeaderLabels(["文件名", "状态", "格式", "输出文件", "说明"])
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        hh = self.table.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
+        self.table.setColumnWidth(1, 80)
+        self.table.setColumnWidth(2, 60)
+        self.table.setMinimumHeight(110)
+        outer.addWidget(self.table, 3)
+
+        # progress
+        prog_row = QHBoxLayout()
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.status_label = QLabel("就绪 · 拖拽文件到窗口即可添加")
+        self.status_label.setProperty("role", "muted")
+        prog_row.addWidget(self.progress, 1)
+        prog_row.addWidget(self.status_label)
+        outer.addLayout(prog_row)
+
+        # log
+        self.log = QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setMaximumBlockCount(4000)
+        self.log.setPlaceholderText("运行日志…")
+        self.log.setMinimumHeight(80)
+        outer.addWidget(self.log, 2)
+
+        # actions
+        act = QHBoxLayout()
+        act.addStretch(1)
+        self.btn_stop = QPushButton("停止")
+        self.btn_stop.setProperty("role", "danger")
+        self.btn_stop.setEnabled(False)
+        self.btn_start = QPushButton("开始解密")
+        self.btn_start.setProperty("role", "primary")
+        self.btn_start.setMinimumWidth(150)
+        act.addWidget(self.btn_stop)
+        act.addWidget(self.btn_start)
+        outer.addLayout(act)
+
+        # wiring
+        self.btn_add_files.clicked.connect(self._pick_files)
+        self.btn_add_dir.clicked.connect(self._pick_dir)
+        self.btn_remove.clicked.connect(self._remove_selected)
+        self.btn_clear.clicked.connect(self._clear)
+        self.btn_out_dir.clicked.connect(self._pick_out_dir)
+        self.btn_settings.clicked.connect(self._open_settings)
+        self.btn_start.clicked.connect(self.start_job)
+        self.btn_stop.clicked.connect(self.stop_job)
+
+    # ------------------------------------------------------------------ #
+    def _load_settings_into_ui(self) -> None:
+        idx = self.quality.findData(self.settings.quality)
+        self.quality.setCurrentIndex(idx if idx >= 0 else 0)
+        self.out_dir.setText(self.settings.output_dir or "")
+
+    def _sync_settings_from_ui(self) -> None:
+        self.settings.quality = self.quality.currentData()
+        self.settings.output_dir = self.out_dir.text().strip()
+        self.config.save()
+
+    # ------------------------------------------------------------------ #
+    def _available_geometry(self) -> QRect:
+        """Work area of the current screen (taskbar excluded)."""
+        return geometry.available_geometry(self)
+
+    def _frame_margins(self) -> "tuple[int, int, int, int]":
+        return geometry.frame_margins(self)
+
+    def _fit_to_screen(self) -> None:
+        geometry.fit(self, preferred=(1080, 760),
+                     minimum=(self.minimumWidth(), self.minimumHeight()))
+
+    def _clamp_to_screen(self) -> None:
+        geometry.clamp(self)
+
+    # -- window geometry persistence ------------------------------------ #
+    ORG_NAME = "MusicDecryptor"
+    APP_NAME = "MusicDecryptor"
+
+    @classmethod
+    def _settings_store(cls) -> QSettings:
+        return QSettings(cls.ORG_NAME, cls.APP_NAME)
+
+    def _restore_geometry(self) -> bool:
+        try:
+            saved = self._settings_store().value("geometry")
+        except Exception:  # noqa: BLE001
+            return False
+        if saved is None or not self.restoreGeometry(saved):
+            return False
+        self._clamp_to_screen()          # a saved size must never clip the UI
+        return True
+
+    def showEvent(self, event) -> None:  # noqa: N802
+        super().showEvent(event)
+        if not self._geometry_ready:
+            self._geometry_ready = True
+            if not self._restore_geometry():
+                self._fit_to_screen()
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        try:
+            self._settings_store().setValue("geometry", self.saveGeometry())
+        except Exception:  # noqa: BLE001
+            pass
+        if self._worker is not None and self._worker.isRunning():
+            self._worker.cancel()
+        super().closeEvent(event)
+
+    # ------------------------------------------------------------------ #
+    def add_paths(self, paths) -> None:
+        added = 0
+        for raw in paths:
+            p = Path(raw)
+            if p.is_dir():
+                for child in sorted(p.rglob("*")):
+                    if child.is_file() and child.suffix.lower() in SUPPORTED_EXT:
+                        added += self._add_row(child) or 0
+            elif p.is_file():
+                added += self._add_row(p) or 0
+        if added:
+            self._log(f"➕ 已添加 {added} 个文件（共 {self.table.rowCount()} 个）")
+
+    def _add_row(self, path: Path) -> int:
+        key = str(path)
+        if key in self._rows:
+            return 0
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        name_item = QTableWidgetItem(path.name)
+        name_item.setToolTip(key)
+        name_item.setData(Qt.ItemDataRole.UserRole, key)
+        self.table.setItem(row, 0, name_item)
+        self._set_cell(row, 1, "pending")
+        self.table.setItem(row, 2, QTableWidgetItem(""))
+        self.table.setItem(row, 3, QTableWidgetItem(""))
+        self.table.setItem(row, 4, QTableWidgetItem(""))
+        self._rows[key] = row
+        return 1
+
+    def _set_cell(self, row: int, col: int, status: str) -> None:
+        text, color = _STATUS.get(status, (status, "#8b93a7"))
+        item = QTableWidgetItem(text)
+        item.setForeground(QColor(color))
+        self.table.setItem(row, col, item)
+
+    # ------------------------------------------------------------------ #
+    def _pick_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "选择加密音频文件", "",
+            "音频/加密文件 (*.ncm *.qmc* *.mgg*.mflac* *.bkc* *.tkm *.mmp4 *.mp3 *.flac *.ogg *.m4a *.wav);;所有文件 (*.*)")
+        if files:
+            self.add_paths(files)
+
+    def _pick_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "选择文件夹")
+        if d:
+            self.add_paths([d])
+
+    def _pick_out_dir(self) -> None:
+        d = QFileDialog.getExistingDirectory(self, "选择输出目录")
+        if d:
+            self.out_dir.setText(d)
+
+    def _remove_selected(self) -> None:
+        rows = sorted({i.row() for i in self.table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            key = self.table.item(r, 0).data(Qt.ItemDataRole.UserRole)
+            self._rows.pop(key, None)
+            self.table.removeRow(r)
+        self._reindex()
+
+    def _clear(self) -> None:
+        self.table.setRowCount(0)
+        self._rows.clear()
+
+    def _reindex(self) -> None:
+        self._rows.clear()
+        for r in range(self.table.rowCount()):
+            key = self.table.item(r, 0).data(Qt.ItemDataRole.UserRole)
+            self._rows[key] = r
+
+    # ------------------------------------------------------------------ #
+    def _open_settings(self) -> None:
+        dlg = SettingsDialog(self.settings, self)
+        if dlg.exec():
+            dlg.apply_to(self.settings)
+            self.config.save()
+            self._load_settings_into_ui()
+            self._log("⚙ 设置已保存")
+
+    # ------------------------------------------------------------------ #
+    def start_job(self) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            return
+        if self.table.rowCount() == 0:
+            QMessageBox.information(self, "提示", "请先添加要处理的文件。")
+            return
+        self._sync_settings_from_ui()
+        paths = list(self._rows.keys())
+        for r in range(self.table.rowCount()):
+            self._set_cell(r, 1, "pending")
+            self.table.item(r, 3).setText("")
+            self.table.item(r, 4).setText("")
+        self.progress.setValue(0)
+        self.progress.setRange(0, max(1, len(paths)))
+        self._log("=" * 46)
+        self._log(f"▶ 开始处理 {len(paths)} 个文件 | 音质：{self.settings.quality.upper()} | "
+                  f"备用下载：{'开' if self.settings.enable_fallback else '关'}")
+
+        self._worker = DecryptWorker(self.settings, paths, self.config.cache_path, self)
+        self._worker.logged.connect(self._log)
+        self._worker.progressed.connect(self._on_progress)
+        self._worker.file_done.connect(self._on_file_done)
+        self._worker.completed.connect(self._on_completed)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
+
+        self.btn_start.setEnabled(False)
+        self.btn_stop.setEnabled(True)
+        self.btn_add_files.setEnabled(False)
+        self.btn_add_dir.setEnabled(False)
+
+    def stop_job(self) -> None:
+        if self._worker is not None:
+            self._worker.cancel()
+            self._log("⏹ 正在停止…")
+
+    def _on_progress(self, done: int, total: int) -> None:
+        self.progress.setRange(0, max(1, total))
+        self.progress.setValue(done)
+        self.status_label.setText(f"进度 {done}/{total}")
+
+    def _on_file_done(self, res) -> None:
+        row = self._rows.get(res.path)
+        if row is None:
+            return
+        self._set_cell(row, 1, res.status)
+        self.table.item(row, 2).setText((res.fmt or "").upper())
+        self.table.item(row, 3).setText(Path(res.out_path).name if res.out_path else "")
+        self.table.item(row, 4).setText(res.message + (f" · 来源 {res.source}" if res.source and res.status == "downloaded" else ""))
+        self.table.scrollToItem(self.table.item(row, 0))
+
+    def _on_completed(self, results) -> None:
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.btn_add_files.setEnabled(True)
+        self.btn_add_dir.setEnabled(True)
+        self.status_label.setText("完成")
+        ok = sum(1 for r in results if r.ok)
+        fail = sum(1 for r in results if r.status == "failed")
+        skip = sum(1 for r in results if r.status == "skipped")
+        self._log(f"■ 全部完成：成功 {ok} · 跳过 {skip} · 失败 {fail}")
+        self._worker = None
+
+    def _on_failed(self, message: str) -> None:
+        self._log(f"❌ 任务异常：{message}")
+        self.btn_start.setEnabled(True)
+        self.btn_stop.setEnabled(False)
+        self.btn_add_files.setEnabled(True)
+        self.btn_add_dir.setEnabled(True)
+        self._worker = None
+
+    # ------------------------------------------------------------------ #
+    def _log(self, message: str) -> None:
+        self.log.appendPlainText(message)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        paths = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+        if paths:
+            self.add_paths(paths)
+            event.acceptProposedAction()

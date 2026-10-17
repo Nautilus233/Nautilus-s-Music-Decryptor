@@ -1,0 +1,7 @@
+# ---- runtime dependencies ------------------------------------------------
+PySide6>=6.10,<7          # Qt6 GUI (only QtCore/QtGui/QtWidgets are bundled)
+mutagen>=1.47             # tag & cover read/write (optional at runtime)
+
+# ---- build-time dependencies --------------------------------------------
+pillow>=10                # icon generation (assets/make_icon.py)
+pyinstaller>=6.16         # single-file .exe packaging

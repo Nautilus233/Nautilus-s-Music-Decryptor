@@ -1,2 +1,126 @@
-# Nautilus-s-Music-Decryptor
-自己的小玩具罢了
+# 音乐解密工具 · Music Decryptor
+
+本地优先（离线可用）的音乐解密工具：离线解密 **网易云 `.ncm`**、**QQ 音乐 QMC/MGG/MFLAC** 等加密格式；
+遇到必须联网/硬件绑定的新格式时，**自动切换**到“备用搜索 - 下载安全音源”流程。
+可打包为一个带自定义图标的独立 `MusicDecryptor.exe`。
+
+> ⚠️ **仅限个人本地研究**：只处理你本机已有的加密文件或你自己的备份。
+> 本项目**不含任何音频内容**，不绕过平台付费/授权。请遵守当地法律与平台条款，勿传播版权内容。
+> 完整设计见 [DESIGN.md](DESIGN.md)。
+
+---
+
+## 特性
+
+- **离线优先**：NCM、QMC0/QMC3/QMCflac/QMCogg 等完全离线解密，无需联网、无付费 API。
+- **自动降级**：新版 QQ 音乐 `STag`（文件内无密钥）自动标记“需联网破解”，立即转备用下载。
+- **备用下载**：内置酷我 / 酷狗 / 全网聚合（MyFreeMP3 风格）/ 本地曲库音源；可配置顺序。
+- **下载即校验**：按**真实文件头**判定格式，校验码率/大小，拦截错误页与低质文件。
+- **稳**：超时 + 重试，逐源切换，单文件失败不影响整批；SHA-256 去重避免重复劳动。
+- **元数据**：保留并写回标题/艺术家/专辑/封面；缺失时用搜索结果补齐（可关）。
+- **美观 GUI**：拖拽、批量、音质筛选、进度条、彩色状态、实时日志。
+- **零原生依赖**：AES/TEA 纯 Python 实现（无 `pycryptodome`），网络层用标准库（无 `requests`）。
+
+## 支持格式
+
+| 平台 | 扩展名 | 离线 |
+|---|---|---|
+| 网易云 | `.ncm` | ✅ |
+| QQ 音乐 QMCv1 | `.bkcmp3 .bkcm4a .bkcflac .bkcwav .bkcape .bkcogg .bkcwma .tkm` | ✅ |
+| QQ 音乐 QMCv2 | `.qmc0 .qmc2 .qmc3 .qmc4 .qmc6 .qmc8 .qmcflac .qmcogg` | ✅（有内嵌密钥时）|
+| QQ 音乐 MGG/MFLAC | `.mgg .mgg0 .mgg1 .mggl .mflac .mflac0 .mmp4` | ✅ `QTag`；❌ `STag`（转备用下载）|
+| 已是明文 | `.mp3 .flac .ogg .m4a .aac .wav .ape .wma .dff` | 直接复制 |
+
+## 安装
+
+需要 **Python 3.10+**（开发验证于 3.14）与 Windows 10/11。
+
+```powershell
+python -m pip install -r requirements.txt
+```
+
+## 使用
+
+```powershell
+python main.py                 # 启动图形界面（拖拽 / 批量）
+python main.py --cli "D:\in"   # 无界面批处理
+python main.py --cli a.ncm --output D:\out --quality flac
+python main.py --check-qt      # 自检：确认 Qt 能加载（界面无法启动时先跑这个）
+python main.py --check-ui      # 自检：主窗口与设置弹窗是否在本机屏幕上完整可见
+python main.py --selftest      # 运行自检
+python main.py song.ncm --auto # 启动后立即开始
+```
+
+图形界面：添加文件/文件夹（或拖入）→ 选音质（默认 MP3）→ `开始解密` → 看列表与日志。
+
+**输出位置**：默认写到**源文件所在目录**（不再落到 exe 自己的 `dist\` 目录）；同名会加 `(1)`，绝不覆盖源文件。可在界面上手动指定其它输出目录。窗口会按当前屏幕工作区自适应，底部按钮不会被任务栏遮住。
+
+## 打包为单文件 EXE
+
+```powershell
+python -m pip install pillow pyinstaller
+powershell -ExecutionPolicy Bypass -File build\build.ps1
+# 产物： dist\MusicDecryptor.exe （自定义图标，Windows 10+ 免安装）
+```
+
+详见 [DESIGN.md](DESIGN.md) 第 5 节（含 spec 说明与两个已知打包坑）。
+
+## 测试
+
+```powershell
+python tests\selftest.py          # 30 项离线用例（合成 NCM/QMC 容器端到端）
+python tests\selftest.py --live   # 追加真实备用下载链路验证
+python tests\test_gui.py          # Qt 离屏冒烟测试
+```
+
+## 疑难排查
+
+- **双击 exe 弹出 `DLL load failed while importing QtCore: 找不到指定的程序`**：
+  这是打包机 `PATH` 上存在 **同名但不同版本的 `icuuc.dll`**（例如 Poppler 自带的 ICU）被 PyInstaller 误打包，遮蔽了 Windows 系统 ICU 导致的。
+  本仓库的 spec 已修复（过滤掉所有 `icu*.dll`）。若你自行改动打包配置，请保留该过滤；并用 `dist\MusicDecryptor.exe --check-qt` 回归。
+- **界面起不来 / 无反应**：先跑 `python main.py --check-qt`；再用 `build\music_decryptor_console.spec` 构建控制台版，让报错直接打到命令行。
+- **窗口或设置弹窗底部被屏幕/任务栏挡住**：先跑 `python main.py --check-ui`（或 `dist\MusicDecryptor.exe --check-ui`）。它会按你的屏幕工作区实测主窗口与对话框的几何并给出逐项结论；设置弹窗主体可滚动、`确定/取消` 已固定在底部。
+- **某音源没结果**：平台接口会变（反爬/改版），只影响 `mmusic\search\` 下对应文件，可在设置里调整音源顺序或换用聚合网关。
+
+## 备用音源
+
+本地曲库（离线）、酷我、酷狗、全网聚合（MyFreeMP3/NetEase 代理，地址可配置）。
+平台改版只影响对应适配器（`mmusic/search/*.py`），解密核心与界面无需改动。
+
+## 目录结构
+
+```text
+mmusic/    核心能力层（crypto / search / pipeline / 校验 / 配置）
+ui/        PySide6 界面层
+assets/    图标与生成脚本
+build/     PyInstaller spec 与构建脚本
+tests/     自检与合成夹具
+main.py    入口（GUI / --cli / --selftest）
+```
+
+## 更新记录
+
+- **v1.0.5**
+  - 新增：**版本过滤**。歌名 / 文件名 / 标签里出现 `伴奏`、`inst`、`remix`、`cover`、`live`、`现场`、`演唱会`、`串烧` 等字样的一律排除，只认原曲；`Alive`、`Instant Crush` 这类正常标题不会误伤。
+  - 新增：**跨音源择优**。不再“第一个能用的音源就下”，而是所有音源的干净候选统一比排名，分高者先下、失败顺延（已有 ≥0.95 的高置信度原曲时跳过其余音源省请求）。
+  - 提示：所有候选都是伴奏/改编版时会明确告知「未找到原曲，当前仅有伴奏/改编版，请确认是否需要下载。」；若你就想要伴奏版，把文件名写成含“伴奏”等字样即可（会保留但会警告）。
+  - 顺带修复：本地音源的 `file://` 路径解析更稳健（用规范 URI；路径不可读时给出明确错误而非异常）。
+- **v1.0.4**
+  - 修复：文件名顺序判定。以前只按「歌手 - 歌名」解析，遇到「歌名 - 歌手」（如 `晴天 - 周杰伦.mgg`）会把标题与歌手读反，导致匹配分骤降、明明搜到也不下载。现在**两种读法都参与打分、取更高分**，查询仍只发一次。
+  - 影响：`歌手 - 歌名` 的旧行为完全不变；日志会写明采用了哪条读法。
+- **v1.0.3**
+  - 移除：不再输出 `.meta.json` 侧车文件（元数据依旧写入音频文件自身的标签/封面，用普通播放器就能看到）。
+  - 影响：设置里的对应开关一并去掉；已保存的旧配置里若残留该项，也会被自动忽略。
+- **v1.0.2**
+  - 修复：**设置对话框**底部被截断——主体改为 `QScrollArea`，`确定/取消`（含免责声明）固定在底部；对话框按屏幕工作区自适应并居中到主窗口，最小 460×380。
+  - 重构：把窗口几何逻辑抽到 `ui/geometry.py`（工作区 + 边框感知），主窗口与对话框共用，避免同一类问题再各修一次。
+  - 新增：`--check-ui` 自检（源码与打包产物共用同一套断言），`tests/test_ui_fit.py` 覆盖主窗口 **与对话框** 共 10 项。
+- **v1.0.1**
+  - 修复：默认输出目录错误地落在程序工作目录（双击 exe 时即 `dist\`），现改为**源文件所在目录**（与界面提示一致），并保证不覆盖源文件；源目录不可写时给出可读提示。
+  - 修复：窗口按**屏幕工作区**（含标题栏/边框厚度）自适应并做边界收敛，底部操作行不再被截断；新增几何记忆与最小尺寸。
+  - 修复：打包时 `PATH` 上同名的非 Qt `icuuc.dll` 被误打包，导致 exe 启动即 `DLL load failed while importing QtCore`（详见 [DESIGN.md](DESIGN.md) §5.6）。
+  - 新增：`--check-qt` 自检；`tests/test_ui_fit.py` 真实屏幕适配测试。
+
+## 许可证与免责
+
+仅供个人学习研究。使用者需自行承担合规责任。作者不对任何滥用负责。
