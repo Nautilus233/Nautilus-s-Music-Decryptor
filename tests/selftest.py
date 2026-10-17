@@ -11,7 +11,14 @@ import argparse
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:  # noqa: BLE001
+        pass
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
@@ -22,14 +29,16 @@ from mmusic.config import Settings  # noqa: E402
 from mmusic.crypto.ncm import NcmDecoder  # noqa: E402
 from mmusic.crypto.qmc import QmcDecoder  # noqa: E402
 from mmusic.downloader import validate  # noqa: E402
+from mmusic.duration import audio_duration, consensus, format_seconds  # noqa: E402
 from mmusic.errors import NeedsOnlineError  # noqa: E402
-from mmusic.match import (filename_query,  # noqa: E402
+from mmusic.match import (filename_query, title_match_score,  # noqa: E402
                         parse_song_filename, parse_song_filename_candidates,
                         rank_tracks, rank_tracks_multi, similarity,
                         split_originals, track_version_markers, version_markers)
 from mmusic.model import Track  # noqa: E402
 from mmusic.net import HttpClient  # noqa: E402
-from mmusic.pipeline import Pipeline  # noqa: E402
+from mmusic.pipeline import (MIN_ACCEPT, MIN_TITLE_SIMILARITY,  # noqa: E402
+                             MIN_TRACK_SECONDS, Pipeline, _plausible_max)
 from mmusic.search.registry import build_sources  # noqa: E402
 from mmusic.search.base import SearchSource  # noqa: E402
 from mmusic.sniff import sniff  # noqa: E402
@@ -340,6 +349,226 @@ def test_cross_source_best() -> None:
               any("强音源" in m and "原曲候选" in m for m in logs), tail)
 
 
+def test_duration_verify() -> None:
+    print("\n[duration verification]")
+    flac = fx.make_flac(269)
+    check("duration: FLAC STREAMINFO -> exact seconds",
+          abs((audio_duration(flac, len(flac)) or 0) - 269) < 0.01,
+          str(audio_duration(flac, len(flac))))
+    mp3 = fx.make_mp3_xing(215)
+    check("duration: MP3 Xing header -> seconds",
+          abs((audio_duration(mp3, len(mp3)) or 0) - 215) < 1.0,
+          str(audio_duration(mp3, len(mp3))))
+    check("duration: zero-filled data -> None (never trusted)",
+          audio_duration(b"\x00" * 4096, 4096) is None)
+    lone_sync = b"\xff\xfb\x90\x00" + b"\x00" * 4092      # 单个假帧头，不能骗过解析器
+    check("duration: a lone fake MP3 sync word is rejected",
+          audio_duration(lone_sync, 4096) is None, str(audio_duration(lone_sync, 4096)))
+    check("duration: format_seconds", format_seconds(269) == "4:29", format_seconds(269))
+
+    _, flags, _ = consensus([269.0, 271.0, 120.0, None])
+    check("consensus: length outlier (bad remix) is rejected",
+          flags == [True, True, False, False], str(flags))
+    check("consensus: an unmeasured candidate is never trusted", flags[3] is False)
+    ref2, flags2, _ = consensus([269.0, 120.0])
+    check("consensus: two disagreeing candidates -> best-ranked length wins",
+          flags2 == [True, False] and abs((ref2 or 0) - 269) < 0.1, f"{ref2} {flags2}")
+    ref3, flags3, _ = consensus([None, None])
+    check("consensus: nothing measured -> nothing trusted",
+          ref3 is None and flags3 == [False, False], str(flags3))
+    ref4, flags4, _ = consensus([200.0, None])
+    check("consensus: single measured candidate passes alone", flags4 == [True, False], str(flags4))
+    check("reference: prefers the most complete value",
+          _plausible_max([142, 131, 235]) == 235, str(_plausible_max([142, 131, 235])))
+    check("reference: an outlying long value is ignored",
+          _plausible_max([142, 131, 235, 480]) == 235, str(_plausible_max([142, 131, 235, 480])))
+
+
+def test_duration_cross_check_e2e() -> None:
+    """标题/歌手都正确、但音频长度对不上的 remix，必须被淘汰。"""
+    print("\n[duration cross-check: end-to-end]")
+    real, wrong = fx.make_mp3_xing(269), fx.make_mp3_xing(120)
+    fallback = dict(sources=["local"], enable_fallback=True, write_metadata=False,
+                    fetch_cover=False, remember_hashes=False)
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        lib = tmp / "lib"
+        lib.mkdir()
+        (lib / "晴天 - 周杰伦.mp3").write_bytes(real)
+        (lib / "晴天 - 周杰伦 (官方版).mp3").write_bytes(wrong)   # 名称无破绽，但只有 2:00
+        src = tmp / "晴天 - 周杰伦.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), local_dirs=[str(lib)], **fallback),
+                        cache_path=tmp / "c.json", on_log=logs.append)
+        res = pipe.process_file(src)
+        got = Path(res.out_path).read_bytes() if res.out_path else b""
+        tail = " | ".join(logs[-8:])
+
+        check("duration-e2e: the length outlier is excluded",
+              any("时长异常已排除" in m for m in logs), tail)
+        check("duration-e2e: the length-consistent candidate is downloaded",
+              got == real, f"{res.out_path}")
+        check("duration-e2e: log reports a reference duration",
+              any("参考时长" in m for m in logs), tail)
+        check("duration-e2e: log reports the measured length",
+              any("实测时长" in m for m in logs), tail)
+
+    # 只有一个候选、且拿不到时长 -> 必须警告，不得声称已通过交叉验证
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        lib = tmp / "lib"
+        lib.mkdir()
+        (lib / "晴天 - 周杰伦.mp3").write_bytes(
+            b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x00" * 40000)   # 无法解析时长
+        src = tmp / "晴天 - 周杰伦.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+
+        logs2: list[str] = []
+        pipe2 = Pipeline(Settings(output_dir=str(tmp / "out"), local_dirs=[str(lib)], **fallback),
+                         cache_path=tmp / "c2.json", on_log=logs2.append)
+        res2 = pipe2.process_file(src)
+        tail2 = " | ".join(logs2[-6:])
+
+        check("duration-e2e: unmeasurable candidate is marked untrusted",
+              any("视为不可信" in m for m in logs2), tail2)
+        check("duration-e2e: result is declarative, never asks the user to act",
+              "时长未" in res2.message and "请" not in res2.message and "确认" not in res2.message,
+              res2.message)
+        check("duration-e2e: still produces a file rather than refusing",
+              res2.status == "downloaded", f"{res2.status} :: {tail2}")
+
+
+def test_title_gate() -> None:
+    print("\n[title field gate]")
+    readings = parse_song_filename_candidates("晴天 - 周杰伦")
+    check("title-gate: exact title passes",
+          title_match_score(readings, Track("x", "晴天", "周杰伦")) >= MIN_TITLE_SIMILARITY)
+    check("title-gate: local filename style passes",
+          title_match_score(readings, Track("x", "晴天 - 周杰伦", "")) >= MIN_TITLE_SIMILARITY)
+    check("title-gate: title inside a medley still passes (duration floor handles it)",
+          title_match_score(readings, Track("x", "新歌前奏 + Julia + 晴天", "x")) >= MIN_TITLE_SIMILARITY)
+    same_artist = [Track("x", "花海", "周杰伦"), Track("x", "听妈妈的话", "周杰伦"),
+                   Track("x", "稻香", "周杰伦")]
+    scores = [round(title_match_score(readings, t), 2) for t in same_artist]
+    check("title-gate: 'same artist, different song' is rejected",
+          all(sc < MIN_TITLE_SIMILARITY for sc in scores), str(scores))
+
+
+def test_duration_floor_e2e() -> None:
+    """只有 15 秒的"前奏/试听片段"必须被拦下，不能当原曲下载。"""
+    print("\n[duration floor: end-to-end]")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        lib = tmp / "lib"
+        lib.mkdir()
+        (lib / "晴天 - 周杰伦.mp3").write_bytes(fx.make_mp3_xing(15))     # 0:15 片段
+        src = tmp / "晴天 - 周杰伦.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), sources=["local"],
+                                 local_dirs=[str(lib)], enable_fallback=True,
+                                 write_metadata=False, fetch_cover=False,
+                                 remember_hashes=False),
+                        cache_path=tmp / "c.json", on_log=logs.append)
+        res = pipe.process_file(src)
+        tail = " | ".join(logs[-6:])
+        check("duration-floor: a 15s clip is excluded",
+              any("时长过短已排除" in m for m in logs), tail)
+        check("duration-floor: nothing is written from a clip",
+              res.status == "failed" and not (tmp / "out").exists(),
+              f"{res.status} :: {tail}")
+
+
+def test_cross_platform_reference() -> None:
+    """参考时长必须跨平台取最完整值：只信一个平台就会下到截短版。"""
+    print("\n[cross-platform duration reference]")
+    short, full = fx.make_mp3_xing(142), fx.make_mp3_xing(235)      # 2:22（截短） / 3:55（完整）
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        spath = tmp / "short.mp3"
+        spath.write_bytes(short)
+        fpath = tmp / "full.mp3"
+        fpath.write_bytes(full)
+
+        class Fake(SearchSource):
+            def __init__(self, name, path, duration):
+                super().__init__(None, {})
+                self.name = name
+                self.label = name
+                self._path = str(path)
+                self._duration = duration
+
+            def search(self, query, *, quality="mp3", limit=10):
+                return [Track(self.name, "最长的电影", "周杰伦", duration=self._duration,
+                              ext="mp3", raw={"path": self._path})]
+
+            def resolve(self, track, *, quality="mp3"):
+                track.url = Path(track.raw["path"]).resolve().as_uri()
+                track.ext = "mp3"
+                return track
+
+        truncating = Fake("kuwo_like", spath, 142)     # 平台标注 2:22
+        complete = Fake("kugou_like", fpath, 235)      # 平台标注 3:55
+        src = tmp / "周杰伦 - 最长的电影.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), enable_fallback=True,
+                                 write_metadata=False, fetch_cover=False,
+                                 remember_hashes=False),
+                        cache_path=tmp / "c.json", on_log=logs.append,
+                        sources=[truncating, complete])
+        res = pipe.process_file(src)
+        got = Path(res.out_path).read_bytes() if res.out_path else b""
+        tail = " | ".join(logs[-6:])
+
+        check("xplat: reference is the most complete platform's value",
+              any("跨平台参考时长 3:55" in m for m in logs), tail)
+        check("xplat: the truncating platform is excluded by its own metadata",
+              any("标注时长偏短已排除" in m for m in logs), tail)
+        check("xplat: the complete version is the one downloaded", got == full, f"{res.out_path}")
+
+
+def test_verified_only_download() -> None:
+    """已有参考时长时，测不出时长的候选绝不能被拿去下载。"""
+    print("\n[only duration-verified resources are downloaded]")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        unmeasurable = tmp / "unmeasurable.mp3"
+        unmeasurable.write_bytes(b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x00" * 40000)
+
+        class Fake(SearchSource):
+            def __init__(self, path):
+                super().__init__(None, {})
+                self.name = self.label = "fake"
+                self._path = str(path)
+
+            def search(self, query, *, quality="mp3", limit=10):
+                return [Track(self.name, "最长的电影", "周杰伦", duration=235,
+                              ext="mp3", raw={"path": self._path})]
+
+            def resolve(self, track, *, quality="mp3"):
+                track.url = Path(track.raw["path"]).resolve().as_uri()
+                track.ext = "mp3"
+                return track
+
+        src = tmp / "周杰伦 - 最长的电影.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), enable_fallback=True,
+                                 write_metadata=False, fetch_cover=False,
+                                 remember_hashes=False),
+                        cache_path=tmp / "c.json", on_log=logs.append,
+                        sources=[Fake(unmeasurable)])
+        res = pipe.process_file(src)
+        check("verified-only: nothing is written when no duration could be measured",
+              res.status == "failed" and not (tmp / "out").exists(),
+              f"{res.status} :: {' | '.join(logs[-3:])}")
+
+
 def test_output_files() -> None:
     print("\n[output files]")
     with tempfile.TemporaryDirectory() as tmp:
@@ -409,6 +638,333 @@ def test_output_dir_default() -> None:
               and Path(r3.out_path).name != src.name, Path(r3.out_path).name)
 
 
+def test_source_pack() -> None:
+    print("\n[source pack: schema + registry equivalence]")
+    from mmusic.search.pack import (PackError, builtin_specs, load_pack,
+                                    pack_summary, validate_pack)
+    from mmusic.search.registry import available_sources, build_sources
+
+    specs = builtin_specs()
+    check("pack: builtin pack lists the four sources in order",
+          [s.id for s in specs] == ["local", "kuwo", "kugou", "aggregator"],
+          str([s.id for s in specs]))
+
+    good = {"schema": 1, "sources": [
+        {"id": "demo", "label": "示例源", "kind": "local", "impl": "local",
+         "enabled_by_default": True}]}
+    check("pack: a valid document validates", len(validate_pack(good)) == 1)
+
+    def _rejects(name: str, doc: dict) -> None:
+        try:
+            validate_pack(doc)
+            ok = False
+        except PackError:
+            ok = True
+        check(f"pack: rejects {name}", ok)
+
+    _rejects("an unknown kind", {"schema": 1, "sources": [{"id": "x1", "label": "x", "kind": "hack"}]})
+    _rejects("a malformed id", {"schema": 1, "sources": [{"id": "Bad-Id", "label": "x", "kind": "local"}]})
+    _rejects("an unknown impl", {"schema": 1, "sources": [{"id": "x2", "label": "x", "kind": "adapter", "impl": "evil"}]})
+    _rejects("an unknown (exec-ish) field", {"schema": 1, "sources": [{"id": "x3", "label": "x", "kind": "local", "exec": "calc"}]})
+    _rejects("a non-https search url", {"schema": 1, "sources": [{"id": "x4", "label": "x", "kind": "json_api", "params": {"search_url": "http://a/b"}}]})
+    _rejects("an unsupported schema version", {"schema": 2, "sources": []})
+    _rejects("duplicate source ids", {"schema": 1, "sources": [{"id": "x5", "label": "a", "kind": "local"}, {"id": "x5", "label": "b", "kind": "local"}]})
+
+    check("pack: default order is local-first",
+          [s.id for s in load_pack({})] == ["local", "kuwo", "kugou", "aggregator"])
+    check("pack: settings['sources'] selects and orders",
+          [s.id for s in load_pack({"sources": ["kugou", "local"]})] == ["kugou", "local"])
+    check("pack: unknown requested ids are ignored",
+          [s.id for s in load_pack({"sources": ["nope", "local"]})] == ["local"])
+    check("pack: summary renders every entry", len(pack_summary(specs).splitlines()) == 4)
+
+    built = build_sources(None, {})
+    check("pack: registry builds exactly the previous chain",
+          [x.name for x in built] == ["local", "kuwo", "kugou", "aggregator"],
+          str([x.name for x in built]))
+    check("pack: available_sources unchanged",
+          set(available_sources()) == {"kuwo", "kugou", "aggregator", "local"})
+    check("pack: a broken/missing user pack never breaks startup",
+          [s.id for s in load_pack({"source_pack_path": "Z:/definitely/missing.json"})]
+          == ["local", "kuwo", "kugou", "aggregator"])
+
+
+def test_fusion() -> None:
+    print("\n[fusion: content dedupe + low-confidence]")
+    from mmusic.search.fusion import (collapse_duplicates, dedupe_key,
+                                      is_low_confidence, mark_low_confidence)
+
+    a = Track("kuwo", "晴天", "周杰伦", duration=235)
+    b = Track("kugou", "晴天 ", "周杰伦", duration=236)      # 空白 + ±1s 应归并
+    live = Track("kuwo", "晴天 (Live)", "周杰伦", duration=235)
+    short = Track("kuwo", "晴天", "周杰伦", duration=142)     # 明显截短 -> 不归并
+
+    check("fusion: same song from two sources shares a key", dedupe_key(a) == dedupe_key(b))
+    check("fusion: a different version keeps its own key", dedupe_key(a) != dedupe_key(live))
+    check("fusion: a clearly shortened copy keeps its own key", dedupe_key(a) != dedupe_key(short))
+
+    kept, dropped = collapse_duplicates([a, b, live, short])
+    check("fusion: duplicates collapse, order preserved",
+          [t.source for t in kept] == ["kuwo", "kuwo", "kuwo"] and len(dropped) == 1,
+          f"kept={len(kept)} dropped={len(dropped)}")
+    check("fusion: the keeper is the higher-ranked occurrence",
+          bool(dropped) and dropped[0][1] is a and dropped[0][0] is b)
+
+    rows = [Track("x", "a", "b", score=0.40), Track("x", "c", "d", score=0.80)]
+    n = mark_low_confidence(rows)
+    check("fusion: low scores flagged, good scores not",
+          n == 1 and is_low_confidence(rows[0]) and not is_low_confidence(rows[1]))
+
+
+def test_resource_index() -> None:
+    print("\n[resource ledger: negative cache / health / degradation]")
+    from mmusic.search.index import ResourceIndex
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        ix = ResourceIndex(tmp / "r.db")
+        check("ledger: opens a database", ix.available)
+        check("ledger: an unseen query is not blocked", not ix.query_blocked("稻香 周杰伦", "kuwo"))
+
+        ix.note_search("kuwo", "稻香 周杰伦", found=False)
+        check("ledger: an empty result blocks it with a reason",
+              ix.query_block_reason("稻香 周杰伦", "kuwo") == "无结果",
+              ix.query_block_reason("稻香 周杰伦", "kuwo"))
+        check("ledger: the block expires after its TTL",
+              ix.query_blocked("稻香 周杰伦", "kuwo")
+              and not ix.query_blocked("稻香 周杰伦", "kuwo", now=int(time.time()) + 7 * 3600))
+        ix.note_search("kuwo", "稻香 周杰伦", found=True)
+        check("ledger: a later hit unblocks the query",
+              not ix.query_blocked("稻香 周杰伦", "kuwo"))
+
+        ix.note_search("kugou", "稻香 周杰伦", found=False, error=True)
+        check("ledger: an error blocks with its own reason",
+              ix.query_block_reason("稻香 周杰伦", "kugou") == "上次出错")
+
+        ix.note_resource("k", "kuwo", "https://cdn/ok.mp3", ext="mp3", bitrate=320, ok=True)
+        ix.note_resource("k", "kuwo", "https://cdn/bad.mp3", ext="mp3", ok=False)
+        check("ledger: a failed url is remembered as stale",
+              ix.is_stale_url("kuwo", "https://cdn/bad.mp3")
+              and not ix.is_stale_url("kuwo", "https://cdn/ok.mp3"))
+        check("ledger: key stats aggregate across sources",
+              ix.key_stats("k")["total"] == 2 and ix.key_stats("k")["verified"] == 1,
+              str(ix.key_stats("k")))
+
+        health = {r["source"]: r for r in ix.health()}
+        check("ledger: health aggregates attempts/successes",
+              health["kuwo"]["attempts"] == 2 and health["kuwo"]["successes"] == 1
+              and health["kugou"]["failures"] == 1, str(health))
+        check("ledger: stats count resources and queries",
+              ix.stats()["resources"] == 2 and ix.stats()["queries"] == 2, str(ix.stats()))
+        ix.close()
+    print("  (ledger released its handle - the temp dir cleaned up)")
+
+    off = ResourceIndex("Z:/definitely/missing/dir/r.db", enabled=False)
+    check("ledger: a disabled index degrades to no-ops",
+          not off.available and not off.query_blocked("q", "s")
+          and off.health() == [] and off.stats()["resources"] == 0)
+
+
+def test_fallback_dedupe_e2e() -> None:
+    """P1：同一首歌经多个源命中时只下载一次（内容去重，需开启台账）。"""
+    print("\n[dedupe: same song from two sources]")
+    A = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\xcc" * 40000
+    B = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\xdd" * 40000
+
+    class FakeSource(SearchSource):
+        def __init__(self, name, label, path):
+            super().__init__(None, {})
+            self.name, self.label = name, label
+            self._path = str(path)
+
+        def search(self, query, *, quality="mp3", limit=10):
+            return [Track(self.name, "晴天", "周杰伦", ext="mp3", raw={"path": self._path})]
+
+        def resolve(self, track, *, quality="mp3"):
+            track.url = Path(track.raw["path"]).resolve().as_uri()
+            track.ext = "mp3"
+            return track
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        pa, pb = tmp / "a.mp3", tmp / "b.mp3"
+        pa.write_bytes(A)
+        pb.write_bytes(B)
+        src = tmp / "晴天 - 周杰伦.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), enable_fallback=True,
+                                 write_metadata=False, fetch_cover=False,
+                                 remember_hashes=True),
+                        cache_path=tmp / "c.json", on_log=logs.append,
+                        sources=[FakeSource("zaa", "源A", pa), FakeSource("zbb", "源B", pb)])
+        res = pipe.process_file(src)
+        produced = list((tmp / "out").glob("*.mp3"))
+        tail = " | ".join(logs[-6:])
+        pipe.close()
+
+        check("dedupe: the duplicate is merged",
+              any("重复资源已合并" in m for m in logs), tail)
+        check("dedupe: log reports the surviving candidate count",
+              any("去重后候选 1 个" in m for m in logs), tail)
+        check("dedupe: exactly one file was produced",
+              res.status == "downloaded" and len(produced) == 1, f"{res.status} {produced}")
+
+
+def test_dependency_guard() -> None:
+    """红线守卫：运行时代码只允许 PySide6 与可选 mutagen（AGENTS.md §1）。"""
+    print("\n[dependency guard: zero runtime deps]")
+    import ast
+    import sys as _sys
+
+    root = Path(__file__).resolve().parent.parent
+    stdlib = set(_sys.stdlib_module_names)
+    local = {"mmusic", "ui", "tests", "tools", "fixtures"}
+    allowed = {"PySide6", "mutagen"}
+    files = ([root / "main.py"] + sorted((root / "mmusic").rglob("*.py"))
+             + sorted((root / "ui").rglob("*.py")))
+    found: "dict[str, str]" = {}
+    for f in files:
+        for node in ast.walk(ast.parse(f.read_text(encoding="utf-8"))):
+            if isinstance(node, ast.Import):
+                names = [a.name.split(".")[0] for a in node.names]
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                names = [node.module.split(".")[0]]
+            else:
+                continue
+            for n in names:
+                if n not in stdlib and n not in local:
+                    found.setdefault(n, f.name)
+
+    extra = sorted(set(found) - allowed)
+    check("deps: no third-party runtime import beyond PySide6 / mutagen", not extra,
+          f"unexpected: {extra}")
+    check("deps: both allowed deps are the ones actually used",
+          set(found) <= allowed and "PySide6" in found, str(sorted(found)))
+    print(f"  (scanned {len(files)} files; third-party = {sorted(found)})")
+
+
+def test_variant_filter_more() -> None:
+    """过滤更彻底：电台版一类"看着像原曲但被剪短"的标记必须命中，且不误伤正常歌名。"""
+    print("\n[variant filter: radio/tv/instrumental markers]")
+    from mmusic.match import split_originals, version_markers
+
+    must_hit = ["夜曲 (电台版)", "夜曲 电台版", "晴天 (TV版)", "稻香 铃声版", "晴天 片段版",
+                "晴天 (钢琴版)", "晴天 吉他版", "晴天 抖音版", "晴天 升调版", "晴天 变速版",
+                "晴天 清唱版", "晴天 合唱版", "晴天 交响版", "晴天 教学", "晴天 混剪",
+                "晴天 (Radio Edit)", "晴天 (radio version)", "晴天 (Mashup)", "晴天 (A Cappella)",
+                "晴天 (Inst.)", "晴天 off vocal", "晴天 (Remix)", "晴天 (Live)", "晴天 (伴奏)"]
+    missed = [t for t in must_hit if not version_markers(t)]
+    check("variant: every radio/tv/instrumental marker is caught", not missed, f"missed={missed}")
+
+    # 误伤防护：这些是正常歌名，绝不能因为含"电台/吉他/TV"就被过滤
+    must_not_hit = ["电台情歌", "吉他手", "TV", "夏日倾情", "小情歌", "生活倒影",
+                    "Alive", "Instant Crush", "电音之王"]
+    hurt = [t for t in must_not_hit if version_markers(t)]
+    check("variant: normal song titles are never mis-blocked", not hurt, f"wrongly blocked={hurt}")
+
+    tracks = [Track("s", "夜曲 (电台版)", "周杰伦"), Track("s", "夜曲", "周杰伦")]
+    originals, dropped = split_originals(tracks)
+    check("variant: the radio edit is dropped, the clean one kept",
+          [t.title for t in originals] == ["夜曲"] and len(dropped) == 1,
+          f"kept={[t.title for t in originals]} dropped={len(dropped)}")
+
+
+def test_qualified_title_loses() -> None:
+    """带修饰的标题必须让位给干净标题（相似度会剥掉括号，所以必须显式扣分）。"""
+    print("\n[ranking: clean title beats a qualified one]")
+    from mmusic.match import rank_tracks_multi
+
+    tracks = [Track("s", "夜曲 (电台版)", "周杰伦"),
+              Track("s", "夜曲 (钢琴版)", "周杰伦"),
+              Track("s", "夜曲", "周杰伦")]
+    ranked = rank_tracks_multi([("夜曲", "周杰伦")], tracks)     # 返回的是新列表
+    check("ranking: the unqualified title ranks first",
+          ranked[0].title == "夜曲", str([(t.title, t.score) for t in ranked]))
+    check("ranking: qualified titles are scored lower",
+          ranked[0].score > ranked[1].score, str([t.score for t in ranked]))
+
+
+def test_duration_tolerance_tight() -> None:
+    """旧容差(10%)会放过只短 10% 的电台版；新容差必须挡掉它，且端到端生效。"""
+    print("\n[tolerance: a ~10% shorter cut is rejected]")
+    from mmusic.duration import consensus
+
+    _ref, flags, _why = consensus([228.0, 205.0])
+    check("tolerance: a 205s cut fails against a 228s original", flags == [True, False], str(flags))
+    _ref2, flags2, _why2 = consensus([228.0, 222.0])
+    check("tolerance: a small (6s) difference is still tolerated", flags2 == [True, True], str(flags2))
+
+    real = fx.make_mp3_xing(228)
+    cut = fx.make_mp3_xing(205)
+
+    class FakeSource(SearchSource):
+        def __init__(self, name, path, duration):
+            super().__init__(None, {})
+            self.name, self.label = name, name
+            self._path, self._duration = str(path), duration
+
+        def search(self, query, *, quality="mp3", limit=10):
+            # 两个候选的**标题都干净**（都叫"夜曲"），名字过滤帮不上忙，
+            # 只能靠时长把 205s 的那个挡掉。
+            return [Track(self.name, "夜曲", "周杰伦", duration=self._duration,
+                          ext="mp3", raw={"path": self._path})]
+
+        def resolve(self, track, *, quality="mp3"):
+            track.url = Path(track.raw["path"]).resolve().as_uri()
+            track.ext = "mp3"
+            return track
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        rp, cp = tmp / "real.mp3", tmp / "cut.mp3"
+        rp.write_bytes(real)
+        cp.write_bytes(cut)
+        src = tmp / "夜曲 - 周杰伦.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), enable_fallback=True,
+                                 write_metadata=False, fetch_cover=False,
+                                 remember_hashes=False),
+                        cache_path=tmp / "c.json", on_log=logs.append,
+                        # 两个候选的平台标注**完全一致**（都声称 3:48），只有一个文件其实是 205s。
+        # 名字过滤与"标注预筛"都帮不上忙 —— 只有实测才能识破它。
+        sources=[FakeSource("zaa", rp, 228), FakeSource("zbb", cp, 228)])
+        res = pipe.process_file(src)
+        got = Path(res.out_path).read_bytes() if res.out_path else b""
+        tail = " | ".join(logs[-6:])
+        check("tolerance: the full-length file is the one downloaded", got == real, tail)
+        check("tolerance: the mislabelled short file is rejected after measuring",
+              any("时长异常已排除" in m for m in logs), tail)
+        check("tolerance: log reports a measured-based reference",
+              any("实测" in m and "参考时长" in m for m in logs), tail)
+
+
+def test_mp3_vbr_estimate() -> None:
+    """没有 Xing 头的 MP3 也要能估准时长（按真实帧扫描算平均码率，而非首帧）。"""
+    print("\n[mp3: frame-scan estimate without a Xing header]")
+    from mmusic.duration import audio_duration, mp3_scan_estimate
+
+    # 60 个连续 CBR 帧（128kbps/44.1kHz -> 每帧 417 字节，含 1152 采样）
+    frame = b"\xff\xfb\x90\x00" + b"\x00" * (417 - 4)
+    head = frame * 60
+    scanned_seconds = 60 * 1152 / 44100.0
+
+    est_same = mp3_scan_estimate(head, len(head))          # 整文件 == 已知部分
+    check("mp3: frame-scan reproduces the scanned length itself",
+          est_same is not None and abs(est_same - scanned_seconds) < 0.05, str(est_same))
+
+    est_4x = mp3_scan_estimate(head, len(head) * 4)        # 外推到 4 倍大小
+    check("mp3: frame-scan scales with the advertised file size",
+          est_4x is not None and abs(est_4x - scanned_seconds * 4) < 0.2, str(est_4x))
+
+    check("mp3: no frames -> no estimate (never trusted)",
+          mp3_scan_estimate(b"\x00" * 4096, 4096) is None)
+    check("mp3: head-only estimate never returns a bogus value for silence",
+          audio_duration(b"\x00" * 4096, 4096) is None)
+
+
 def test_live() -> None:
     print("\n[fallback/live]")
     http = HttpClient(timeout=15, retries=2)
@@ -464,7 +1020,22 @@ def main() -> int:
     test_version_filter()
     test_variant_filter_e2e()
     test_cross_source_best()
+    test_duration_verify()
+    test_duration_cross_check_e2e()
+    test_title_gate()
+    test_duration_floor_e2e()
+    test_cross_platform_reference()
+    test_verified_only_download()
     test_title_artist_filename()
+    test_source_pack()
+    test_fusion()
+    test_resource_index()
+    test_fallback_dedupe_e2e()
+    test_dependency_guard()
+    test_variant_filter_more()
+    test_qualified_title_loses()
+    test_duration_tolerance_tight()
+    test_mp3_vbr_estimate()
     if args.live:
         test_live()
 

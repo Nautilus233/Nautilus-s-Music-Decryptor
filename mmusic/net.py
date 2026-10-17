@@ -151,6 +151,68 @@ class HttpClient:
         except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError) as exc:
             raise NetworkError("下载失败", detail=f"{url} :: {exc}") from exc
 
+    def probe_tail(self, url: str, *, limit: int = 128 * 1024,
+                   headers: Optional[dict] = None, timeout: Optional[float] = None
+                   ) -> tuple[bytes, int]:
+        """Fetch just the *tail* of a media file plus its advertised size.
+
+        Some containers keep the length at the end (Ogg's last page granule,
+        an m4a whose `moov` is not "faststart"), so a head-only probe cannot
+        measure them."""
+        to = self.timeout if timeout is None else timeout
+        hdr = {"Accept-Encoding": "identity", "Range": f"bytes=-{limit}"}
+        if headers:
+            hdr.update(headers)
+        req = urllib.request.Request(url, headers=self._headers(hdr), method="GET")
+        try:
+            with self._opener.open(req, timeout=to) as resp:
+                data = resp.read(limit)
+                total = 0
+                content_range = resp.headers.get("Content-Range") or ""
+                if "/" in content_range:
+                    try:
+                        total = int(content_range.rsplit("/", 1)[1])
+                    except ValueError:
+                        total = 0
+                if not total:
+                    total = int(resp.headers.get("Content-Length") or 0)
+                return data, total
+        except urllib.error.HTTPError as exc:
+            raise NetworkError(f"探测失败 HTTP {exc.code}", detail=url) from exc
+        except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError) as exc:
+            raise NetworkError("探测失败", detail=f"{url} :: {exc}") from exc
+
+    def probe(self, url: str, *, limit: int = 256 * 1024,
+              headers: Optional[dict] = None, timeout: Optional[float] = None
+              ) -> tuple[bytes, int]:
+        """Fetch just the *head* of a media file plus its advertised size.
+
+        Used to read a container header (duration/bitrate) without downloading
+        the whole thing: sends a Range request when the server honours it, and
+        always stops reading after `limit` bytes.  Returns (head_bytes, total)."""
+        to = self.timeout if timeout is None else timeout
+        hdr = {"Accept-Encoding": "identity", "Range": f"bytes=0-{limit - 1}"}
+        if headers:
+            hdr.update(headers)
+        req = urllib.request.Request(url, headers=self._headers(hdr), method="GET")
+        try:
+            with self._opener.open(req, timeout=to) as resp:
+                data = resp.read(limit)
+                total = 0
+                content_range = resp.headers.get("Content-Range") or ""
+                if "/" in content_range:
+                    try:
+                        total = int(content_range.rsplit("/", 1)[1])
+                    except ValueError:
+                        total = 0
+                if not total:
+                    total = int(resp.headers.get("Content-Length") or 0)
+                return data, total
+        except urllib.error.HTTPError as exc:
+            raise NetworkError(f"探测失败 HTTP {exc.code}", detail=url) from exc
+        except (urllib.error.URLError, socket.timeout, ssl.SSLError, OSError) as exc:
+            raise NetworkError("探测失败", detail=f"{url} :: {exc}") from exc
+
     def close(self) -> None:
         try:
             self._opener.close()

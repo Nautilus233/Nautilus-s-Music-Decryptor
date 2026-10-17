@@ -43,7 +43,7 @@ class LocalSource(SearchSource):
                         artist="",
                         ext=path.suffix.lstrip(".").lower(),
                         size=path.stat().st_size,
-                        url=str(path),
+                        url="",                       # filled by resolve() as a file: URI
                         raw={"path": str(path)},
                     ))
         results.sort(key=lambda t: similarity(query, t.title), reverse=True)

@@ -20,6 +20,31 @@ PAYLOAD_FLAC = b"fLaC" + b"\x00" * 42 + bytes((i * 7) & 0xFF for i in range(512)
 PAYLOAD_OGG = b"OggS\x00\x02" + bytes((i * 5) & 0xFF for i in range(512))
 
 
+def make_flac(duration: float, *, sample_rate: int = 44100, channels: int = 2,
+              bits: int = 16, pad: int = 40000) -> bytes:
+    """A FLAC whose STREAMINFO declares `duration` seconds (exact, size-independent)."""
+    total_samples = int(duration * sample_rate)
+    packed = ((sample_rate << 44) | ((channels - 1) << 41) | ((bits - 1) << 36)
+              | total_samples)
+    # STREAMINFO = min/max block (2+2) + min/max frame (3+3) + packed (8) + MD5 (16)
+    streaminfo = (4096).to_bytes(2, "big") * 2 + b"\x00" * 6 + packed.to_bytes(8, "big") \
+                 + b"\x00" * 16
+    assert len(streaminfo) == 34
+    return b"fLaC" + bytes([0x00]) + (34).to_bytes(3, "big") + streaminfo + b"\x00" * pad
+
+
+def make_mp3_xing(duration: float, *, sample_rate: int = 44100, pad: int = 40000) -> bytes:
+    """An MP3 with a Xing header declaring exactly `duration` seconds."""
+    spf = 1152
+    frames = max(1, int(duration * sample_rate / spf))
+    head = bytearray(36)                 # 4-byte frame header + 32-byte stereo side info
+    head[0], head[1] = 0xFF, 0xFB        # MPEG1 / Layer III / no CRC
+    head[2] = (9 << 4) | (0 << 2)        # 128 kbps @ 44100 Hz
+    head[3] = 0x00                       # stereo
+    xing = b"Xing" + (0x00000001).to_bytes(4, "big") + frames.to_bytes(4, "big")
+    return bytes(head) + xing + b"\x00" * pad
+
+
 # --------------------------------------------------------------------- #
 # NCM
 # --------------------------------------------------------------------- #

@@ -33,6 +33,7 @@ class Track:
     bitrate: int = 0           # kbps, 0 == unknown
     ext: str = "mp3"
     size: int = 0              # bytes, 0 == unknown
+    actual_duration: "float | None" = None   # seconds, measured from the audio itself
     url: str = ""              # direct link (may be filled lazily)
     raw: dict = field(default_factory=dict)
     score: float = 0.0

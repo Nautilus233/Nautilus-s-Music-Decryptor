@@ -106,6 +106,8 @@ def main(argv=None) -> int:
     parser.add_argument("--selftest", action="store_true", help="运行自检")
     parser.add_argument("--check-qt", action="store_true", help="自检：加载 Qt 并打印版本后退出")
     parser.add_argument("--check-ui", action="store_true", help="自检：校验主窗口与设置弹窗的屏幕自适应")
+    parser.add_argument("--sources-report", action="store_true",
+                        help="打印音源清单与健康统计后退出")
     args = parser.parse_args(argv)
 
     if args.check_qt:
@@ -125,6 +127,28 @@ def main(argv=None) -> int:
         theme.apply(app)
         failed = selfcheck.run(app)
         return 1 if failed else 0
+    if args.sources_report:
+        _ensure_utf8_console()
+        from mmusic.config import AppConfig
+        from mmusic.search.index import ResourceIndex
+        from mmusic.search.pack import pack_summary
+        from mmusic.search.registry import specs_for
+
+        config = AppConfig()
+        print("配置的音源（按尝试顺序）：")
+        print(pack_summary(specs_for(config.settings.to_dict())))
+        ledger = ResourceIndex(config.cache_path.parent / "resources.db")
+        print(f"\n台账：{ledger.stats()}")
+        rows = ledger.health()
+        print("音源健康统计：")
+        if not rows:
+            print("  （暂无记录：还没走过备用下载）")
+        for row in rows:
+            print(f"  {row['source']:11} 尝试 {row['attempts']:>4}  成功 {row['successes']:>4}"
+                  f"  失败 {row['failures']:>4}  成功率 {row['success_rate'] * 100:.0f}%"
+                  f"  平均 {row['avg_ms']} ms")
+        ledger.close()
+        return 0
     if args.selftest:
         sys.argv = ["selftest"]
         runpy.run_path(str(ROOT / "tests" / "selftest.py"), run_name="__main__")

@@ -1,3 +1,9 @@
+"""Build the fallback source chain from the declarative pack.
+
+Behaviour is identical to the previous hard-coded registry - the only change
+is that *which* sources exist, in what order, now comes from
+:mod:`mmusic.search.pack` (data) instead of a literal dict (code).
+"""
 from __future__ import annotations
 
 from typing import Optional
@@ -7,11 +13,10 @@ from .base import SearchSource
 from .kugou import KugouSource
 from .kuwo import KuwoSource
 from .local import LocalSource
+from .pack import DEFAULT_ORDER, load_pack  # noqa: F401  (DEFAULT_ORDER re-exported)
 
-# ordered default fallback chain: local first (free), then the online ones
-DEFAULT_ORDER = ["local", "kuwo", "kugou", "aggregator"]
-
-_REGISTRY: "dict[str, type[SearchSource]]" = {
+#: built-in implementations addressable from a pack entry
+_ADAPTERS: "dict[str, type[SearchSource]]" = {
     KuwoSource.name: KuwoSource,
     KugouSource.name: KugouSource,
     AggregatorSource.name: AggregatorSource,
@@ -20,16 +25,23 @@ _REGISTRY: "dict[str, type[SearchSource]]" = {
 
 
 def available_sources() -> list[str]:
-    return list(_REGISTRY)
+    """Ids of the built-in implementations (unchanged public behaviour)."""
+    return list(_ADAPTERS)
+
+
+def specs_for(settings: Optional[dict] = None):
+    """The ordered :class:`SourceSpec` list for these settings."""
+    return load_pack(settings or {})
 
 
 def build_sources(http, settings: Optional[dict] = None) -> list[SearchSource]:
     settings = settings or {}
-    order = settings.get("sources") or DEFAULT_ORDER
     built: list[SearchSource] = []
-    for name in order:
-        cls = _REGISTRY.get(name)
+    for spec in specs_for(settings):
+        cls = _ADAPTERS.get(spec.impl)
         if cls is None:
+            # a data-only spec (json_api / html_scrape / template_url) has no
+            # implementation yet - P2 drives those; skip instead of failing.
             continue
         try:
             built.append(cls(http, settings))
