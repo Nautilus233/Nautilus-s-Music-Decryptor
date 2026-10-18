@@ -765,7 +765,8 @@ class Pipeline:
 
     @staticmethod
     def _referer_for(track: Track) -> str:
-        return {"kuwo": "https://www.kuwo.cn/", "kugou": "https://www.kugou.com/"}.get(track.source, "")
+        return {"kuwo": "https://www.kuwo.cn/", "kugou": "https://www.kugou.com/",
+                "migu": "https://music.migu.cn/"}.get(track.source, "")
 
     def _fetch_cover(self, url: str) -> bytes:
         try:

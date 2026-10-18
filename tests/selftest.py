@@ -647,8 +647,8 @@ def test_source_pack() -> None:
     from mmusic.search.registry import available_sources, build_sources
 
     specs = builtin_specs()
-    check("pack: builtin pack lists the four live sources in order",
-          [s.id for s in specs][:4] == ["local", "kuwo", "kugou", "aggregator"],
+    check("pack: builtin pack lists the live sources in order",
+          [s.id for s in specs][:5] == ["local", "kuwo", "kugou", "migu", "aggregator"],
           str([s.id for s in specs]))
     check("pack: demo/experimental entries are not built in",
           "example_open_audio" not in [s.id for s in specs],
@@ -677,7 +677,7 @@ def test_source_pack() -> None:
 
     ids = [s.id for s in load_pack({})]
     check("pack: default order is local-first and CC/PD last",
-          ids[:4] == ["local", "kuwo", "kugou", "aggregator"]
+          ids[:5] == ["local", "kuwo", "kugou", "migu", "aggregator"]
           and {"wikimedia", "internet_archive"} <= set(ids)
           and ids[-1] == "internet_archive"
           and "aggregator_joox" not in ids, str(ids))
@@ -701,7 +701,7 @@ def test_source_pack() -> None:
     built = build_sources(None, {})
     names = [x.name for x in built]
     check("pack: registry builds the full chain, names unique",
-          names[:4] == ["local", "kuwo", "kugou", "aggregator"]
+          names[:5] == ["local", "kuwo", "kugou", "migu", "aggregator"]
           and len(set(names)) == len(names) and "internet_archive" in names, str(names))
     check("pack: available_sources grew, mainstream kept",
           {"kuwo", "kugou", "aggregator", "local"} <= set(available_sources())
@@ -1418,6 +1418,78 @@ def test_new_sources() -> None:
           agg.provider == "joox" and agg.name == "aggregator", agg.provider)
 
 
+def test_migu_source() -> None:
+    """咪咕：离线夹具 —— 检索解析 + listen-url 取链 + 免登录降级逻辑。"""
+    print("\n[migu: search + listen-url resolve]")
+    from mmusic.search.migu import MiguSource
+
+    SEARCH_JSON = {
+        "code": "000000",
+        "songResultData": {"result": [
+            {"id": "1104716107", "contentId": "600929000005945142",
+             "copyrightId": "69085303837", "resourceType": "2",
+             "name": "光年之外",
+             "singers": [{"id": "1", "name": "G.E.M.邓紫棋"}],
+             "albums": [{"id": "2", "name": "光年之外"}],
+             "newRateFormats": [{"formatType": "PQ", "size": "3769366",
+                                 "fileType": "mp3"}]},
+            {"id": "9", "contentId": "600", "copyrightId": "690",
+             "resourceType": "2", "name": "光年之外(伴奏)",
+             "singers": [{"name": "某某"}], "albums": []},
+        ]},
+    }
+    OK_JSON = {"code": "000000", "info": "操作成功", "data": {
+        "formatType": "PQ", "url": "https://freetyst.nf.migu.cn/x/y.mp3?Key=k"}}
+    LOGIN_JSON = {"code": "000000", "info": "操作成功", "data": {
+        "cannotCode": "440003", "dialogInfo": {"text": "登录后免费试听"}}}
+    DEAD_JSON = {"code": "000000", "info": "操作成功", "data": {"cannotCode": "440004"}}
+
+    class FakeHttp:
+        def __init__(self, listen_replies):
+            self.calls = []
+            self.listen_replies = list(listen_replies)
+
+        def get_json(self, url, *, headers=None, **kw):
+            self.calls.append((url, dict(headers or {})))
+            if "search_all.do" in url:
+                return SEARCH_JSON
+            return self.listen_replies.pop(0) if self.listen_replies else DEAD_JSON
+
+    http = FakeHttp([OK_JSON])
+    src = MiguSource(http, {})
+    tracks = src.search("光年之外", limit=8)
+    check("migu: search maps name/singers/album and keeps the raw item",
+          len(tracks) == 2 and tracks[0].title == "光年之外"
+          and tracks[0].artist == "G.E.M.邓紫棋" and tracks[0].album == "光年之外"
+          and tracks[0].raw["contentId"] == "600929000005945142", str(tracks[:1]))
+    check("migu: listen requests always carry the channel header",
+          all("channel" in h for _u, h in http.calls), str(http.calls))
+
+    track = src.resolve(tracks[0])
+    check("migu: resolve returns the CDN url with the declared size",
+          track.url.startswith("https://freetyst.nf.migu.cn/")
+          and track.size == 3769366 and track.ext == "mp3" and track.bitrate == 128,
+          "%s / %s" % (track.url, track.size))
+
+    http2 = FakeHttp([LOGIN_JSON, OK_JSON])
+    src2 = MiguSource(http2, {})
+    t2 = src2.search("光年之外")[0]
+    t2 = src2.resolve(t2, quality="flac")
+    check("migu: a login-walled SQ degrades to PQ instead of giving up",
+          t2.ext == "mp3" and t2.url.startswith("https://freetyst.nf.migu.cn/"),
+          "%s / %s" % (t2.ext, t2.url))
+
+    http3 = FakeHttp([DEAD_JSON, DEAD_JSON])
+    src3 = MiguSource(http3, {})
+    t3 = src3.search("光年之外")[0]
+    try:
+        src3.resolve(t3)
+        ok = False
+    except Exception as exc:                       # noqa: BLE001
+        ok = "无免费直链" in str(exc)
+    check("migu: no-free tracks raise a readable error", ok)
+
+
 def test_manual_links() -> None:
     """P3：手动补链 —— 用户给的链接优先使用、跳过歌名/歌手门槛，但仍走下载校验。"""
     print("\n[manual links]")
@@ -1727,6 +1799,7 @@ def main() -> int:
     test_strong_gate()
     test_query_expander()
     test_new_sources()
+    test_migu_source()
     test_manual_links()
     test_variant_retry_e2e()
     test_import_all_modules()

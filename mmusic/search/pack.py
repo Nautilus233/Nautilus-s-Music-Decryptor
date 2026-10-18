@@ -32,7 +32,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 ALLOWED_KINDS = ("adapter", "json_api", "html_scrape", "template_url", "local")
 # P0 只存在这些内置实现；P2 起 json_api/html_scrape/template_url 由通用引擎驱动
-KNOWN_IMPLS = ("kuwo", "kugou", "aggregator", "local",
+KNOWN_IMPLS = ("kuwo", "kugou", "migu", "aggregator", "local",
                "wikimedia", "internet_archive", "manual")
 SPEC_FIELDS = frozenset({
     "id", "label", "kind", "impl", "enabled_by_default", "offline",
@@ -41,7 +41,7 @@ SPEC_FIELDS = frozenset({
 #: sources are tried in this order unless the user reorders them
 # 顺序 = 命中概率 × 稳定性：先本地、再中文主流平台、再聚合通道，
 # 最后才是 CC/PD 开放库（它们覆盖"冷门/古典/现场"，但通常不带流行曲）
-DEFAULT_ORDER = ("local", "kuwo", "kugou", "aggregator",
+DEFAULT_ORDER = ("local", "kuwo", "kugou", "migu", "aggregator",
                  "wikimedia", "internet_archive")
 _ID_RE = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 #: 旧版本写死的默认音源名单（用于识别"这份配置其实没被用户改过"）
@@ -175,7 +175,7 @@ def validate_pack(data: object) -> list[SourceSpec]:
 
 
 # ---------------------------------------------------------------------------
-# built-in pack (equivalent to the four hand-written adapters)
+# built-in pack (equivalent to the hand-written adapters)
 # ---------------------------------------------------------------------------
 BUILTIN_PACK: tuple[SourceSpec, ...] = (
     SourceSpec(id="local", label="本地曲库(CC0/自建)", kind="local", impl="local",
@@ -188,6 +188,10 @@ BUILTIN_PACK: tuple[SourceSpec, ...] = (
                enabled_by_default=True, home="https://www.kugou.com/",
                license_note="公开检索接口，仅按歌名定向查询",
                rate_limit={"per_host_rps": 1.0, "burst": 3}),
+    SourceSpec(id="migu", label="咪咕音乐", kind="adapter", impl="migu",
+               enabled_by_default=True, home="https://music.migu.cn/",
+               license_note="公开 H5 接口（免登录 PQ），仅供个人试听/备份用途",
+               rate_limit={"per_host_rps": 1.0, "burst": 2}),
     SourceSpec(id="aggregator", label="全网聚合(MyFreeMP3)", kind="adapter", impl="aggregator",
                enabled_by_default=True, home="https://music-api.gdstudio.xyz/",
                license_note="公共聚合网关，地址可由用户改为自建",

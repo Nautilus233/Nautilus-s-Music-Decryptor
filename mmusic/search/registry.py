@@ -16,6 +16,7 @@ from .kugou import KugouSource
 from .kuwo import KuwoSource
 from .local import LocalSource
 from .manual import ManualLinkSource
+from .migu import MiguSource
 from .pack import DEFAULT_ORDER, load_pack, SourceSpec  # noqa: F401
 from .wikimedia import WikimediaCommonsSource
 
@@ -23,6 +24,7 @@ from .wikimedia import WikimediaCommonsSource
 _ADAPTERS: "dict[str, type[SearchSource]]" = {
     KuwoSource.name: KuwoSource,
     KugouSource.name: KugouSource,
+    MiguSource.name: MiguSource,
     AggregatorSource.name: AggregatorSource,
     LocalSource.name: LocalSource,
     WikimediaCommonsSource.name: WikimediaCommonsSource,

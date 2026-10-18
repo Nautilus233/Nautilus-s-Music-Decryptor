@@ -63,7 +63,7 @@
 - **能力层（无界面、可独立复用）**
   - `mmusic/sniff.py`：格式识别（头部魔数 + 扩展名 + 尾部特征）。
   - `mmusic/crypto/`：`aes.py`（纯 Python AES-ECB）、`tea.py`（TEA + 腾讯 TEA-CBC）、`ncm.py`、`qmc.py`。
-  - `mmusic/search/`：备用音源适配器（`kuwo` / `kugou` / `aggregator` / `local`）与注册表。
+  - `mmusic/search/`：备用音源适配器（`kuwo` / `kugou` / `migu` / `aggregator` / `local` 等）与注册表。
   - `mmusic/downloader.py`：下载结果校验（文件头、码率、大小）。
   - `mmusic/metadata.py`： mutagen 读写标签与封面（缺失时优雅降级）。
   - `mmusic/net.py`：基于 `urllib` 的 HTTP 客户端（超时 / 重试 / gzip / 流式下载）。
@@ -328,6 +328,7 @@ class SearchSource(ABC):
 
 - **Kuwo（酷我）**：`search.kuwo.cn/r.s`（伪 JSON，用“括号深度扫描器”解析含嵌套对象的条目）+ `antiserver.kuwo.cn/anti.s?type=convert_url3` 直链。已验证可达并返回 CDN mp3 直链。
 - **Kugou（酷狗）**：`songsearch.kugou.com/song_search_v2`（标准 JSON）+ `m.kugou.com/app/i/getSongInfo.php` 直链（免费曲目返回 `url`，付费曲目 `url` 为空 → 自动跳过）。
+- **Migu（咪咕）**：`search_all.do`（标准 JSON，`searchSwitch` 必填）+ `content/listen-url`（`channel` 走**请求头**；免登录 PQ 128k，HQ/SQ 遇登录墙自动降级）。实测直链字节数与官方声明一致、时长探测与完整度门禁均通过。
 - **Aggregator（MyFreeMP3 / 聚合网关）**：可配置的 `api.php` 风格接口（默认 `music-api.gdstudio.xyz`），`types=search|url|pic|lyric`，实测可返回 NetEase 320kbps 直链与封面。**地址/平台可在设置里改**。
 - **Local（本地曲库 / CC0 音效库）**：扫描用户指定目录，`file://` 命中即用，完全离线、优先级最高。
 

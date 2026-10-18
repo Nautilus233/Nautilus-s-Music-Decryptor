@@ -28,8 +28,18 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host '==> building (this can take a few minutes)' -ForegroundColor Cyan
-$cleanArg = if ($NoClean) { @() } else { @('--clean') }
-python -m PyInstaller --noconfirm @cleanArg --distpath dist --workpath build\work build\music_decryptor.spec
+# 注意：不要把 `@var` splat 用在原生命令上 —— PowerShell 会把经 if/管道等
+# 表达式折叠后的单元素“数组”还原成字符串，再逐字符展开（历史事故：
+# @cleanArg 把 "--clean" 变成 "- - c l e a n"，PyInstaller 只报
+# "unrecognized arguments: ...spec"，且旧版脚本还会误报构建成功）。
+# 显式构造数组传参，并在调用后检查退出码。
+$pyArgs = @('--noconfirm')
+if (-not $NoClean) { $pyArgs += '--clean' }
+$pyArgs += @('--distpath', 'dist', '--workpath', 'build\work', 'build\music_decryptor.spec')
+python -m PyInstaller $pyArgs
+if ($LASTEXITCODE -ne 0) {
+    throw "build failed: PyInstaller exited with code $LASTEXITCODE"
+}
 
 $exe = Join-Path $root 'dist\MusicDecryptor.exe'
 if (Test-Path $exe) {
