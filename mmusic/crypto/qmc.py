@@ -320,5 +320,9 @@ class QmcDecoder:
         ext = sniffed
         if ext == "mmp4":
             ext = "m4a"
-        return AudioResult(audio=audio, ext=ext,
-                           meta={"songId": self.song_id} if self.song_id else {})
+        meta: "dict" = {}
+        if self.song_id:
+            meta["songId"] = self.song_id
+        if self.note:                 # 例如“musicex（本地 ekey 已加载…）”，由流水线写进日志
+            meta["note"] = self.note
+        return AudioResult(audio=audio, ext=ext, meta=meta)

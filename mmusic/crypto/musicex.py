@@ -16,7 +16,8 @@ from pathlib import Path
 
 from ..constants import QMC_TAG_MUSICEX
 
-__all__ = ["MusicexTail", "parse_tail", "find_ekey_text"]
+__all__ = ["MusicexTail", "parse_tail", "parse_file", "find_ekey_path",
+           "find_ekey_text"]
 
 #: (mid 起点, mid 终点, 文件名起点, 文件名终点, 音频后额外的前缀字节数)
 #: A 变体：tail=192，audio = size - tail；B 变体：tail=200，audio = size - tail - 16
@@ -60,44 +61,68 @@ def parse_tail(tail: bytes, file_size: int) -> "MusicexTail | None":
     return None
 
 
-def find_ekey_text(src_path: "str | Path | None", song_mid: str,
-                   filename: str) -> "str | None":
-    """在加密文件附近查找用户自行准备的 ekey 文本；没有则返回 None。
+def parse_file(path: "str | Path") -> "MusicexTail | None":
+    """直接读文件尾部的便捷入口（供 ekey 获取等使用）。"""
+    p = Path(path)
+    try:
+        size = p.stat().st_size
+        with open(p, "rb") as fh:
+            fh.seek(-min(size, 4096), 2) if size > 4096 else fh.seek(0)
+            tail = fh.read()
+    except OSError:
+        return None
+    return parse_tail(tail, size)
 
-    查找顺序：
-      1. ``<dir>/ekeys/<song_mid>__<filename>.txt``（社区 fetch_ekey 默认布局）
-      2. ``<dir>/ekeys/<song_mid>.txt``
-      3. ``<dir>/ekeys/<song_mid>*.txt``（按文件名排序取第一个非空）
-      4. ``<song.mgg>.ekey`` 或 ``<song>.ekey``（同名旁挂文件）
+
+def _ekey_candidates(src: Path, song_mid: str, filename: str) -> "list[Path]":
+    """候选 ekey 文件，按优先级排序（社区 fetch_ekey 默认布局优先）。"""
+    parent = src.parent
+    ekeys_dir = parent / "ekeys"
+    cands: "list[Path]" = [ekeys_dir / f"{song_mid}__{filename}.txt",
+                           ekeys_dir / f"{song_mid}.txt"]
+    try:
+        cands.extend(sorted(ekeys_dir.glob(f"{song_mid}*.txt")))
+    except OSError:
+        pass
+    cands.append(parent / f"{src.name}.ekey")
+    cands.append(parent / f"{src.stem}.ekey")
+    return cands
+
+
+def find_ekey_path(src_path: "str | Path | None", song_mid: str,
+                   filename: str) -> "Path | None":
+    """返回**实际可用**的 ekey 文件路径（存在且非空）；没有则 None。
+
+    查找顺序：``ekeys/<mid>__<filename>.txt`` → ``ekeys/<mid>.txt`` →
+    ``ekeys/<mid>*.txt`` → ``<song.mgg>.ekey`` / ``<song>.ekey``。
     """
     if not src_path:
         return None
     try:
         src = Path(src_path)
-        parent = src.parent
     except (TypeError, OSError):
         return None
-    candidates: "list[Path]" = []
-    ekeys_dir = parent / "ekeys"
-    candidates.append(ekeys_dir / f"{song_mid}__{filename}.txt")
-    candidates.append(ekeys_dir / f"{song_mid}.txt")
-    try:
-        candidates.extend(sorted(ekeys_dir.glob(f"{song_mid}*.txt")))
-    except OSError:
-        pass
-    candidates.append(parent / f"{src.name}.ekey")
-    candidates.append(parent / f"{src.stem}.ekey")
     seen: "set[str]" = set()
-    for cand in candidates:
+    for cand in _ekey_candidates(src, song_mid, filename):
         marker = str(cand)
         if marker in seen:
             continue
         seen.add(marker)
         try:
-            if cand.is_file():
-                text = cand.read_text("utf-8", errors="ignore").strip()
-                if text:
-                    return text
+            if cand.is_file() and cand.read_text("utf-8", errors="ignore").strip():
+                return cand
         except OSError:
             continue
     return None
+
+
+def find_ekey_text(src_path: "str | Path | None", song_mid: str,
+                   filename: str) -> "str | None":
+    """查找 ekey 文本（没有则 None）。"""
+    path = find_ekey_path(src_path, song_mid, filename)
+    if path is None:
+        return None
+    try:
+        return path.read_text("utf-8", errors="ignore").strip()
+    except OSError:
+        return None

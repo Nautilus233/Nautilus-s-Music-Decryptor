@@ -1787,6 +1787,8 @@ def test_musicex_container() -> None:
         r2 = QmcDecoder(p2.read_bytes(), "mgg", src_path=p2).decode()
         check("musicex: payload decodes byte-exact with a local ekey",
               r2.audio == fx.PAYLOAD_OGG)
+        check("musicex: success path reports the ekey in meta (log transparency)",
+              "ekey" in (r2.meta or {}).get("note", ""), str(r2.meta))
 
         # ③ B 变体（tail=200）+ <mid>.txt 命名 + RC4 密钥
         p3 = tmp / "B变体.mflac"
@@ -1814,6 +1816,229 @@ def test_qmc_no_silent_garbage() -> None:
     except DecryptionFailedError as exc:
         ok, msg = ("不是有效音频" in exc.message), exc.message
     check("qmc-guard: garbage never becomes a written file", ok, msg)
+
+
+def test_target_format_matrix() -> None:
+    """目标音质矩阵（纯逻辑）：MP3 全转 / 无损升级 / 有损降级 / 引擎缺失回退。"""
+    print("\n[target quality: matrix + engine fallback]")
+    from mmusic.transcode import plan, plan_effective
+
+    check("quality: mp3 target converts everything (flac too)",
+          plan("flac", "mp3") == ("mp3", "") and plan("ogg", "mp3")[0] == "mp3"
+          and plan("wav", "mp3")[0] == "mp3")
+    check("quality: already-matching format is a no-op",
+          plan("mp3", "mp3") == ("keep", "") and plan("flac", "flac") == ("keep", ""))
+    check("quality: flac target upgrades lossless, degrades lossy with a note",
+          plan("wav", "flac") == ("flac", "")
+          and plan("ogg", "flac")[0] == "mp3" and "有损" in plan("ogg", "flac")[1])
+    check("quality: wav target keeps lossless as-is, degrades lossy",
+          plan("wav", "wav") == ("keep", "") and plan("flac", "wav") == ("keep", "")
+          and plan("m4a", "wav")[0] == "mp3")
+    action, note = plan_effective("ogg", "mp3", engine_available=False)
+    check("quality: engine missing -> keep original with a readable note",
+          action == "keep" and "引擎不可用" in note, note)
+
+
+def _make_test_wav(seconds: float = 1.0) -> bytes:
+    import io as _io, math as _math, struct as _struct, wave as _wave
+    frames = bytearray()
+    for i in range(int(44100 * seconds)):
+        v = int(9000 * _math.sin(2 * _math.pi * 440 * i / 44100))
+        frames += _struct.pack("<hh", v, v)
+    buf = _io.BytesIO()
+    with _wave.open(buf, "wb") as w:
+        w.setnchannels(2); w.setsampwidth(2); w.setframerate(44100)
+        w.writeframes(bytes(frames))
+    return buf.getvalue()
+
+
+def test_transcode_engine() -> None:
+    """转码引擎端到端：stdlib 生成 WAV → MP3 / FLAC，并回环解码验证。"""
+    print("\n[transcode engine: wav -> mp3 / flac / roundtrip]")
+    from mmusic import transcode
+    from mmusic.duration import audio_duration, flac_streaminfo, mp3_frame_info
+
+    if not transcode.available():
+        check("transcode: engine unavailable -> graceful skip", True,
+              transcode.unavailable_reason())
+        print("  （本机引擎不可用，跳过端到端用例）")
+        return
+
+    wav = _make_test_wav()
+    mp3, ext = transcode.convert_bytes(wav, "wav", "mp3")
+    info = mp3_frame_info(mp3)
+    check("transcode: wav -> 320k mp3 (MPEG1 L3)",
+          ext == "mp3" and bool(info) and info["bitrate"] == 320
+          and info["sample_rate"] == 44100, str(info))
+    check("transcode: wav -> mp3 duration ~1s",
+          (audio_duration(mp3, len(mp3)) or 0) > 0.7, str(audio_duration(mp3, len(mp3))))
+    flac, ext2 = transcode.convert_bytes(wav, "wav", "flac")
+    si = flac_streaminfo(flac)
+    check("transcode: wav -> flac (hand-built container)",
+          ext2 == "flac" and flac[:4] == b"fLaC" and bool(si)
+          and si["sample_rate"] == 44100 and si["channels"] == 2, str(si))
+    back, _ = transcode.convert_bytes(flac, "flac", "mp3")
+    check("transcode: our flac decodes back (container + frames valid)",
+          (audio_duration(back, len(back)) or 0) > 0.7, str(audio_duration(back, len(back))))
+
+
+def test_pipeline_quality_e2e() -> None:
+    """流水线端到端：明文 WAV + 目标 MP3 → 产出 .mp3（目标音质真正生效）。"""
+    print("\n[target quality: pipeline end-to-end]")
+    from mmusic import transcode
+    if not transcode.available():
+        check("quality-e2e: engine unavailable -> skip", True)
+        return
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = tmp / "song.wav"
+        src.write_bytes(_make_test_wav())
+        logs: "list[str]" = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), quality="mp3",
+                                 enable_fallback=False, write_metadata=False,
+                                 fetch_cover=False, remember_hashes=False),
+                        cache_path=tmp / "c.json", on_log=logs.append, sources=[])
+        res = pipe.process_file(src)
+        out = Path(res.out_path) if res.out_path else None
+        check("quality-e2e: plain wav + mp3 target -> .mp3 produced",
+              out is not None and out.exists() and out.suffix == ".mp3"
+              and out.stat().st_size > 1000, f"{res.status} {res.out_path}")
+
+
+def test_ekey_fetch() -> None:
+    """ekey 按需获取：请求体/响应解析/凭证归一化/缓存新鲜度/失败降级（全离线夹具）。"""
+    print("\n[ekey: on-demand fetch (offline fixtures)]")
+    import json as _json
+    from mmusic import ekeys
+    from mmusic.crypto.musicex import find_ekey_path
+
+    body = ekeys.build_request("12345", "00TEST00000001", "TEST00001.mgg")
+    check("ekey: request follows the GetEVkey shape",
+          body["req_1"]["module"] == "music.vkey.GetEVkey"
+          and body["req_1"]["method"] == "CgiGetEVkey"
+          and body["req_1"]["param"]["songmid"] == ["00TEST00000001"]
+          and body["req_1"]["param"]["filename"] == ["TEST00001.mgg"]
+          and body["comm"]["uin"] == "12345", str(body)[:100])
+    check("ekey: response parser returns the ekey",
+          ekeys.parse_response({"req_1": {"code": 0,
+                                          "data": {"midurlinfo": [{"ekey": "ABC123"}]}}}) == "ABC123")
+    bad_ok = 0
+    for bad in ({"req_1": {"code": 1000, "info": "未登录"}},
+                {"req_1": {"code": 0, "data": {"midurlinfo": []}}}):
+        try:
+            ekeys.parse_response(bad)
+        except ekeys.EkeyError:
+            bad_ok += 1
+    check("ekey: a bad response raises EkeyError", bad_ok == 2)
+    check("ekey: a whole pasted cookie is normalised",
+          ekeys.normalize_creds("", "qqmusic_key=K1; qqmusic_uin=777")
+          == ("777", "qqmusic_key=K1; qqmusic_uin=777")
+          and ekeys.normalize_creds("777", "K2")[1] == "qqmusic_key=K2; qqmusic_uin=777")
+
+    class EkeyHttp:
+        def __init__(self, payload):
+            self.calls = []
+            self.payload = payload
+
+        def request(self, method, url, *, data=None, headers=None, **kw):
+            self.calls.append({"method": method, "url": url,
+                               "cookie": (headers or {}).get("Cookie", ""),
+                               "body": _json.loads((data or b"{}").decode("utf-8"))})
+            return 200, _json.dumps(self.payload).encode("utf-8"), {}
+
+    ok_payload = {"req_1": {"code": 0, "data": {"midurlinfo": [{"ekey": "SYNTH-EKEY"}]}}}
+
+    class Creds:
+        qqmusic_uin = "12345"
+        qqmusic_key = "KEY-XYZ"
+
+    class NoCreds:
+        qqmusic_uin = ""
+        qqmusic_key = ""
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = tmp / "song.mgg"
+        src.write_bytes(fx.build_musicex(fx.PAYLOAD_OGG))
+        http = EkeyHttp(ok_payload)
+        ok, why = ekeys.ensure_ekey(http, NoCreds(), src, retry_delay=0.0)
+        check("ekey: without credentials nothing is requested",
+              ok is False and "凭证" in why and not http.calls, why)
+        ok, why = ekeys.ensure_ekey(http, Creds(), src, retry_delay=0.0)
+        written = find_ekey_path(src, "00TEST00000001", "TEST00001.mgg")
+        check("ekey: the fetched ekey is written to ekeys/<mid>__<file>.txt",
+              ok and written is not None
+              and written.read_text("utf-8").strip() == "SYNTH-EKEY", f"{why} | {written}")
+        calls = len(http.calls)
+        ok2, why2 = ekeys.ensure_ekey(http, Creds(), src, retry_delay=0.0)
+        check("ekey: a fresh cached ekey is reused (no extra request)",
+              ok2 and len(http.calls) == calls, why2)
+        check("ekey: the request carried the cookie to the official endpoint",
+              bool(http.calls) and http.calls[0]["method"] == "POST"
+              and http.calls[0]["url"] == ekeys.API
+              and http.calls[0]["cookie"] == "qqmusic_key=KEY-XYZ; qqmusic_uin=12345"
+              and http.calls[0]["body"]["req_1"]["param"]["filename"] == ["TEST00001.mgg"],
+              str(http.calls[:1])[:110])
+        bad_src = tmp / "song2.mgg"
+        bad_src.write_bytes(fx.build_musicex(fx.PAYLOAD_OGG, song_mid="00TEST00000002",
+                                            filename="TEST00002.mgg"))
+        ok3, why3 = ekeys.ensure_ekey(EkeyHttp({"req_1": {"code": 1000, "info": "need login"}}),
+                                      Creds(), bad_src, retry_delay=0.0)
+        check("ekey: an API rejection degrades with a readable reason",
+              ok3 is False and "失败" in why3, why3)
+
+
+def test_ekey_pipeline_e2e() -> None:
+    """流水线：musicex + 已配置凭证 + 假 HTTP → 自动取 ekey 并当次解码。"""
+    print("\n[ekey: pipeline auto-fetch end-to-end]")
+    import json as _json
+    from mmusic.config import Settings
+
+    key = bytes(range(32))
+    ekey_text = fx.make_qmc_v2_key(key).decode("ascii")
+
+    class EkeyHttp:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, method, url, *, data=None, headers=None, **kw):
+            self.calls += 1
+            payload = {"req_1": {"code": 0, "data": {"midurlinfo": [{"ekey": ekey_text}]}}}
+            return 200, _json.dumps(payload).encode("utf-8"), {}
+
+        def close(self):
+            pass
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        src = tmp / "song.mgg"
+        src.write_bytes(fx.build_musicex(fx.PAYLOAD_OGG, key))
+        settings = Settings(output_dir=str(tmp / "out"), quality="mp3",
+                            enable_fallback=False, write_metadata=False,
+                            fetch_cover=False, remember_hashes=False,
+                            timeout=5.0, retries=0, min_bitrate=0,
+                            qqmusic_uin="12345", qqmusic_key="K")
+        logs: "list[str]" = []
+        pipe = Pipeline(settings, cache_path=tmp / "c.json", on_log=logs.append,
+                        sources=[], http=EkeyHttp())
+        res = pipe.process_file(src)
+        check("ekey-e2e: the musicex file decodes after the silent fetch",
+              res.status == "decoded", f"{res.status} {res.message}")
+        check("ekey-e2e: the ekey file was written next to the source",
+              (tmp / "ekeys" / "00TEST00000001__TEST00001.mgg.txt").is_file())
+        check("ekey-e2e: the log reports the silent fetch",
+              any("已静默获取 ekey" in m for m in logs), " | ".join(logs[-3:]))
+
+
+def test_settings_roundtrip() -> None:
+    """设置项往返：凭证 / 自动开始 / 目标音质等字段不丢、类型正确。"""
+    print("\n[settings: round-trip]")
+    from mmusic.config import Settings
+    s = Settings(quality="flac", qqmusic_uin="1", qqmusic_key="K", auto_start=False)
+    back = Settings.from_dict(s.to_dict())
+    check("settings: new fields round-trip (creds / auto-start / quality)",
+          back.qqmusic_uin == "1" and back.qqmusic_key == "K"
+          and back.auto_start is False and back.quality == "flac")
 
 
 def test_completeness_gate() -> None:
@@ -1977,6 +2202,12 @@ def main() -> int:
     test_kwm_decoder()
     test_musicex_container()
     test_qmc_no_silent_garbage()
+    test_target_format_matrix()
+    test_transcode_engine()
+    test_pipeline_quality_e2e()
+    test_ekey_fetch()
+    test_ekey_pipeline_e2e()
+    test_settings_roundtrip()
     test_completeness_gate()
     if args.live:
         test_live()

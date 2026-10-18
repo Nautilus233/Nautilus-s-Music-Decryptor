@@ -35,6 +35,12 @@ class Settings:
     keep_original: bool = True
     enable_fallback: bool = True
     remember_hashes: bool = True
+    # QQ 音乐登录态（仅本机保存）：用于“按需静默获取 musicex 的 ekey”。
+    # 等价于登录凭证 —— 日志永不输出、只用于官方 GetEVkey 调用；留空则功能关闭。
+    qqmusic_uin: str = ""
+    qqmusic_key: str = ""
+    # 拖入/添加文件后自动开始处理（同事最省事；可在 设置→行为 关闭）
+    auto_start: bool = True
 
     def to_dict(self) -> dict:
         return asdict(self)

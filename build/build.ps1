@@ -27,6 +27,13 @@ if ($LASTEXITCODE -ne 0) {
     python -m pip install -r requirements.txt
 }
 
+# 先检查目标 exe 是否被占用（还在运行 / 杀软扫描中）—— 给出人话提示
+$_exe = Join-Path $root 'dist\MusicDecryptor.exe'
+if (Test-Path $_exe) {
+    try { $fs = [IO.File]::Open($_exe, 'Open', 'ReadWrite', 'None'); $fs.Close() }
+    catch { throw "dist\MusicDecryptor.exe 正被占用：请先关闭正在运行的软件（或稍等几秒让杀软扫描结束）再重打包。" }
+}
+
 Write-Host '==> building (this can take a few minutes)' -ForegroundColor Cyan
 # 注意：不要把 `@var` splat 用在原生命令上 —— PowerShell 会把经 if/管道等
 # 表达式折叠后的单元素“数组”还原成字符串，再逐字符展开（历史事故：

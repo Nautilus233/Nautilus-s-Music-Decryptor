@@ -82,6 +82,38 @@ class SettingsDialog(QDialog):
         form.addRow("聚合默认平台", self.agg_provider)
         body.addWidget(gb_net)
 
+        # -- QQ 凭证（按需静默获取 ekey）--------------------------------
+        gb_ekey = QGroupBox("QQ 音乐凭证（管理员一次配置 ─ 点标题展开即可编辑）")
+        gb_ekey.setCheckable(True)          # 折叠：同事默认看不到内容，也不会误改
+        gb_ekey.setChecked(False)
+        self.gb_ekey = gb_ekey
+        ef = QFormLayout(gb_ekey)
+        self.qq_uin = QLineEdit()
+        self.qq_uin.setPlaceholderText("你的 QQ 号")
+        self.qq_key = QLineEdit()
+        self.qq_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self.qq_key.setPlaceholderText("qqmusic_key（整条 Cookie 直接粘贴也行）")
+        ef.addRow("QQ 号", self.qq_uin)
+        ef.addRow("会话 Cookie", self.qq_key)
+        btn_row = QHBoxLayout()
+        btn_paste = QPushButton("从剪贴板粘贴 Cookie")
+        btn_clear = QPushButton("清空")
+        btn_paste.clicked.connect(self._paste_cookie)
+        btn_clear.clicked.connect(self._clear_cookie)
+        btn_row.addWidget(btn_paste)
+        btn_row.addWidget(btn_clear)
+        btn_row.addStretch(1)
+        ef.addRow(btn_row)
+        self.qq_feedback = QLabel("")
+        self.qq_feedback.setProperty("role", "muted")
+        ef.addRow(self.qq_feedback)
+        hint = QLabel("配置一次即可：之后拖入新版加密歌曲会自动取钥匙，无需再设置。Cookie 仅存本机、"
+                      "日志不会输出；等价于登录凭证，改密/退出登录即失效。留空即关闭该功能。")
+        hint.setProperty("role", "muted")
+        hint.setWordWrap(True)
+        ef.addRow(hint)
+        body.addWidget(gb_ekey)
+
         # -- local dirs ------------------------------------------------
         gb_local = QGroupBox("本地曲库目录（可选，离线优先命中）")
         lv = QVBoxLayout(gb_local)
@@ -109,8 +141,9 @@ class SettingsDialog(QDialog):
         self.chk_overwrite = QCheckBox("同名文件直接覆盖（否则自动加序号）")
         self.chk_keep = QCheckBox("保留原始加密文件")
         self.chk_cache = QCheckBox("启用哈希去重缓存（避免重复解密/下载）")
+        self.chk_auto = QCheckBox("拖入文件后自动开始处理（同事最省事）")
         for cb in (self.chk_fallback, self.chk_meta, self.chk_cover,
-                   self.chk_overwrite, self.chk_keep, self.chk_cache):
+                   self.chk_overwrite, self.chk_keep, self.chk_cache, self.chk_auto):
             bv.addWidget(cb)
         body.addWidget(gb_beh)
 
@@ -158,6 +191,10 @@ class SettingsDialog(QDialog):
         self.min_bitrate.setValue(int(s.min_bitrate))
         self.agg_base.setText(s.aggregator_base)
         self.agg_provider.setText(s.aggregator_provider)
+        self.qq_uin.setText(s.qqmusic_uin or "")
+        self.qq_key.setText(s.qqmusic_key or "")
+        self.gb_ekey.setChecked(bool(s.qqmusic_key))   # 已配置则展开，便于管理员查看
+        self.chk_auto.setChecked(bool(getattr(s, "auto_start", True)))
         self.local_list.addItems(list(s.local_dirs or []))
         self.chk_fallback.setChecked(s.enable_fallback)
         self.chk_meta.setChecked(s.write_metadata)
@@ -165,6 +202,31 @@ class SettingsDialog(QDialog):
         self.chk_overwrite.setChecked(s.overwrite)
         self.chk_keep.setChecked(s.keep_original)
         self.chk_cache.setChecked(s.remember_hashes)
+
+    # ------------------------------------------------------------------ #
+    def _paste_cookie(self) -> None:
+        """从剪贴板导入：整条 Cookie 或只有 qqmusic_key 都认（自动提取 QQ 号）。"""
+        from PySide6.QtWidgets import QApplication  # 局部导入，避免动 import 区
+        raw = (QApplication.clipboard().text() or "").strip()
+        if not raw:
+            self.qq_feedback.setText("剪贴板是空的")
+            return
+        self.gb_ekey.setChecked(True)
+        if "=" in raw:                      # 整条 Cookie
+            self.qq_key.setText(raw)
+            for part in raw.split(";"):
+                name, _, value = part.strip().partition("=")
+                if name.strip().lower() in ("qqmusic_uin", "uin") and value.strip():
+                    self.qq_uin.setText(value.strip())
+            self.qq_feedback.setText(f"✓ 已粘贴整条 Cookie（末尾 …{raw[-12:]}）")
+        else:
+            self.qq_key.setText(raw)
+            self.qq_feedback.setText(f"✓ 已粘贴 qqmusic_key（末尾 …{raw[-8:]}）")
+
+    def _clear_cookie(self) -> None:
+        self.qq_uin.clear()
+        self.qq_key.clear()
+        self.qq_feedback.setText("已清空（保存后自动获取 ekey 关闭）")
 
     def _add_local_dir(self) -> None:
         d = QFileDialog.getExistingDirectory(self, "选择本地曲库目录")
@@ -182,6 +244,9 @@ class SettingsDialog(QDialog):
         settings.min_bitrate = int(self.min_bitrate.value())
         settings.aggregator_base = self.agg_base.text().strip()
         settings.aggregator_provider = self.agg_provider.text().strip() or "netease"
+        settings.qqmusic_uin = self.qq_uin.text().strip()
+        settings.qqmusic_key = self.qq_key.text().strip()
+        settings.auto_start = self.chk_auto.isChecked()
         settings.local_dirs = [self.local_list.item(i).text() for i in range(self.local_list.count())]
         settings.enable_fallback = self.chk_fallback.isChecked()
         settings.write_metadata = self.chk_meta.isChecked()

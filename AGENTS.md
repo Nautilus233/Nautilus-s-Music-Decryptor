@@ -13,6 +13,8 @@
   已自研并用测试固定：AES（`crypto/aes.py`）、TEA（`crypto/tea.py`）、NCM/QMC 解码器、`urllib` 网络层。
 - **禁止**引入原生 / 二进制运行时依赖，例如但不限于：`pycryptodome`、`requests`、`numpy`、
   `ffmpeg`、`chromaprint`、`librosa`、非标准库的数据库驱动。标准库 `sqlite3`、`hashlib`、`json` 可用。
+- **例外（2026-10-18 用户明确同意）**：转码引擎复用 **PySide6 自带的 FFmpeg 库**（`avcodec/avformat/avutil/swresample`，LGPL，运行时 ctypes 动态加载）——不新增外部依赖、不打包 `ffmpeg.exe`；引擎缺失时**静默回退保留原格式**，其余功能不受影响。权衡与被否决方案见 `DESIGN.md` §3.4。
+- **用户凭证**（`qqmusic_key` / `qqmusic_uin`）：仅保存在本机 `settings.json`，**日志绝不输出**，只用于官方 `GetEVkey` 端点；留空即关闭该功能。禁止内存扫描 / 浏览器 cookie 抓取等“凭证窃取”式实现。
 - 新增**任何**运行时依赖前，必须先取得用户明确同意，并在 `DESIGN.md` 记录理由与被否决的替代方案。
 
 ## 2. 轻量化

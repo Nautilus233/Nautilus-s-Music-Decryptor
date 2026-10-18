@@ -65,7 +65,31 @@ def main() -> int:
     print(f"output cell    : {out_name}")
     print(f"files produced : {[p.name for p in produced]}")
 
-    ok = state["finished"] and status == "已解密" and len(produced) == 1
+    # 拖入即自动开始（窗口可见时）—— 同事零操作的关键行为
+    import time as _time
+    cfg2 = AppConfig(path=tmp / "settings2.json")
+    cfg2.settings.output_dir = str(tmp / "out2")
+    cfg2.settings.enable_fallback = False
+    cfg2.settings.write_metadata = False
+    cfg2.settings.fetch_cover = False
+    win2 = MainWindow(cfg2)
+    win2.show()
+    win2.add_paths([str(src)])
+    auto_started = False
+    for _ in range(150):
+        app.processEvents()
+        if win2._worker is not None:      # 已被自动启动（不论跑完与否）
+            auto_started = True
+            break
+        _time.sleep(0.02)
+    if win2._worker is not None and win2._worker.isRunning():
+        win2.stop_job()
+        win2._worker.wait(10000)
+    win2.close()
+    print(f"auto-start on drop: {auto_started}")
+
+    ok = (state["finished"] and status == "已解密" and len(produced) == 1
+          and auto_started)
     print("GUI SMOKE TEST:", "PASS" if ok else "FAIL")
     return 0 if ok else 1
 

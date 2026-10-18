@@ -4,5 +4,5 @@ Public surface:
     from mmusic.pipeline import Pipeline, JobResult
 """
 
-__version__ = "1.0.17-dev2"
+__version__ = "1.0.20-dev5"
 __all__ = ["__version__"]

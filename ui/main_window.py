@@ -3,8 +3,9 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import QRect, QSettings, Qt, QUrl
-from PySide6.QtGui import QColor, QDragEnterEvent, QDropEvent, QIcon
+from PySide6.QtCore import QRect, QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import (QColor, QDesktopServices, QDragEnterEvent,
+                           QDropEvent, QIcon)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
                                QFileDialog, QFrame, QHBoxLayout, QHeaderView,
                                QLabel, QLineEdit, QMainWindow, QMessageBox,
@@ -108,6 +109,9 @@ class MainWindow(QMainWindow):
         out_row.addWidget(self.out_dir, 1)
         self.btn_out_dir = QPushButton("选择…")
         out_row.addWidget(self.btn_out_dir)
+        self.btn_open_out = QPushButton("打开输出目录")
+        self.btn_open_out.setToolTip("在文件管理器中打开上次输出/设置的目录")
+        out_row.addWidget(self.btn_open_out)
         self.btn_manual = QPushButton("手动补链…")
         self.btn_manual.setToolTip("所有音源都找不到时，粘贴直链或本地路径，优先使用")
         out_row.addWidget(self.btn_manual)
@@ -138,7 +142,7 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.status_label = QLabel("就绪 · 拖拽文件到窗口即可添加")
+        self.status_label = QLabel("就绪 · 把加密歌曲拖进窗口（或点「添加文件」）")
         self.status_label.setProperty("role", "muted")
         prog_row.addWidget(self.progress, 1)
         prog_row.addWidget(self.status_label)
@@ -174,6 +178,7 @@ class MainWindow(QMainWindow):
         self.btn_settings.clicked.connect(self._open_settings)
         self.btn_manual.clicked.connect(self._open_manual_links)
         self.btn_start.clicked.connect(self.start_job)
+        self.btn_open_out.clicked.connect(self._open_out_dir)
         self.btn_stop.clicked.connect(self.stop_job)
 
     # ------------------------------------------------------------------ #
@@ -249,6 +254,11 @@ class MainWindow(QMainWindow):
                 added += self._add_row(p) or 0
         if added:
             self._log(f"➕ 已添加 {added} 个文件（共 {self.table.rowCount()} 个）")
+            # 简化：窗口可见时“拖入即自动开始”（同事零操作）；可在 设置→行为 关闭。
+            # 启动时带路径（__init__ / --auto）不在此触发，避免与 --auto 重复。
+            if (getattr(self.settings, "auto_start", True) and self.isVisible()
+                    and not (self._worker is not None and self._worker.isRunning())):
+                QTimer.singleShot(0, self.start_job)
 
     def _add_row(self, path: Path) -> int:
         key = str(path)
@@ -382,6 +392,10 @@ class MainWindow(QMainWindow):
         self.table.item(row, 3).setText(Path(res.out_path).name if res.out_path else "")
         self.table.item(row, 4).setText(res.message + (f" · 来源 {res.source}" if res.source and res.status == "downloaded" else ""))
         self.table.scrollToItem(self.table.item(row, 0))
+        if res.out_path:
+            self._last_out_dir = str(Path(res.out_path).parent)
+        if "重新粘贴" in (res.message or ""):
+            self.status_label.setText("⚠ QQ 登录态可能已失效：请管理员到 设置 → QQ 音乐凭证 重新粘贴")
 
     def _on_completed(self, results) -> None:
         self.btn_start.setEnabled(True)
@@ -393,6 +407,11 @@ class MainWindow(QMainWindow):
         fail = sum(1 for r in results if r.status == "failed")
         skip = sum(1 for r in results if r.status == "skipped")
         self._log(f"■ 全部完成：成功 {ok} · 跳过 {skip} · 失败 {fail}")
+        waiting = sum(1 for r in range(self.table.rowCount())
+                      if self.table.item(r, 1) is not None
+                      and self.table.item(r, 1).text() == "等待")
+        if waiting:
+            self._log(f"⏳ 列表里还有 {waiting} 个待处理文件：点「开始解密」即可继续")
         self._worker = None
 
     def _on_failed(self, message: str) -> None:
@@ -406,6 +425,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ #
     def _log(self, message: str) -> None:
         self.log.appendPlainText(message)
+
+    def _open_out_dir(self) -> None:
+        """在文件管理器中打开上次输出（或设置里指定）的目录。"""
+        target = self.settings.output_dir or getattr(self, "_last_out_dir", "")
+        if not target and self._rows:
+            target = str(Path(next(iter(self._rows))).parent)
+        if not target or not Path(target).is_dir():
+            self._log("📂 还没有可打开的输出目录（先处理一个文件，或在设置里指定输出目录）")
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(target))))
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:  # noqa: N802
         if event.mimeData().hasUrls():

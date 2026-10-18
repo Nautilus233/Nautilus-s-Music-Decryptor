@@ -290,7 +290,7 @@ else:                               # 旧版：末 4 字节为密钥长度（小
     else:                 cipher = Static()          # 无密钥 → QMCv1 静态
 ```
 
-**musicex（2026 新版 `.mgg` / `.mflac` / `.mmp4`）**：音频后接**未加密尾部**（A 变体 192 字节；B 变体 200 字节 + 16 字节前缀），尾部以 `musicex\0` 结尾、用 UTF-16LE 存 `song_mid` 与原始文件名，**不含密钥**。ekey 需用账号在线获取（每文件、约 22 小时有效）：本地 `ekeys/<song_mid>__<filename>.txt`（社区 `fetch_ekey.py` 的默认布局）存在时直接展开解码；否则抛 `NeedsOnlineError` 转备用搜索。另加**解码后安全网**：结果必须通过音频头校验（`looks_like_audio`），否则一律判失败 —— 未知新格式、错误密钥、被误判的“静态加密”都不可能再静默产出垃圾文件。
+**musicex（2026 新版 `.mgg` / `.mflac` / `.mmp4`）**：音频后接**未加密尾部**（A 变体 192 字节；B 变体 200 字节 + 16 字节前缀），尾部以 `musicex\0` 结尾、用 UTF-16LE 存 `song_mid` 与原始文件名，**不含密钥**。ekey 需用账号在线获取（每文件、约 22 小时有效）：本地 `ekeys/<song_mid>__<filename>.txt`（社区 `fetch_ekey.py` 的默认布局）存在时直接展开解码；否则抛 `NeedsOnlineError` 转备用搜索。**自 v1.0.19 起**：设置页可填自己的 QQ 会话（`qqmusic_key`，或直接粘整条 Cookie）——处理到 musicex 文件且缺 ekey 时**按需静默拉取一次**（官方 `GetEVkey`：每曲一次、串行、瞬时失败 3 秒后重试一次、22 小时缓存），写入 `ekeys/` 后**当次即可离线解码**；未配置凭证或拉取失败则完全维持原行为。凭证只存本机 `settings.json`、日志永不输出。另加**解码后安全网**：结果必须通过音频头校验（`looks_like_audio`），否则一律判失败 —— 未知新格式、错误密钥、被误判的“静态加密”都不可能再静默产出垃圾文件。
 
 密钥派生（`qmc_derive_key`）核心三步；其中腾讯 TEA-CBC 的“双解密”结构按参考实现 1:1 移植：
 
@@ -312,6 +312,28 @@ return raw_dec[:8] + sub
 - 尾部 `QTag`（内嵌密钥）→ **可离线**解密。
 - 尾部 `STag`（无内嵌密钥，密钥由客户端联网取）→ 判定 `needs_online=True`，抛 `NeedsOnlineError`，由编排层**立即转备用下载**。
 - 旧版 `mflac/mgg` 若末 4 字节密钥长度 < 0x400 → 有内嵌密钥 → 离线解；否则视为静态 QMCv1。
+
+### 3.4 目标音质与可选转码引擎（`mmusic/transcode.py`）
+
+「目标音质」自 v1.0.18 起**真正决定最终产物格式**（解密输出与备用下载两条路径统一生效）：
+
+| 源格式 | 目标 MP3 | 目标 FLAC | 目标 WAV |
+| --- | --- | --- | --- |
+| 有损（.mgg→OGG、M4A、WMA…） | → **MP3 320k** | **降级 MP3**（日志注明“未做无效升格”） | **降级 MP3** |
+| 有损（已是 MP3） | 原样（零开销） | 同上 | 同上 |
+| 无损（FLAC / WAV / APE / DFF） | → MP3 320k | → FLAC（WAV/APE→FLAC） | **保持无损**（FLAC 不展开成 WAV） |
+
+**引擎（方案 1，2026-10-18 用户拍板）**：复用 **PySide6 自带的 FFmpeg 库**（`avcodec/avformat/avutil/swresample`，
+LGPL；Qt 6.8+ 的多媒体后端本来就是 FFmpeg）——**不新增任何外部依赖、不打包 `ffmpeg.exe`**；打包时附带这 4 个 DLL
+（exe 约 47MB → 约 55MB），运行时 ctypes 动态加载。**引擎缺失 / 加载失败 / 转码失败一律静默回退：保留原格式并写一行日志**，
+绝不丢文件——这就是“无引擎版本”的回退语义。被否决的替代方案：打包现成 `ffmpeg.exe`（体积 +50~90MB、多为 GPL 构建、
+杀软误报高）、依赖系统 ffmpeg（用户需自行安装，否则目标音质形同虚设）。
+
+实现细节（版本无关的自发现，Qt 这份是 FFmpeg 8 系）：ctx 字段偏移用 **AVOption 表枚举**（`ar`/`ch_layout`/`frame_size`；
+`sample_fmt` 位于 `ar` 与 `frame_size` 之间、默认 -1 故可定位）；AVFrame 的 `ch_layout` 偏移用**写入探测**（写入合法布局后以
+`av_frame_get_buffer` 成功为证，只碰零值槽位）；所有指针访问走 `ReadProcessMemory` 安全探测。编码器用 Windows 内核
+`mp3_mf`（无 libmp3lame/GPL 负担）与 libavcodec 的 `flac`；容器（裸 MP3 帧流 / `fLaC`+STREAMINFO+帧）由我们自己写，
+不用 libavformat 输出侧。不重采样（保持源采样率/声道）；MP3 编码仅支持 32/44.1/48kHz、1~2 声道，其余如实放弃。
 
 ### 3.5 备用搜索引擎接口（`search/base.py`）
 
@@ -465,6 +487,8 @@ rank_tracks_multi(readings, tracks, prefer_ext=quality)   # 每首取两种读�
 ---
 
 ## 4. 图形界面布局（线框 + 说明）
+
+**面向“同一台机器、多人使用”的简化（v1.0.20）**：`QQ 音乐凭证` 收进**可折叠的“管理员一次配置”分组**（支持「从剪贴板粘贴 Cookie」一键导入整条 Cookie），日常使用者完全不必打开设置；主界面新增「打开输出目录」；`设置 → 行为 → 拖入文件后自动开始处理` **默认开启** —— 同事的完整流程 = **双击程序 → 把歌曲拖进窗口 → 完成**（输出按目标音质落在输出目录，表格逐条显示结果）。
 
 ### 4.1 主窗口
 

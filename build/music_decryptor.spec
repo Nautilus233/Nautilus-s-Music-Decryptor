@@ -15,6 +15,19 @@ ROOT = os.path.dirname(_build_dir)
 
 ICON = os.path.join(ROOT, "assets", "icon.ico")
 
+# --- 可选转码引擎：PySide6 自带的 FFmpeg 库（LGPL，动态链接） ------------------
+# 只打包音频编解码需要的四个库（名字带 FFmpeg 主版本号，用 glob 匹配以免升级后失效）。
+# 运行时由 mmusic/transcode.py 从 sys._MEIPASS 或 PySide6 目录加载；缺失则静默回退。
+import glob
+_MEDIA_DLLS: "list" = []
+try:
+    import PySide6 as _PS
+    _ps_dir = os.path.dirname(_PS.__file__)
+    for _pat in ("avcodec-*.dll", "avformat-*.dll", "avutil-*.dll", "swresample-*.dll"):
+        _MEDIA_DLLS += [(p, ".") for p in glob.glob(os.path.join(_ps_dir, _pat))]
+except Exception:
+    _MEDIA_DLLS = []
+
 # Everything except QtCore/QtGui/QtWidgets is dropped to keep the exe small.
 EXCLUDES = [
     "PySide6.QtWebEngineCore", "PySide6.QtWebEngineWidgets", "PySide6.QtWebEngineQuick",
@@ -39,7 +52,7 @@ EXCLUDES = [
 a = Analysis(
     [os.path.join(ROOT, "main.py")],
     pathex=[ROOT],
-    binaries=[],
+    binaries=_MEDIA_DLLS,
     datas=[(ICON, "assets")],
     hiddenimports=[
         "mutagen", "mutagen.id3", "mutagen.flac", "mutagen.mp4",

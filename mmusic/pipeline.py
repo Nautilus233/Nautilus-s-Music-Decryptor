@@ -22,6 +22,8 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .config import default_config_dir
+from .constants import QMC_TAG_MUSICEX
+from . import ekeys
 from .crypto.kwm import KwmDecoder
 from .crypto.ncm import NcmDecoder
 from .crypto.qmc import QmcDecoder
@@ -45,6 +47,7 @@ from .search.query import MAX_PER_SOURCE as MAX_VARIANTS_PER_SOURCE
 from .search.query import expand as expand_query
 from .search.registry import build_sources
 from .sniff import sniff_path
+from . import transcode
 from .utils import sha256_file
 
 _UNSAFE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
@@ -132,12 +135,14 @@ class Pipeline:
                  on_progress: "Callable[[int, int], None] | None" = None,
                  on_file: "Callable[[JobResult], None] | None" = None,
                  sources: "list | None" = None,
-                 index_path: "str | Path | None" = None) -> None:
+                 index_path: "str | Path | None" = None,
+                 http=None) -> None:
         self.settings = settings
         self._log = _guarded(on_log)
         self._progress = _guarded(on_progress)
         self._on_file = _guarded(on_file)
-        self.http = HttpClient(timeout=settings.timeout, retries=settings.retries)
+        self.http = http if http is not None else HttpClient(timeout=settings.timeout,
+                                                             retries=settings.retries)
         if cache_path:
             cache_file = Path(cache_path)
         elif settings.output_dir:
@@ -165,6 +170,16 @@ class Pipeline:
             self.index.close()
         except Exception:  # noqa: BLE001
             pass
+
+    @staticmethod
+    def _is_musicex_file(path: Path) -> bool:
+        """便宜判断：文件尾部是否为 musicex 魔法（避免对 STag 等无谓尝试）。"""
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(-8, 2)
+                return fh.read(8) == QMC_TAG_MUSICEX
+        except OSError:
+            return False
 
     def _out_dir_for(self, src: "str | Path") -> Path:
         """Resolve where a produced file goes.
@@ -250,9 +265,19 @@ class Pipeline:
                 mode = "offline"
             elif fmt.kind == "qmc":
                 if fmt.needs_online:
-                    raise NeedsOnlineError(fmt.note)
+                    if self._is_musicex_file(p):
+                        # 新版 musicex：按需静默拉一次 ekey（用户自带登录态，仅本机）
+                        ok, why = ekeys.ensure_ekey(self.http, self.settings, p)
+                        self._log(f"  · {why}")
+                        if not ok:
+                            raise NeedsOnlineError(f"{fmt.note}；{why}")
+                    else:
+                        raise NeedsOnlineError(fmt.note)
                 self._log(f"🔧 离线解密 QMC：{name}")
                 result = QmcDecoder(p.read_bytes(), fmt.ext, src_path=p).decode()
+                note = (result.meta or {}).get("note")
+                if note:
+                    self._log(f"  · {note}")
                 mode = "offline"
             else:
                 raise UnsupportedFormatError("无法识别的加密格式", detail=fmt.ext or "未知扩展名")
@@ -278,22 +303,42 @@ class Pipeline:
             return JobResult(str(p), name, "failed", message="写入输出文件失败", detail=str(exc))
 
     # ------------------------------------------------------------------ #
+    def _final_format(self, audio: bytes, ext: str, name: str) -> "tuple[bytes, str, str]":
+        """按「目标音质」决定最终产物格式；引擎缺失/失败时保留原格式并如实说明。"""
+        quality = getattr(self.settings, "quality", "") or ""
+        if not quality:
+            return audio, ext, ""
+        action, note = transcode.plan_effective(ext, quality)
+        if action == "keep":
+            return audio, ext, note
+        try:
+            new_audio, new_ext = transcode.convert_bytes(audio, ext, action)
+            self._log(f"  · 目标音质 {quality.upper()}：{ext.upper()} → {new_ext.upper()} 转码完成")
+            return new_audio, new_ext, note
+        except transcode.EngineUnavailable as exc:  # noqa: BLE001
+            return audio, ext, (f"{note}；" if note else "") + f"转码引擎不可用（{exc}），已保留原格式"
+        except Exception as exc:  # noqa: BLE001 - 转码失败绝不丢文件
+            return audio, ext, (f"{note}；" if note else "") + f"转码失败（{exc}），已保留原格式"
+
     def _write_decoded(self, src: Path, name: str, result: AudioResult, mode: str, digest: str) -> JobResult:
         out_dir = self._out_dir_for(src)
         title = result.title or src.stem
         artist = result.artist
         base = self._safe_name(artist, title)
+        audio, out_ext, fmt_note = self._final_format(result.audio, result.ext, name)
+        if fmt_note:
+            self._log(f"  · {name}：{fmt_note}")
 
         # an input that is *already* plain audio and would land on its own
         # filename needs no copy at all
-        if (mode == "plain" and out_dir == src.resolve().parent
-                and f"{base}.{result.ext}".lower() == src.name.lower()):
+        if (mode == "plain" and out_ext == result.ext and out_dir == src.resolve().parent
+                and f"{base}.{out_ext}".lower() == src.name.lower()):
             self._log(f"⏭ 已是明文音频，无需处理：{src.name}")
             return JobResult(str(src), src.name, "skipped", mode="plain",
-                             out_path=str(src), fmt=result.ext, message="已是明文，无需处理")
+                             out_path=str(src), fmt=out_ext, message="已是明文，无需处理")
 
-        out_path = self._unique(out_dir, base, result.ext)
-        out_path.write_bytes(result.audio)
+        out_path = self._unique(out_dir, base, out_ext)
+        out_path.write_bytes(audio)
 
         cover = result.cover
         if not cover and self.settings.fetch_cover and result.cover_url:
@@ -310,10 +355,10 @@ class Pipeline:
                 pass
 
         status = "copied" if mode == "plain" else "decoded"
-        tag = "解密" if mode == "offline" else "复制"
-        self._log(f"✅ {tag}完成：{name} → {out_path.name}  [{result.ext.upper()}]")
+        tag = "解密" if mode == "offline" else ("转码" if out_ext != result.ext else "复制")
+        self._log(f"✅ {tag}完成：{name} → {out_path.name}  [{out_ext.upper()}]")
         return JobResult(str(src), name, status, mode=mode, out_path=str(out_path),
-                         fmt=result.ext, message="完成")
+                         fmt=out_ext, message="完成")
 
     # ------------------------------------------------------------------ #
     def _search_order(self, chinese: bool) -> "list":
@@ -581,9 +626,11 @@ class Pipeline:
 
     def _write_downloaded(self, src: Path, track: Track, data: bytes, v, digest: str,
                           *, note: str = "") -> JobResult:
+        data, out_ext, fmt_note = self._final_format(data, v.ext, src.name)
+        note = "；".join(x for x in (note, fmt_note) if x)
         out_dir = self._out_dir_for(src)
         base = self._safe_name(track.artist, track.title or src.stem)
-        out_path = self._unique(out_dir, base, v.ext)
+        out_path = self._unique(out_dir, base, out_ext)
         out_path.write_bytes(data)
 
         cover = b""
@@ -599,19 +646,19 @@ class Pipeline:
                        album=track.album, cover=cover)
 
         if digest and self.settings.remember_hashes:
-            self.cache.add(digest, out_path=str(out_path), mode="fallback", fmt=v.ext, source=track.source)
+            self.cache.add(digest, out_path=str(out_path), mode="fallback", fmt=out_ext, source=track.source)
         if not self.settings.keep_original:
             try:
                 src.unlink()
             except OSError:
                 pass
 
-        br = f"，{v.bitrate}kbps" if v.bitrate else ""
+        br = f"，{v.bitrate}kbps" if (v.bitrate and out_ext == v.ext) else ""
         dur = f"，时长 {format_seconds(track.actual_duration)}" if track.actual_duration else ""
-        self._log(f"✅ 备用下载完成：{src.name} → {out_path.name}  [{v.ext.upper()}{br}{dur}] "
+        self._log(f"✅ 备用下载完成：{src.name} → {out_path.name}  [{out_ext.upper()}{br}{dur}] "
                   f"来源：{track.source}" + (f"  ⚠ {note}" if note else ""))
         return JobResult(str(src), src.name, "downloaded", mode="fallback", out_path=str(out_path),
-                         fmt=v.ext, bitrate=v.bitrate, source=track.source,
+                         fmt=out_ext, bitrate=v.bitrate, source=track.source,
                          message="完成" if not note else f"完成（{note}）")
 
     # ------------------------------------------------------------------ #
