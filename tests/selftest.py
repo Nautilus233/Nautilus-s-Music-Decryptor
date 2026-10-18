@@ -41,7 +41,7 @@ from mmusic.pipeline import (MIN_ACCEPT, MIN_TITLE_SIMILARITY,  # noqa: E402
                              MIN_TRACK_SECONDS, Pipeline, _plausible_max)
 from mmusic.search.registry import build_sources  # noqa: E402
 from mmusic.search.base import SearchSource  # noqa: E402
-from mmusic.sniff import sniff  # noqa: E402
+from mmusic.sniff import sniff, sniff_path  # noqa: E402
 
 PASSED: list[str] = []
 FAILED: list[str] = []
@@ -1750,6 +1750,7 @@ def test_kwm_decoder() -> None:
 def test_musicex_container() -> None:
     """musicex（2026 新版 QQ）：尾部解析 / 无 ekey 报“需联网” / 有 ekey 完整解码。"""
     print("\n[musicex: 2026 QQ container]")
+    from mmusic import ekeys
     from mmusic.crypto.qmc import QmcDecoder
     from mmusic.sniff import sniff_path
 
@@ -1800,6 +1801,15 @@ def test_musicex_container() -> None:
         r3 = QmcDecoder(p3.read_bytes(), "mflac", src_path=p3).decode()
         check("musicex: variant B (200) parses and decodes byte-exact",
               r3.audio == fx.PAYLOAD_FLAC)
+
+        # ④ 本地 ekey 已过期（>22h）：不再假装“可离线解码”，保持 needs-online，
+        #    以便流水线按需重取 / 转备用链路（陈旧 ekey 不得绕过重取）。
+        stale_ekey = tmp / "ekeys" / "00TEST00000001__TEST00001.mgg.txt"
+        old_ts = time.time() - (ekeys.VALID_SECONDS + 3600)
+        os.utime(stale_ekey, (old_ts, old_ts))
+        info4 = sniff_path(p2)
+        check("musicex: an expired local ekey is no longer treated as offline-ready",
+              info4.needs_online and "过期" in info4.note, str(info4))
 
 
 def test_qmc_no_silent_garbage() -> None:
@@ -1973,6 +1983,9 @@ def test_ekey_fetch() -> None:
         ok2, why2 = ekeys.ensure_ekey(http, Creds(), src, retry_delay=0.0)
         check("ekey: a fresh cached ekey is reused (no extra request)",
               ok2 and len(http.calls) == calls, why2)
+        ok_f, why_f = ekeys.ensure_ekey(http, Creds(), src, retry_delay=0.0, force=True)
+        check("ekey: force=True re-fetches even while a fresh cache exists (self-heal)",
+              ok_f is True and len(http.calls) > calls, why_f)
         check("ekey: the request carried the cookie to the official endpoint",
               bool(http.calls) and http.calls[0]["method"] == "POST"
               and http.calls[0]["url"] == ekeys.API
@@ -1992,6 +2005,7 @@ def test_ekey_pipeline_e2e() -> None:
     """流水线：musicex + 已配置凭证 + 假 HTTP → 自动取 ekey 并当次解码。"""
     print("\n[ekey: pipeline auto-fetch end-to-end]")
     import json as _json
+    from mmusic import ekeys
     from mmusic.config import Settings
 
     key = bytes(range(32))
@@ -2028,6 +2042,32 @@ def test_ekey_pipeline_e2e() -> None:
               (tmp / "ekeys" / "00TEST00000001__TEST00001.mgg.txt").is_file())
         check("ekey-e2e: the log reports the silent fetch",
               any("已静默获取 ekey" in m for m in logs), " | ".join(logs[-3:]))
+
+        # ② 本地 ekey 陈旧且已失效 + 凭证有效：应静默重取一次并当次解码成功（自愈）
+        stale_dir = tmp / "stale"
+        stale_dir.mkdir()
+        src2 = stale_dir / "song.mgg"
+        src2.write_bytes(fx.build_musicex(fx.PAYLOAD_OGG, key))
+        (stale_dir / "ekeys").mkdir()
+        bad_ek = stale_dir / "ekeys" / "00TEST00000001__TEST00001.mgg.txt"
+        bad_ek.write_text(fx.make_qmc_v2_key(bytes(range(1, 33))).decode("ascii"),
+                          encoding="utf-8")
+        old_ts = time.time() - (ekeys.VALID_SECONDS + 3600)
+        os.utime(bad_ek, (old_ts, old_ts))
+        settings2 = Settings(output_dir=str(stale_dir / "out"), quality="mp3",
+                            enable_fallback=False, write_metadata=False,
+                            fetch_cover=False, remember_hashes=False,
+                            timeout=5.0, retries=0, min_bitrate=0,
+                            qqmusic_uin="12345", qqmusic_key="K")
+        assert sniff_path(src2).needs_online        # 过期即不再视作离线可解
+        http2 = EkeyHttp()
+        logs2: "list[str]" = []
+        pipe2 = Pipeline(settings2, cache_path=stale_dir / "c.json",
+                         on_log=logs2.append, sources=[], http=http2)
+        res2 = pipe2.process_file(src2)
+        check("ekey-e2e: a stale/failed local ekey self-heals via a silent re-fetch",
+              res2.status == "decoded" and http2.calls > 0,
+              f"{res2.status} calls={http2.calls}")
 
 
 def test_settings_roundtrip() -> None:

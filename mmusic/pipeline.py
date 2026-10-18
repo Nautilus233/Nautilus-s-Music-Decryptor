@@ -264,8 +264,9 @@ class Pipeline:
                 result = NcmDecoder(p.read_bytes()).decode()
                 mode = "offline"
             elif fmt.kind == "qmc":
+                musicex_file = self._is_musicex_file(p)
                 if fmt.needs_online:
-                    if self._is_musicex_file(p):
+                    if musicex_file:
                         # 新版 musicex：按需静默拉一次 ekey（用户自带登录态，仅本机）
                         ok, why = ekeys.ensure_ekey(self.http, self.settings, p)
                         self._log(f"  · {why}")
@@ -274,7 +275,20 @@ class Pipeline:
                     else:
                         raise NeedsOnlineError(fmt.note)
                 self._log(f"🔧 离线解密 QMC：{name}")
-                result = QmcDecoder(p.read_bytes(), fmt.ext, src_path=p).decode()
+                raw = p.read_bytes()
+                try:
+                    result = QmcDecoder(raw, fmt.ext, src_path=p).decode()
+                except DecryptionFailedError:
+                    # 本地 ekey 虽在“新鲜期”，却可能已经失效（换机器 / 被提前轮换）。
+                    # 已配置凭证时静默重取一次再试（成本封顶：一次请求，短超时）；否则如实上报。
+                    if not (musicex_file and ekeys.creds_configured(self.settings)):
+                        raise
+                    ok, why = ekeys.ensure_ekey(self.http, self.settings, p,
+                                                force=True, timeout=8.0)
+                    self._log(f"  · 本地 ekey 校验未通过，已尝试重新获取：{why}")
+                    if not ok:
+                        raise
+                    result = QmcDecoder(raw, fmt.ext, src_path=p).decode()
                 note = (result.meta or {}).get("note")
                 if note:
                     self._log(f"  · {note}")

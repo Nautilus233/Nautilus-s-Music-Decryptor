@@ -82,7 +82,7 @@ def parse_response(payload: dict) -> str:
 
 
 def fetch_ekey(http, uin: str, cookie: str, song_mid: str, filename: str,
-               *, retry_delay: float = 3.0) -> str:
+               *, retry_delay: float = 3.0, timeout: float = 20.0) -> str:
     """拉一次 ekey；瞬时失败按社区建议重试一次（默认 3 秒后）。"""
     body = json.dumps(build_request(uin, song_mid, filename)).encode("utf-8")
     headers = {"Content-Type": "application/json", "Cookie": cookie,
@@ -90,7 +90,8 @@ def fetch_ekey(http, uin: str, cookie: str, song_mid: str, filename: str,
     last = ""
     for attempt in (0, 1):
         try:
-            status, raw, _ = http.request("POST", API, data=body, headers=headers, timeout=20)
+            status, raw, _ = http.request("POST", API, data=body, headers=headers,
+                                          timeout=timeout)
             if status >= 400:
                 last = f"HTTP {status}"
             else:
@@ -108,17 +109,21 @@ def fetch_ekey(http, uin: str, cookie: str, song_mid: str, filename: str,
 
 
 def ensure_ekey(http, settings, src_path: "str | Path",
-                *, retry_delay: float = 3.0) -> "tuple[bool, str]":
+                *, retry_delay: float = 3.0, timeout: float = 20.0,
+                force: bool = False) -> "tuple[bool, str]":
     """确保 ``src_path``（musicex 文件）有可用 ekey。
 
     返回 ``(是否可用, 说明)``；说明用于日志，**不含任何凭证内容**。
+
+    ``force=True`` 时忽略“本地已有新鲜 ekey”的缓存判断，强制重取一次 ——
+    用于本地 ekey 虽在 22 小时窗口内、却已失效（换机 / 被提前轮换）的自愈场景。
     """
     src = Path(src_path)
     tail = musicex.parse_file(src)
     if tail is None:
         return False, "不是 musicex 文件（尾部无法解析）"
     existing = musicex.find_ekey_path(src, tail.song_mid, tail.filename)
-    if existing is not None:
+    if existing is not None and not force:
         try:
             age = time.time() - existing.stat().st_mtime
             if age < VALID_SECONDS:
@@ -131,7 +136,7 @@ def ensure_ekey(http, settings, src_path: "str | Path",
         return False, "未配置 QQ 凭证（设置页可填 qqmusic_key；留空则关闭自动获取）"
     try:
         ekey = fetch_ekey(http, uin, cookie, tail.song_mid, tail.filename,
-                          retry_delay=retry_delay)
+                          retry_delay=retry_delay, timeout=timeout)
     except EkeyError as exc:
         return False, (f"自动获取 ekey 失败：{exc}"
                        "（若提示未登录/失效：请到 设置 → QQ 音乐凭证 重新粘贴一次）")
