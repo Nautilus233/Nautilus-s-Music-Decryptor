@@ -5,7 +5,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .constants import (AUDIO_MAGICS, M4A_FTYP, NCM_MAGIC, QMC_EXT_MAP,
-                        QMC_TAG_QTAG, QMC_TAG_STAG, QMC_V2_EXTS)
+                        QMC_TAG_MUSICEX, QMC_TAG_QTAG, QMC_TAG_STAG, QMC_V2_EXTS)
+from .crypto.musicex import find_ekey_text, parse_tail as parse_musicex_tail
 
 __all__ = ["FormatInfo", "looks_like_audio", "sniff", "sniff_path"]
 
@@ -44,6 +45,11 @@ def sniff(head: bytes, tail: bytes, ext: str) -> FormatInfo:
 
     if ext in QMC_EXT_MAP:
         _family, out_ext = QMC_EXT_MAP[ext]
+        if len(tail) >= 8 and tail[-8:] == QMC_TAG_MUSICEX:
+            return FormatInfo("qmc", ext, out_ext, needs_online=True,
+                              note="QQ音乐新版 musicex 加密：文件内无密钥，"
+                                   "需要账号 ekey（放入 ekeys 目录后可离线解码）",
+                              trailing=tail[-8:])
         trailing = tail[-4:] if len(tail) >= 4 else tail
         if trailing == QMC_TAG_STAG:
             return FormatInfo("qmc", ext, out_ext, needs_online=True,
@@ -74,8 +80,16 @@ def sniff_path(path: "str | Path") -> FormatInfo:
     with open(p, "rb") as f:
         head = f.read(16)
         if size > 8:
-            f.seek(-8, 2)
-            tail = f.read(8)
+            f.seek(-min(size, 4096), 2)
+            tail = f.read()
         else:
             tail = head
-    return sniff(head, tail, p.suffix)
+    info = sniff(head, tail, p.suffix)
+    # musicex 尾部本身无密钥：若用户已在本地放好 ekey，就如实放宽为“可解码”
+    if info.kind == "qmc" and len(tail) >= 8 and tail[-8:] == QMC_TAG_MUSICEX:
+        mus = parse_musicex_tail(tail, size)
+        if mus is not None and find_ekey_text(p, mus.song_mid, mus.filename):
+            return FormatInfo("qmc", info.ext, info.out_ext, needs_online=False,
+                              note=f"musicex 新版加密（已找到本地 ekey：{mus.song_mid}）",
+                              trailing=tail[-8:])
+    return info

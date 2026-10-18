@@ -25,6 +25,7 @@ AUDIO_MAGICS: "dict[bytes, str]" = {
     b"\xff\xfa": "mp3",
     b"\xff\xf1": "aac",
     b"FRM8": "dff",
+    b"\x30\x26\xb2\x75": "wma",
 }
 M4A_FTYP = b"ftyp"          # lives at offset 4 of an m4a/mp4 file
 
@@ -55,6 +56,7 @@ QMC_MIX_KEY2 = bytes([0x2A, 0x2A, 0x23, 0x21, 0x28, 0x23, 0x24, 0x25,
 QMC_ENC_V2_PREFIX = b"QQMusic EncV2,Key:"
 QMC_TAG_STAG = b"STag"
 QMC_TAG_QTAG = b"QTag"
+QMC_TAG_MUSICEX = b"musicex\x00"   # 2026 新版尾部魔法（.mgg/.mflac/.mmp4）
 QMC_MAP_MAX_KEY_LEN = 300     # longer derived keys use the RC4 stream cipher
 
 # extension -> (cipher family, output extension)

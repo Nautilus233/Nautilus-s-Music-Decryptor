@@ -12,10 +12,15 @@ The key lives in the file trailer:
 
 * ``"QTag"`` trailer  -> embedded key + song id  (offline decryptable)
 * ``"STag"`` trailer  -> *no* embedded key (needs the online / client key)
+* ``"musicex\0"`` tail (2026) -> unencrypted tail with song_mid/filename
+  but **no key**; decodes offline only when a local ekey is provided
+  (``ekeys/<mid>__<file>.txt``), otherwise raises NeedsOnlineError
 * legacy trailer      -> last 4 bytes = little-endian key length
 
 Anything we cannot obtain a key for offline raises :class:`NeedsOnlineError`,
-which the pipeline turns into the fallback-download flow.
+which the pipeline turns into the fallback-download flow.  Decoded results are
+additionally checked against the audio magic table; a mismatch raises
+:class:`DecryptionFailedError` instead of silently writing garbage.
 """
 from __future__ import annotations
 
@@ -25,10 +30,11 @@ import struct
 
 from ..constants import (QMC_ENC_V2_PREFIX, QMC_EXT_MAP, QMC_MAP_MAX_KEY_LEN,
                          QMC_MIX_KEY1, QMC_MIX_KEY2, QMC_STATIC_CIPHER_BOX,
-                         QMC_TAG_QTAG, QMC_TAG_STAG)
+                         QMC_TAG_MUSICEX, QMC_TAG_QTAG, QMC_TAG_STAG)
 from ..errors import DecryptionFailedError, NeedsOnlineError
 from ..model import AudioResult
 from ..sniff import looks_like_audio
+from .musicex import find_ekey_text, parse_tail as parse_musicex_tail
 from .tea import decrypt_tencent_tea
 
 __all__ = ["QmcDecoder", "qmc_derive_key", "simple_make_key"]
@@ -203,13 +209,16 @@ class QmcRC4Cipher:
 # container handler
 # --------------------------------------------------------------------- #
 class QmcDecoder:
-    def __init__(self, data: bytes, ext: str) -> None:
+    def __init__(self, data: bytes, ext: str, *,
+                 src_path: "str | None" = None) -> None:
         self.file = data
         self.size = len(data)
         self.ext = (ext or "").lower().lstrip(".")
+        self.src_path = src_path
         self.cipher = None
         self.audio_size = 0
         self.song_id: "int | None" = None
+        self.song_mid: "str | None" = None
         self.out_ext = QMC_EXT_MAP.get(self.ext, ("qmc2", "mp3"))[1]
         self.needs_online = False
         self.note = ""
@@ -221,9 +230,35 @@ class QmcDecoder:
             return QmcRC4Cipher(key)
         return QmcMapCipher(key)
 
+    def _analyze_musicex(self) -> None:
+        """2026 新版 musicex 尾部：文件内无密钥；本地有 ekey 才能离线解码。"""
+        info = parse_musicex_tail(self.file[-4096:], self.size)
+        if info is None:
+            raise DecryptionFailedError("musicex 尾部解析失败（结构异常）")
+        self.audio_size = info.audio_size
+        self.song_mid = info.song_mid
+        ekey_text = find_ekey_text(self.src_path, info.song_mid, info.filename)
+        if not ekey_text:
+            self.needs_online = True
+            self.note = ("QQ音乐新版 musicex 加密：文件内无密钥，需要账号 ekey"
+                         "（在线获取后放入 ekeys 目录即可离线解码）")
+            return
+        try:
+            key = qmc_derive_key(ekey_text.encode("utf-8"))
+        except Exception as exc:  # noqa: BLE001 - 坏 ekey 要给出可读错误
+            raise DecryptionFailedError(
+                "musicex ekey 解析失败（密钥无效/已过期/被截断）",
+                detail=str(exc)) from exc
+        self.cipher = self._make_cipher(key)
+        self.note = f"musicex（本地 ekey 已加载：{info.song_mid}）"
+
     def _analyze(self) -> None:
         if self.size < 16:
             raise DecryptionFailedError("QMC 文件过小")
+
+        if self.file[-8:] == QMC_TAG_MUSICEX:
+            self._analyze_musicex()
+            return
 
         tail = self.file[-4:]
         if tail == QMC_TAG_STAG:
@@ -275,8 +310,14 @@ class QmcDecoder:
         self.cipher.decrypt(buf, 0)
         audio = bytes(buf)
 
+        # 安全网：解密结果必须是可识别的音频头。错误密钥 / 未知新格式 / 被误判为
+        # “静态加密”的文件都会在这里现形 —— 宁可直接失败，也绝不静默写出垃圾。
         sniffed = looks_like_audio(audio[:16])
-        ext = sniffed or self.out_ext
+        if sniffed is None:
+            raise DecryptionFailedError(
+                "解密结果不是有效音频（密钥或加密格式不匹配，未写出文件）",
+                detail=f"head={audio[:8].hex()}")
+        ext = sniffed
         if ext == "mmp4":
             ext = "m4a"
         return AudioResult(audio=audio, ext=ext,

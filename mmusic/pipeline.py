@@ -31,6 +31,7 @@ from .errors import (CancelledError, DecryptionFailedError, MusicDecryptorError,
                      NeedsOnlineError, NetworkError, SearchNoResultError,
                      UnsupportedFormatError)
 from .hashcache import HashCache
+from .lang import is_chinese_likely
 from .match import (best_reading_match, filename_query, parse_song_filename_candidates,
                     rank_tracks_multi, reading_scores, split_originals,
                     version_markers)
@@ -54,6 +55,9 @@ MIN_ARTIST_SIMILARITY = 0.60  # 歌手字段硬门槛：同名翻唱/不同演�
 MIN_TRACK_SECONDS = 45.0     # 实测时长下限：低于此秒数视为试听片段/前奏，不是完整原曲
 EARLY_STOP_SCORE = 0.95    # 已拿到高置信度原曲（歌名+歌手几乎完全一致）就不再打扰其它音源
 MAX_DOWNLOADS = 6          # 单文件最多尝试的下载次数（按分数从高到低顺延）
+#: 华语歌预匹配（mmusic/lang.py）：备用链路的动态排序与按需检索
+_CJK_FIRST_SOURCE = "migu"                      # 华语场景：提到联网源最前
+_CJK_DEFER_SOURCES = frozenset({"wikimedia", "internet_archive"})  # …垫底，有候选时不检索
 MAX_PROBES = 2             # 最多探测几个候选（静默的置信度操作，成本必须封顶）
 MAX_PROBES_WIDE = 4        # 平台标注互相矛盾时多测几个：只测前 2 个可能全是缩短版
 PROBE_TIMEOUT = 8.0        # 探测用更短超时：慢就跳过，绝不拖慢主流程
@@ -248,7 +252,7 @@ class Pipeline:
                 if fmt.needs_online:
                     raise NeedsOnlineError(fmt.note)
                 self._log(f"🔧 离线解密 QMC：{name}")
-                result = QmcDecoder(p.read_bytes(), fmt.ext).decode()
+                result = QmcDecoder(p.read_bytes(), fmt.ext, src_path=p).decode()
                 mode = "offline"
             else:
                 raise UnsupportedFormatError("无法识别的加密格式", detail=fmt.ext or "未知扩展名")
@@ -312,10 +316,36 @@ class Pipeline:
                          fmt=result.ext, message="完成")
 
     # ------------------------------------------------------------------ #
+    def _search_order(self, chinese: bool) -> "list":
+        """华语歌预匹配后的本次信源顺序（静默、自动）。
+
+        非华语：原样返回用户配置的顺序。
+        华语：离线/补链源保持最前；咪咕提到联网源最前；维基共享 / 互联网档案馆
+        压到最后 —— 是否真正检索由 `_fallback` 决定（只有当此前没有任何通过
+        门槛的候选时才去碰它们）。
+        """
+        sources = list(self.sources)
+        if not chinese:
+            return sources
+        head = [s for s in sources
+                if getattr(s, "offline", False) or getattr(s, "trusted_links", False)]
+        online = [s for s in sources if s not in head]
+        migu = [s for s in online if s.name == _CJK_FIRST_SOURCE]
+        defer = [s for s in online if s.name in _CJK_DEFER_SOURCES]
+        middle = [s for s in online
+                  if s.name != _CJK_FIRST_SOURCE and s.name not in _CJK_DEFER_SOURCES]
+        return head + migu + middle + defer
+
     def _fallback(self, src: Path, digest: str, *, note: str) -> JobResult:
         readings = parse_song_filename_candidates(src.stem) or [(src.stem, "")]
         query = filename_query(src.stem) or src.stem
         self._log(f"🔎 触发备用搜索：{query}")
+        # 华语歌预匹配（静默、自动）：决定本次备用链路的信源顺序，不打扰用户
+        chinese = is_chinese_likely(src.stem, *[f"{t} {a}" for t, a in readings])
+        search_order = self._search_order(chinese)
+        if chinese and any(s.name == _CJK_FIRST_SOURCE or s.name in _CJK_DEFER_SOURCES
+                           for s in search_order):
+            self._log("  · 华语歌预匹配：咪咕优先；维基共享/互联网档案馆仅在无其他候选时检索")
         if len(readings) > 1:
             self._log("  · 文件名有两种读法：" +
                       " / ".join(f"歌名「{t}」歌手「{a}」" for t, a in readings))
@@ -337,9 +367,14 @@ class Pipeline:
         if len(variants) > 1:
             self._log("  · 检索变体：" + " / ".join(f"{v.reason}「{v.text}」" for v in variants))
 
-        for source in self.sources:
+        found_any = False   # 是否已有通过门槛的候选：华语场景下决定 CC/PD 源是否检索
+        for source in search_order:
             if self._cancel:
                 raise CancelledError("已取消")
+            if chinese and source.name in _CJK_DEFER_SOURCES and found_any:
+                self._log(f"  · [{source.label}] 已跳过（华语歌：已有其他候选，"
+                          "避免在低命中源上耗时）")
+                continue
             kept: "list[Track]" = []
             for variant in variants[:MAX_VARIANTS_PER_SOURCE]:
                 kept, off_title_n, off_artist_n, dropped_ver = self._search_and_gate(
@@ -353,6 +388,7 @@ class Pipeline:
             if not kept:
                 continue
             tracks = kept
+            found_any = True
 
             rank_tracks_multi(readings, tracks, prefer_ext=self.settings.quality)
             best_t, best_a = reading_scores(readings, tracks[0],

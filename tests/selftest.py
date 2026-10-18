@@ -1490,6 +1490,106 @@ def test_migu_source() -> None:
     check("migu: no-free tracks raise a readable error", ok)
 
 
+def test_language_prefilter() -> None:
+    """华语预匹配（静默）：汉字检测 + 内置歌手名单；只影响排序，不参与校验。"""
+    print("\n[language prefilter: chinese-likely detection]")
+    from mmusic.lang import contains_han, is_chinese_likely
+
+    check("lang: han detected in mixed text",
+          contains_han("晴天") and contains_han("G.E.M.邓紫棋") and contains_han("大碟·测试"),
+          "")
+    check("lang: pure latin text has no han",
+          not contains_han("Hotel California") and not contains_han("Jay Chou"), "")
+    check("lang: chinese title -> chinese-likely", is_chinese_likely("晴天 - 周杰伦"))
+    check("lang: romanized artist in the built-in list still matches",
+          is_chinese_likely("Mojito", "Jay Chou")
+          and is_chinese_likely("Light Years Away", "g.e.m."), "")
+    check("lang: western songs stay non-chinese",
+          not is_chinese_likely("Hotel California", "Eagles")
+          and not is_chinese_likely("Shape of You", "Ed Sheeran")
+          and not is_chinese_likely("Yesterday Once More", "Carpenters"), "")
+
+
+def test_cjk_order_e2e() -> None:
+    """华语歌端到端：咪咕先行、CC/PD 源按需检索；非华语歌维持原顺序。"""
+    print("\n[cjk order: migu first + CC/PD deferral]")
+    PAYLOAD = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\xbb" * 40000
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+
+        def run_case(name, filename, plan, source_names):
+            base = tmp / name
+            base.mkdir()
+            media = base / "payload.mp3"
+            media.write_bytes(PAYLOAD)
+            calls: list[str] = []
+
+            class FakeSource(SearchSource):
+                def __init__(self, n):
+                    super().__init__(None, {})
+                    self.name = n
+                    self.label = n
+
+                def search(self, query, *, quality="mp3", limit=10):
+                    calls.append(self.name)
+                    hit = plan.get(self.name)
+                    if not hit:
+                        return []
+                    title, artist = hit
+                    return [Track(self.name, title, artist, ext="mp3",
+                                  raw={"path": str(media)})]
+
+                def resolve(self, track, *, quality="mp3"):
+                    track.url = Path(track.raw["path"]).resolve().as_uri()
+                    track.ext = "mp3"
+                    return track
+
+            src = base / filename
+            src.write_bytes(os.urandom(8188) + b"STag")
+            logs: list[str] = []
+            pipe = Pipeline(Settings(output_dir=str(base / "out"), enable_fallback=True,
+                                     write_metadata=False, fetch_cover=False,
+                                     remember_hashes=False),
+                            cache_path=base / "c.json", on_log=logs.append,
+                            sources=[FakeSource(n) for n in source_names])
+            res = pipe.process_file(src)
+            return calls, logs, res
+
+        ORDER = ["kuwo", "migu", "wikimedia", "internet_archive"]
+
+        # ① 华语歌 + 主流命中：migu 提前；CC/PD 不再检索
+        calls, logs, res = run_case(
+            "sc1", "晴天 - 周杰伦.mgg",
+            {"migu": ("晴天", "周杰伦"), "kuwo": ("晴天", "周杰伦")}, ORDER)
+        check("cjk-order: migu is searched before kuwo",
+              calls[:2] == ["migu", "kuwo"], str(calls))
+        check("cjk-order: CC/PD sources are skipped once a candidate exists",
+              "wikimedia" not in calls and "internet_archive" not in calls, str(calls))
+        check("cjk-order: the song is still downloaded",
+              res.status == "downloaded" and bool(res.out_path), res.status)
+
+        # ② 华语歌 + 主流全空：CC/PD 仍作为最后兜底被检索
+        calls, logs, res = run_case(
+            "sc2", "晴天 - 周杰伦.mgg", {"wikimedia": ("晴天", "周杰伦")}, ORDER)
+        check("cjk-order: CC/PD is searched when mainstream finds nothing",
+              "wikimedia" in calls and calls.index("kuwo") < calls.index("wikimedia"),
+              str(calls))
+        check("cjk-order: after the CC source hits, the later CC/PD source is skipped",
+              "internet_archive" not in calls, str(calls))
+
+        # ③ 非华语歌：顺序与检索行为保持用户配置
+        calls, logs, res = run_case(
+            "sc3", "Hotel California - Eagles.mgg",
+            {"kuwo": ("Hotel California", "Eagles")}, ORDER)
+        check("cjk-order: non-chinese songs keep the configured order",
+              calls[:2] == ["kuwo", "migu"], str(calls))
+        check("cjk-order: non-chinese songs still consult CC/PD sources",
+              "wikimedia" in calls and "internet_archive" in calls, str(calls))
+        check("cjk-order: no chinese-prefilter log for western songs",
+              not any("华语歌预匹配" in m for m in logs), " | ".join(logs[-3:]))
+
+
 def test_manual_links() -> None:
     """P3：手动补链 —— 用户给的链接优先使用、跳过歌名/歌手门槛，但仍走下载校验。"""
     print("\n[manual links]")
@@ -1647,6 +1747,75 @@ def test_kwm_decoder() -> None:
               out is not None and out.read_bytes() == payload, str(out))
 
 
+def test_musicex_container() -> None:
+    """musicex（2026 新版 QQ）：尾部解析 / 无 ekey 报“需联网” / 有 ekey 完整解码。"""
+    print("\n[musicex: 2026 QQ container]")
+    from mmusic.crypto.qmc import QmcDecoder
+    from mmusic.sniff import sniff_path
+
+    key = bytes(range(32))                                     # -> map cipher
+    key_big = bytes((i * 7 + 1) & 0xFF for i in range(512))    # -> rc4 cipher
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+
+        # ① 无 ekey：如实标记“需联网”，绝不再产出垃圾文件
+        p1 = tmp / "无ekey.mgg"
+        p1.write_bytes(fx.build_musicex(fx.PAYLOAD_OGG))
+        info = sniff_path(p1)
+        check("musicex: sniffed as needs-online",
+              info.needs_online and info.kind == "qmc", str(info))
+        try:
+            QmcDecoder(p1.read_bytes(), "mgg", src_path=p1).decode()
+            ok, msg = False, "no exception"
+        except NeedsOnlineError as exc:
+            ok, msg = ("ekey" in exc.message), exc.message
+        check("musicex: decode without ekey raises a readable error", ok, msg)
+
+        # ② 本地 ekeys/<mid>__<name>.txt：完整离线解码（map 密文）
+        p2 = tmp / "有ekey.mgg"
+        p2.write_bytes(fx.build_musicex(fx.PAYLOAD_OGG, key))
+        (tmp / "ekeys").mkdir()
+        (tmp / "ekeys" / "00TEST00000001__TEST00001.mgg.txt").write_text(
+            fx.make_qmc_v2_key(key).decode("ascii"), encoding="utf-8")
+        dec2 = QmcDecoder(p2.read_bytes(), "mgg", src_path=p2)
+        check("musicex: tail fields parsed (mid/size)",
+              dec2.song_mid == "00TEST00000001" and dec2.audio_size == len(fx.PAYLOAD_OGG),
+              f"{dec2.song_mid} / {dec2.audio_size}")
+        check("musicex: sniff_path sees the local ekey",
+              not sniff_path(p2).needs_online, str(sniff_path(p2)))
+        r2 = QmcDecoder(p2.read_bytes(), "mgg", src_path=p2).decode()
+        check("musicex: payload decodes byte-exact with a local ekey",
+              r2.audio == fx.PAYLOAD_OGG)
+
+        # ③ B 变体（tail=200）+ <mid>.txt 命名 + RC4 密钥
+        p3 = tmp / "B变体.mflac"
+        p3.write_bytes(fx.build_musicex(fx.PAYLOAD_FLAC, key_big, variant=200,
+                                        song_mid="00TEST00000002",
+                                        filename="TEST00002.mflac"))
+        (tmp / "ekeys" / "00TEST00000002.txt").write_text(
+            fx.make_qmc_v2_key(key_big).decode("ascii"), encoding="utf-8")
+        r3 = QmcDecoder(p3.read_bytes(), "mflac", src_path=p3).decode()
+        check("musicex: variant B (200) parses and decodes byte-exact",
+              r3.audio == fx.PAYLOAD_FLAC)
+
+
+def test_qmc_no_silent_garbage() -> None:
+    """未知尾部不再静默产出垃圾文件：解码结果过不了音频头校验就明确报错。"""
+    print("\n[qmc guard: no silent garbage]")
+    from mmusic.crypto.qmc import QmcDecoder
+    from mmusic.errors import DecryptionFailedError
+
+    junk = bytearray(os.urandom(66000))
+    junk[-4:] = b"\xff\xff\x00\x00"       # 末4字节 >= 0x400 → 走“静态加密”分支
+    try:
+        QmcDecoder(bytes(junk), "mgg").decode()
+        ok, msg = False, "no exception"
+    except DecryptionFailedError as exc:
+        ok, msg = ("不是有效音频" in exc.message), exc.message
+    check("qmc-guard: garbage never becomes a written file", ok, msg)
+
+
 def test_completeness_gate() -> None:
     """P0-1：下载完整度门禁——提示音/试听/截短绝不落盘。"""
     print("\n[completeness gate]")
@@ -1800,10 +1969,14 @@ def main() -> int:
     test_query_expander()
     test_new_sources()
     test_migu_source()
+    test_language_prefilter()
+    test_cjk_order_e2e()
     test_manual_links()
     test_variant_retry_e2e()
     test_import_all_modules()
     test_kwm_decoder()
+    test_musicex_container()
+    test_qmc_no_silent_garbage()
     test_completeness_gate()
     if args.live:
         test_live()

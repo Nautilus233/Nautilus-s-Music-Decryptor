@@ -169,3 +169,32 @@ def build_qmc_stag(payload: bytes) -> bytes:
     mask = _qmc_static_mask(len(payload))
     body = bytes(a ^ b for a, b in zip(payload, mask))
     return body + b"STag"
+
+
+def build_musicex(payload: bytes, key: "bytes | None" = None, *, variant: int = 192,
+                  song_mid: str = "00TEST00000001",
+                  filename: str = "TEST00001.mgg") -> bytes:
+    """musicex（2026 新版）：加密音频 + 未加密尾部（A=192 / B=200+16 前缀）。
+
+    ``key`` 给定时用其加密 payload；配套 ekey 文本用 ``make_qmc_v2_key(key)``。
+    """
+    from mmusic.crypto.qmc import QmcMapCipher, QmcRC4Cipher
+    if key is None:
+        audio = payload
+    else:
+        buf = bytearray(payload)
+        cipher = QmcRC4Cipher(key) if len(key) > 300 else QmcMapCipher(key)
+        cipher.decrypt(buf, 0)
+        audio = bytes(buf)
+    if variant == 192:
+        mid_at, name_at, size_at, prefix = 12, 72, 176, 0
+    else:
+        mid_at, name_at, size_at, prefix = 28, 88, 184, 16
+    tail = bytearray(variant)
+    mid = song_mid.encode("utf-16le")
+    tail[mid_at:mid_at + len(mid)] = mid
+    name = filename.encode("utf-16le")
+    tail[name_at:name_at + len(name)] = name
+    tail[-8:] = b"musicex\x00"
+    tail[size_at:size_at + 4] = variant.to_bytes(4, "little")
+    return audio + b"\x00" * prefix + bytes(tail)
