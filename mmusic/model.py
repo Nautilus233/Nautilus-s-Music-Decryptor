@@ -37,3 +37,6 @@ class Track:
     url: str = ""              # direct link (may be filled lazily)
     raw: dict = field(default_factory=dict)
     score: float = 0.0
+    #: 直链形态上一次就看得出的"疑似短资源"（试听/铃声/提示音）。目前由酷我适配器
+    #: 依据 CDN 路径判定；只用于**降权**（少花探测/下载预算），绝不硬性排除。
+    short_asset: bool = False

@@ -214,12 +214,18 @@ def test_version_filter() -> None:
                "晴天 minus one", "晴天 karaoke", "晴天 カラオケ", "晴天 (Instrumental)",
                "晴天 -inst", "晴天_inst", "晴天 inst.", "晴天 (Remix)", "晴天 (Cover)",
                "晴天 翻唱", "晴天 (Live)", "晴天 现场版", "晴天 (Demo)", "晴天 试听",
-               "晴天 (Acoustic)", "晴天 不插电", "晴天 (剪辑版)", "晴天 (Edit)", "晴天 (Mix)"]
+               "晴天 (Acoustic)", "晴天 不插电", "晴天 (剪辑版)", "晴天 (Edit)", "晴天 (Mix)",
+               # 2026-10-19 三十首批量实测里真实"漏网"的（它们都能拿到直链）：
+               "天空の城ラピュタ (网友改编)", "晴天 3D环绕版", "稻香 (2018 CCTV-15 现场版)",
+               "遇见 (黑胶版)", "夜曲 (重生版)", "光年之外 热爱版", "晴天 (2020重制版)",
+               "富士山下 (2010音乐万万岁现场)", "晴天 晚会版"]
     missed = [t for t in blocked if not version_markers(t)]
     check(f"filter: all {len(blocked)} variant markers are caught", not missed, f"漏掉: {missed}")
 
     kept = ["晴天", "周杰伦 - 晴天", "Alive", "Instant Crush", "Mixed Up",
-            "Deliver", "Oliver", "Olivia", "Believer", "Studio 54", "Film"]
+            "Deliver", "Oliver", "Olivia", "Believer", "Studio 54", "Film",
+            # 词表补词后**不得误伤**的正常标题（含"节目""重制"这类词根的普通用法）
+            "Shape Of You", "Für Elise", "千本桜", "学猫叫", "海阔天空", "重生"]
     hurt = [(t, version_markers(t)) for t in kept if version_markers(t)]
     check("filter: no false positives on normal titles", not hurt, f"误伤: {hurt}")
 
@@ -2070,6 +2076,130 @@ def test_ekey_pipeline_e2e() -> None:
               f"{res2.status} calls={http2.calls}")
 
 
+def test_source_tag_and_cover_carry() -> None:
+    """离线解密：回读源标签（不把 TITLE 覆盖成文件名）+ 转码搬运内嵌封面（纯本地）。"""
+    print("\n[offline decode: source tags + embedded cover carry-through]")
+    import wave
+    from mmusic import transcode
+    from mmusic.transcode import EngineUnavailable
+    from mutagen.flac import FLAC as _FLAC, Picture as _Picture
+
+    if not transcode.available():
+        print("  (skip) 转码引擎不可用，构造不出真实带封面的 FLAC 样本")
+        return
+
+    # 1) 纯 Python 生成 0.3s 真 WAV -> 引擎转成真 FLAC -> 用 mutagen 打标签 + 内嵌封面
+    with tempfile.TemporaryDirectory() as t0:
+        wav = Path(t0) / "a.wav"
+        with wave.open(str(wav), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(44100)           # MP3 编码器（mp3_mf）不接受 8k/16k
+            w.writeframes(b"\x00\x00" * 13230)   # ~0.3s
+        try:
+            flac_bytes, _ = transcode.convert_bytes(wav.read_bytes(), "wav", "flac")
+        except EngineUnavailable as exc:
+            print(f"  (skip) 引擎不可用：{exc}")
+            return
+
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 128
+    # mutagen 的 FLAC.save() 必须落在真文件上（写 BytesIO 会在头部自检时失败）
+    with tempfile.TemporaryDirectory() as t1:
+        tagged = Path(t1) / "tagged.flac"
+        tagged.write_bytes(flac_bytes)
+        f = _FLAC(str(tagged))
+        f["title"] = ["夜曲"]
+        f["artist"] = ["周杰伦"]
+        f["album"] = ["十一月的萧邦"]
+        pic = _Picture()
+        pic.type = 3
+        pic.mime = "image/png"
+        pic.data = png
+        f.add_picture(pic)
+        f.save()
+        payload_with = tagged.read_bytes()
+    payload_without = flac_bytes            # 没封面、没标签的同一段真音频
+
+    class CountingHttp:
+        def __init__(self):
+            self.calls = 0
+
+        def request(self, *a, **kw):
+            self.calls += 1
+            raise AssertionError("离线路径不得联网")
+
+        def close(self):
+            pass
+
+    # 引擎自己产出的**裸 FLAC**（无标签、单条流）也必须能转 MP3：
+    # 实测缺陷（2026-10-19）—— 堆内存探测曾命中无关内存 → codec_id=0 →
+    # 误报"没有可用的解码器"，转码被静默降级成"保留原格式"，且换顺序就好。
+    try:
+        bare_mp3, _ = transcode.convert_bytes(flac_bytes, "flac", "mp3")
+        check("transcode: 引擎产出的裸 FLAC 也能转 MP3（探测不再命中无关内存）",
+              len(bare_mp3) > 1000, f"{len(bare_mp3)}B")
+    except Exception as exc:  # noqa: BLE001
+        check("transcode: 引擎产出的裸 FLAC 也能转 MP3（探测不再命中无关内存）",
+              False, f"{type(exc).__name__}: {exc}")
+
+    key = bytes(range(32))
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        http = CountingHttp()
+
+        def run(payload: bytes, quality: str, tag: str):
+            src = tmp / f"{tag}.mflac"
+            src.write_bytes(fx.build_qmc_v2(payload, key))
+            info = sniff_path(src)
+            settings = Settings(output_dir=str(tmp / ("out_" + tag)), quality=quality,
+                                enable_fallback=False, write_metadata=True,
+                                fetch_cover=True, remember_hashes=False,
+                                timeout=5.0, retries=0, min_bitrate=0)
+            logs: "list[str]" = []
+            pipe = Pipeline(settings, cache_path=tmp / (tag + ".json"),
+                            on_log=logs.append, sources=[], http=http)
+            return info, pipe.process_file(src)
+
+        # 2) 目标 MP3：标签与内嵌封面必须跟过去，标题不得被文件名覆盖
+        info, r = run(payload_with, "mp3", "with")
+        out = Path(r.out_path) if r.out_path else None
+        check("tagcarry: 源 mflac 走离线解密（不依赖网络）",
+              not info.needs_online and r.status == "decoded" and r.mode == "offline",
+              f"{info.needs_online} {r.status}/{r.mode}")
+        from mutagen.id3 import ID3 as _ID3
+        frames = _ID3(str(out)) if out and out.exists() else {}
+        apic = [k for k in frames if str(k).startswith("APIC")] if frames else []
+        check("tagcarry: TITLE 用源文件的真歌名（未被文件名覆盖）",
+              frames and str(frames.get("TIT2")) == "夜曲", str(frames.get("TIT2")) if frames else "no tags")
+        check("tagcarry: ARTIST / ALBUM 从源文件回读",
+              frames and str(frames.get("TPE1")) == "周杰伦" and str(frames.get("TALB")) == "十一月的萧邦",
+              f"{frames.get('TPE1') if frames else None} / {frames.get('TALB') if frames else None}")
+        check("tagcarry: 转码成 MP3 后内嵌封面未丢（APIC）",
+              len(apic) == 1 and bytes(frames[apic[0]].data) == png,
+              f"APIC={apic}")
+        check("tagcarry: 产物文件名仍是「歌手 - 歌名」",
+              out is not None and out.name == "周杰伦 - 夜曲.mp3", out.name if out else r.message)
+
+        # 3) 目标 FLAC：不转码（keep），源内封面与标签原样保留
+        info2, r2 = run(payload_with, "flac", "keep")
+        out2 = Path(r2.out_path) if r2.out_path else None
+        fa = _FLAC(str(out2)) if out2 and out2.exists() else None
+        check("tagcarry: 目标 FLAC 走 keep，源内嵌封面保留",
+              fa is not None and len(fa.pictures) == 1 and bytes(fa.pictures[0].data) == png,
+              f"pictures={len(fa.pictures) if fa else None}")
+        check("tagcarry: 目标 FLAC 标签保持源值",
+              fa is not None and fa.get("title") == ["夜曲"] and fa.get("artist") == ["周杰伦"],
+              f"{fa.get('title') if fa else None}")
+
+        # 4) 源本身没有封面：不得凭空造、更不得联网找
+        _, r3 = run(payload_without, "mp3", "nocover")
+        out3 = Path(r3.out_path) if r3.out_path else None
+        frames3 = _ID3(str(out3)) if out3 and out3.exists() else {}
+        check("tagcarry: 源无封面时产物不加封面（不联网找图）",
+              not [k for k in frames3 if str(k).startswith("APIC")] and http.calls == 0,
+              f"http_calls={http.calls}")
+
+
 def test_settings_roundtrip() -> None:
     """设置项往返：凭证 / 自动开始 / 目标音质等字段不丢、类型正确。"""
     print("\n[settings: round-trip]")
@@ -2079,6 +2209,256 @@ def test_settings_roundtrip() -> None:
     check("settings: new fields round-trip (creds / auto-start / quality)",
           back.qqmusic_uin == "1" and back.qqmusic_key == "K"
           and back.auto_start is False and back.quality == "flac")
+
+
+def test_last_resort_source() -> None:
+    """末位来源（酷狗）：照常检索但**不为它预解析**直链，只在其它来源都没测到可用候选时才补测。"""
+    print("\n[last-resort source: no wasted resolves]")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        good = tmp / "good.mp3"
+        good.write_bytes(fx.make_mp3_xing(210, pad=40000))
+
+        class Src(SearchSource):
+            def __init__(self, name, title, artist, path, calls):
+                super().__init__(None, {})
+                self.name = self.label = name
+                self._title, self._artist, self._path = title, artist, str(path)
+                self.calls = calls
+
+            def search(self, query, *, quality="mp3", limit=10):
+                return [Track(self.name, self._title, self._artist, ext="mp3",
+                              raw={"p": self._path})]
+
+            def resolve(self, track, *, quality="mp3"):
+                self.calls.append(self.name)
+                track.url = Path(track.raw["p"]).resolve().as_uri()
+                track.ext = "mp3"
+                return track
+
+        from mmusic.pipeline import _LAST_RESORT_SOURCES
+        check("末位来源: 内置清单里包含 kugou", "kugou" in _LAST_RESORT_SOURCES)
+
+        # 场景①：主来源有可用候选 → 末位来源**连解析都不做**
+        calls_a: "list[str]" = []
+        primary = Src("kuwo", "晴天", "周杰伦", good, calls_a)
+        kugou = Src("kugou", "晴天", "周杰伦", good, calls_a)
+        src = tmp / "晴天 - 周杰伦.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+        logs_a: "list[str]" = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), enable_fallback=True,
+                                 write_metadata=False, fetch_cover=False,
+                                 remember_hashes=False, min_bitrate=0),
+                        cache_path=tmp / "c.json", on_log=logs_a.append,
+                        sources=[primary, kugou])
+        res = pipe.process_file(src)
+        check("末位来源: 主来源够用时，没有为末位来源解析直链",
+              res.out_path is not None and "kugou" not in calls_a,
+              f"resolved={calls_a} status={res.status}")
+        check("末位来源: 日志如实说明降权",
+              any("已降权" in m and "末位来源" in m for m in logs_a),
+              " | ".join(logs_a[-4:]))
+
+        # 场景②：只有末位来源能提供可用候选 → 仍必须被补测到、被下到（绝不误报没找到）
+        calls_b: "list[str]" = []
+        blank = tmp / "blank.mp3"
+        blank.write_bytes(b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\x00" * 40000)
+        empty = Src("kuwo", "晴天", "周杰伦", blank, calls_b)     # 测不出时长的候选
+        kugou2 = Src("kugou", "晴天", "周杰伦", good, calls_b)
+        second = tmp / "second"
+        second.mkdir()
+        src2 = second / "晴天 - 周杰伦.mgg"      # 与场景① 同名不同目录，读法一致
+        src2.write_bytes(os.urandom(8192) + b"STag")
+        logs_b: "list[str]" = []
+        pipe2 = Pipeline(Settings(output_dir=str(second / "out"), enable_fallback=True,
+                                  write_metadata=False, fetch_cover=False,
+                                  remember_hashes=False, min_bitrate=0),
+                         cache_path=second / "c.json", on_log=logs_b.append,
+                         sources=[empty, kugou2])
+        res2 = pipe2.process_file(src2)
+        got = Path(res2.out_path).read_bytes() if res2.out_path else b""
+        check("末位来源: 只有它能提供可用候选时，照样被补测并落盘",
+              got == good.read_bytes(), f"{res2.status} got={len(got)}B :: {' | '.join(logs_b[-4:])}")
+
+
+def test_source_link_upgrades() -> None:
+    """P0：酷我直链形态判定（正片/短资源）+ 实测平均码率 + 酷狗 hash 顺序与返回值校正。"""
+    print("\n[fallback sources: link heuristics]")
+    from mmusic.pipeline import _avg_bitrate
+    from mmusic.search.kugou import KugouSource
+    from mmusic.search.kuwo import KuwoSource, classify_link
+
+    # ① 酷我直链形态（URL 全部取自 2026-10-19 的真实实测样本）
+    cases = [
+        ("https://kw-er.kuwo.cn/f2319cb6fc8ff011660e68a9e527225a/6ad5ae9c/resource/30106/trackmedia/M500004H9KoF2Ms7hW.mp3", "full"),
+        ("https://kw-bj.kuwo.cn/44c84912bff67654ea8714666eb1e4bd/6ad5ae9b/ev/resource/n2/39/48/2738742160.mp3", "short"),
+        ("https://kw-bj.kuwo.cn/38be33aea26d130a68505f3e82e5f4fa/6ad5ae9c/lx/resource/n3/88/69/563182854.mp3", "short"),
+        ("https://kw-bj.kuwo.cn/895d18d586195fe6df16456881f9a358/6ad5ae9d/gf/resource/n3/77/73/3643297523.mp3", "short"),
+        ("https://kw-bj.kuwo.cn/4dc769751718ad0dba37714ab9aaf953/6ad5aeb9/nf/resource/x.mp3", "short"),
+        ("https://example.com/song.mp3", ""),
+        ("", ""),
+    ]
+    bad = [f"{classify_link(u)}!={w}" for u, w in cases if classify_link(u) != w]
+    check("kuwo: CDN 路径能区分正片/短资源（不用下载）", not bad, " | ".join(bad))
+    check("kuwo: trackmedia 形态判为正片",
+          classify_link(cases[0][0]) == "full")
+
+    # ② 平均码率用真实数字校准（体积 ÷ 实测时长，不用首帧码率）
+    check("bitrate: 实测平均码率 3.69MB/230s -> 128k",
+          _avg_bitrate(3690000, 230.0) == 128, str(_avg_bitrate(3690000, 230.0)))
+    check("bitrate: 短资源也如实算出低码率 0.13MB/22s -> 47k",
+          _avg_bitrate(130000, 22.0) == 47, str(_avg_bitrate(130000, 22.0)))
+    check("bitrate: 没有时长就不猜", _avg_bitrate(1000, None) == 0)
+
+    # ③ 酷我 resolve：短资源当场标记 + 解析入口是 HTTPS
+    class KuwoHttp:
+        def __init__(self, url):
+            self.url = url
+
+        def get_json(self, url, headers=None, **kw):
+            return {"code": 200, "url": self.url}
+
+    short_url = "https://kw-bj.kuwo.cn/aa/bb/lx/resource/n3/1/2/3.mp3"
+    ks = KuwoSource(KuwoHttp(short_url), {})
+    track = Track("kuwo", "夜曲", "周杰伦", raw={"MUSICRID": "MUSIC_1"})
+    ks.resolve(track)
+    check("kuwo: 短资源直链会被标记 short_asset（不下载即可判）",
+          track.short_asset and track.url == short_url, f"{track.short_asset} {track.url}")
+    full_url = "https://kw-er.kuwo.cn/aa/bb/resource/30106/trackmedia/M500004H9KoF2Ms7hW.mp3"
+    ks2 = KuwoSource(KuwoHttp(full_url), {})
+    track2 = Track("kuwo", "夜曲", "周杰伦", raw={"MUSICRID": "MUSIC_2"})
+    ks2.resolve(track2)
+    check("kuwo: 正片不会被误标", not track2.short_asset)
+    check("kuwo: 解析入口已改为 HTTPS",
+          KuwoSource.RESOLVE.startswith("https://"), KuwoSource.RESOLVE)
+
+    # ④ 酷狗：hash 顺序（FileHash 优先）+ 用返回值校正声明字段
+    class KugouHttp:
+        def __init__(self):
+            self.info_urls: list[str] = []
+
+        def get_json(self, url, headers=None, **kw):
+            if "song_search_v2" in url:
+                return {"data": {"lists": [{
+                    "SongName": "夜曲", "SingerName": "周杰伦", "AlbumName": "十一月的萧邦",
+                    "Duration": 230, "FileHash": "FILEH",
+                    "HQFileHash": "HQH", "SQFileHash": "SQH"}]}}
+            self.info_urls.append(url)
+            return {"url": "https://sharefs.kugou.com/x.mp3", "bitRate": 128,
+                    "extName": "mp3", "fileSize": 3000000}
+
+    h = KugouHttp()
+    gs = KugouSource(h, {})
+    t_mp3 = gs.search("夜曲", limit=3)[0]
+    gs.resolve(t_mp3, quality="mp3")
+    check("kugou: 常规目标先试 FileHash（实测命中率最高）",
+          bool(h.info_urls) and "hash=FILEH" in h.info_urls[0], str(h.info_urls[:1]))
+    check("kugou: 用返回值校正声明（声明 320k/flac -> 实测 128k/mp3）",
+          t_mp3.bitrate == 128 and t_mp3.ext == "mp3", f"{t_mp3.bitrate}/{t_mp3.ext}")
+    h2 = KugouHttp()
+    gs2 = KugouSource(h2, {})
+    t_flac = gs2.search("夜曲", limit=3)[0]
+    gs2.resolve(t_flac, quality="flac")
+    check("kugou: FLAC 目标仍先试 SQ（唯一可能给无损的档）",
+          bool(h2.info_urls) and "hash=SQH" in h2.info_urls[0], str(h2.info_urls[:1]))
+
+
+def test_short_asset_probe_priority() -> None:
+    """疑似短资源不许占满探测预算：真原曲必须仍能被测到、被下到（此前会报"没找到"）。"""
+    print("\n[short assets must not eat the probe budget]")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        clip1 = tmp / "clip1.mp3"
+        clip1.write_bytes(fx.make_mp3_xing(5, pad=40000))
+        clip2 = tmp / "clip2.mp3"
+        clip2.write_bytes(fx.make_mp3_xing(8, pad=40000))
+        full = tmp / "full.mp3"
+        full.write_bytes(fx.make_mp3_xing(200, pad=40000))
+
+        class Fake(SearchSource):
+            def __init__(self):
+                super().__init__(None, {})
+                self.name = self.label = "fake"
+
+            def search(self, query, *, quality="mp3", limit=10):
+                # 前两个是"疑似短资源"（真实场景由酷我 CDN 路径判定），而且
+                # 歌手字段完全一致 => 匹配分**更高**，会排在真原曲前面。
+                return [Track(self.name, "晴天", "周杰伦", ext="mp3",
+                              raw={"p": str(clip1)}),
+                        Track(self.name, "晴天", "周杰伦", ext="mp3",
+                              raw={"p": str(clip2)}),
+                        Track(self.name, "晴天", "周杰伦 Jay Chou", ext="mp3",
+                              raw={"p": str(full)})]
+
+            def resolve(self, track, *, quality="mp3"):
+                path = Path(track.raw["p"])
+                track.url = path.resolve().as_uri()
+                track.ext = "mp3"
+                track.short_asset = path.name.startswith("clip")
+                return track
+
+        src = tmp / "晴天 - 周杰伦.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), enable_fallback=True,
+                                 write_metadata=False, fetch_cover=False,
+                                 remember_hashes=False, min_bitrate=0),
+                        cache_path=tmp / "c.json", on_log=logs.append, sources=[Fake()])
+        res = pipe.process_file(src)
+        got = Path(res.out_path).read_bytes() if res.out_path else b""
+        tail = " | ".join(logs[-6:])
+        check("短资源降权: 探测预算没被片段占满，真原曲照样被测到并落盘",
+              got == full.read_bytes(), f"{res.status} got={len(got)}B :: {tail}")
+        check("短资源降权: 日志说明降权（不静默）",
+              any("已降权" in m for m in logs), tail)
+        check("短资源降权: 片段连探测都不占用（预算全给正片，更省请求）",
+              not any("时长过短已排除" in m for m in logs), tail)
+
+
+def test_portable_config_dir() -> None:
+    """便携模式：程序目录里有 settings.json / portable 标记时配置随 exe 走，否则仍是 %APPDATA%。"""
+    print("\n[portable mode: config beside the exe]")
+    from mmusic.config import AppConfig, default_config_dir, resolve_config_dir
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+
+        bare = tmp / "bare"
+        bare.mkdir()
+        check("portable: 没有标记时仍用 %APPDATA%",
+              resolve_config_dir(bare) == default_config_dir(), str(resolve_config_dir(bare)))
+        check("portable: 仓库根目录没有标记时也不会把配置写进仓库",
+              resolve_config_dir() == default_config_dir(), str(resolve_config_dir()))
+
+        with_settings = tmp / "with_settings"
+        with_settings.mkdir()
+        (with_settings / "settings.json").write_text("{}", encoding="utf-8")
+        check("portable: 存在 settings.json → 配置目录 = 程序目录",
+              resolve_config_dir(with_settings) == with_settings,
+              str(resolve_config_dir(with_settings)))
+
+        marker = tmp / "marker_file"
+        marker.mkdir()
+        (marker / "portable").write_text("", encoding="utf-8")
+        check("portable: 空的 portable 标记文件同样启用",
+              resolve_config_dir(marker) == marker, str(resolve_config_dir(marker)))
+
+        marker_dir = tmp / "marker_dir"
+        (marker_dir / "portable").mkdir(parents=True)
+        check("portable: portable 文件夹同样启用",
+              resolve_config_dir(marker_dir) == marker_dir, str(resolve_config_dir(marker_dir)))
+
+        cfg = AppConfig(path=with_settings / "settings.json")
+        cfg.settings.qqmusic_uin = "12345"
+        cfg.settings.qqmusic_key = "K"
+        cfg.settings.quality = "flac"
+        cfg.save()
+        back = AppConfig(path=with_settings / "settings.json").settings
+        check("portable: 便携目录里的设置与凭证往返正常",
+              back.qqmusic_uin == "12345" and back.qqmusic_key == "K"
+              and back.quality == "flac", f"{back.qqmusic_uin}/{back.quality}")
+        check("portable: 哈希缓存与配置同目录（一起搬走）",
+              cfg.cache_path.parent == with_settings, str(cfg.cache_path))
 
 
 def test_completeness_gate() -> None:
@@ -2247,7 +2627,12 @@ def main() -> int:
     test_pipeline_quality_e2e()
     test_ekey_fetch()
     test_ekey_pipeline_e2e()
+    test_source_tag_and_cover_carry()
     test_settings_roundtrip()
+    test_portable_config_dir()
+    test_source_link_upgrades()
+    test_last_resort_source()
+    test_short_asset_probe_priority()
     test_completeness_gate()
     if args.live:
         test_live()

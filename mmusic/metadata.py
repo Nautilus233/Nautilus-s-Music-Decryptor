@@ -5,6 +5,8 @@ format is unsupported, the audio itself is still written untouched.
 """
 from __future__ import annotations
 
+import base64
+import io
 from pathlib import Path
 
 try:
@@ -17,7 +19,8 @@ try:
 except Exception:  # noqa: BLE001
     HAVE_MUTAGEN = False
 
-__all__ = ["HAVE_MUTAGEN", "write_tags", "read_tags", "guess_image_mime"]
+__all__ = ["HAVE_MUTAGEN", "write_tags", "read_tags", "read_source_meta",
+           "guess_image_mime"]
 
 
 def guess_image_mime(data: bytes) -> str:
@@ -99,6 +102,58 @@ def write_tags(path: "str | Path", *, title: str = "", artist: str = "",
         return True
     except Exception:  # noqa: BLE001
         return False
+
+
+def _cover_of(parsed) -> bytes:
+    """从已解析的 mutagen 对象里取第一张内嵌封面（没有则 b""）。"""
+    try:
+        if isinstance(parsed, FLAC):
+            pics = getattr(parsed, "pictures", None) or []
+            return bytes(pics[0].data) if pics else b""
+        if isinstance(parsed, MP4):
+            covr = (parsed.tags or {}).get("covr")
+            return bytes(covr[0]) if covr else b""
+        if isinstance(parsed, OggVorbis):
+            blobs = parsed.get("metadata_block_picture") or []
+            if blobs:
+                return bytes(Picture(base64.b64decode(blobs[0])).data)
+            return b""
+        tags = getattr(parsed, "tags", None)
+        if tags is not None:                      # ID3 系（mp3 / aiff …）
+            for key in list(tags.keys()):
+                if str(key).startswith("APIC"):
+                    return bytes(tags[key].data)
+    except Exception:  # noqa: BLE001 - 封面读不出不算错，静默放弃
+        pass
+    return b""
+
+
+def read_source_meta(data: bytes) -> "tuple[dict, bytes]":
+    """从**已解密的音频字节**里读出源文件自带的标签与封面（纯本地、不联网）。
+
+    用途：离线解密路径不要把源里正确的 ``title`` 覆盖成文件名，源里若内嵌封面
+    也要在转码后带过去。只做头部解析（毫秒级），任何失败都返回 ``({}, b"")`` —— 
+    绝不因为标签问题影响解密产物。
+    """
+    if not HAVE_MUTAGEN or not data:
+        return {}, b""
+    tags: dict = {}
+    try:
+        easy = MutagenFile(io.BytesIO(data), easy=True)
+        if easy is not None and easy.tags:
+            for key in ("title", "artist", "album"):
+                value = easy.get(key)
+                if value:
+                    text = str(value[0]).strip()
+                    if text:
+                        tags[key] = text
+    except Exception:  # noqa: BLE001
+        tags = {}
+    try:
+        parsed = MutagenFile(io.BytesIO(data))
+    except Exception:  # noqa: BLE001
+        return tags, b""
+    return tags, (_cover_of(parsed) if parsed is not None else b"")
 
 
 def read_tags(path: "str | Path") -> dict:

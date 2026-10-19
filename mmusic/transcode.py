@@ -276,6 +276,17 @@ class _Engine:
         return self._frame_offsets
 
     def _find_audio_stream(self, fmt: int) -> "int":
+        """Locate the audio stream's ``codecpar``.
+
+        这是"版本无关"的堆内存探测，**不能假设第一个命中就是真的音频流**：实测
+        （2026-10-19）同一进程里，一个只有单条流的裸 FLAC 曾命中一段
+        ``codec_type == 1`` 的无关内存，于是 ``codec_id = 0`` →
+        误报"没有可用的解码器"，转码被静默降级成"保留原格式"（用户只看到
+        "转码失败"，且换个文件顺序就又好了 —— 典型的偶发）。所以每个候选都用
+        ``avcodec_find_decoder`` 校验：取第一个**确实存在解码器**的候选；
+        一个都没有时退回第一个"音频类型"的候选，让调用方给出可读错误。
+        """
+        first_audio = 0
         for off in range(0, 160, 8):
             arr = self._ptr(fmt, off)
             if not arr:
@@ -289,8 +300,14 @@ class _Engine:
                     if not cp:
                         continue
                     head = self._read(cp, 8)
-                    if head and ctypes.c_int32.from_buffer_copy(head, 0).value == _AUDIO:
+                    if not head or ctypes.c_int32.from_buffer_copy(head, 0).value != _AUDIO:
+                        continue
+                    codec_id = ctypes.c_int32.from_buffer_copy(head, 4).value
+                    if codec_id and self.p_find_decoder(codec_id):
                         return cp
+                    first_audio = first_audio or cp
+        if first_audio:
+            return first_audio
         raise TranscodeFailed("输入中没有找到音频流")
 
     # ---------------- 转码主流程 ---------------- #

@@ -1,4 +1,4 @@
-"""Persistent settings (JSON next to the user's AppData)."""
+"""Persistent settings (JSON in %APPDATA%, or beside the exe in portable mode)."""
 from __future__ import annotations
 
 import json
@@ -6,12 +6,37 @@ import os
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .paths import program_dir
+
 APP_NAME = "MusicDecryptor"
+
+#: 便携模式的触发标记：程序目录下存在 `settings.json` 或 `portable` 即启用
+PORTABLE_MARKERS = ("settings.json", "portable")
 
 
 def default_config_dir() -> Path:
     base = os.environ.get("APPDATA") or os.environ.get("XDG_CONFIG_HOME") or str(Path.home())
     return Path(base) / APP_NAME
+
+
+def resolve_config_dir(program_dir_path: "str | Path | None" = None) -> Path:
+    """配置目录：**便携模式优先**，否则 ``%APPDATA%\MusicDecryptor``。
+
+    便携模式 = 程序目录（冻结后即 exe 所在目录）下已经有 ``settings.json``，
+    或放了一个空的 ``portable`` 标记文件/文件夹。此时配置与哈希缓存都落在
+    程序目录，**随 exe 一起搬走**（换机器 / 拷给同事时凭证与设置跟着走）。
+    没有标记时行为与以前完全一致。
+    """
+    try:
+        base = Path(program_dir_path) if program_dir_path is not None else program_dir()
+    except (TypeError, OSError):
+        return default_config_dir()
+    try:
+        if base.is_dir() and any((base / name).exists() for name in PORTABLE_MARKERS):
+            return base
+    except OSError:
+        pass
+    return default_config_dir()
 
 
 @dataclass
@@ -53,7 +78,7 @@ class Settings:
 
 class AppConfig:
     def __init__(self, path: "str | Path | None" = None) -> None:
-        self.dir = default_config_dir()
+        self.dir = resolve_config_dir()
         self.path = Path(path) if path else self.dir / "settings.json"
         self.cache_path = self.path.parent / "hashcache.json"
         self.settings = Settings()

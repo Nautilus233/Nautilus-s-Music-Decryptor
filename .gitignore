@@ -14,6 +14,10 @@ venv/
 # ---- app runtime leftovers ---------------------------------------------
 .mmusic-hashcache.json
 hashcache.json
+# 便携模式：程序目录下的 settings.json 含 QQ 凭证，公开仓库严禁提交
+settings.json
+/portable
+/portable/
 resources.db
 resources.db-wal
 resources.db-shm

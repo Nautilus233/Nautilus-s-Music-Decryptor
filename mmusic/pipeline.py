@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-from .config import default_config_dir
+from .config import resolve_config_dir
 from .constants import QMC_TAG_MUSICEX
 from . import ekeys
 from .crypto.kwm import KwmDecoder
@@ -37,7 +37,7 @@ from .lang import is_chinese_likely
 from .match import (best_reading_match, filename_query, parse_song_filename_candidates,
                     rank_tracks_multi, reading_scores, split_originals,
                     version_markers)
-from .metadata import write_tags
+from .metadata import read_source_meta, write_tags
 from .model import AudioResult, Track
 from .net import HttpClient
 from .search.fusion import (collapse_duplicates, dedupe_key,
@@ -61,11 +61,17 @@ MAX_DOWNLOADS = 6          # 单文件最多尝试的下载次数（按分数从
 #: 华语歌预匹配（mmusic/lang.py）：备用链路的动态排序与按需检索
 _CJK_FIRST_SOURCE = "migu"                      # 华语场景：提到联网源最前
 _CJK_DEFER_SOURCES = frozenset({"wikimedia", "internet_archive"})  # …垫底，有候选时不检索
+#: 「末位来源」：实测（2026-10-19，30 首混合曲目）**没有任何一首是只有它才能拿到**，
+#: 平均 7.1 请求/首（酷我/咪咕 2.0），且命中的多半是 DJ版/现场/网友改编这类准正版。
+#: 因此它**照常检索**（保留兜底能力），但探测/下载排到最后，且**不为它预解析**直链；
+#: 只有当其它来源都测不出可用候选时，才用独立额度回头补测它。
+_LAST_RESORT_SOURCES = frozenset({"kugou"})
 MAX_PROBES = 2             # 最多探测几个候选（静默的置信度操作，成本必须封顶）
 MAX_PROBES_WIDE = 4        # 平台标注互相矛盾时多测几个：只测前 2 个可能全是缩短版
 PROBE_TIMEOUT = 8.0        # 探测用更短超时：慢就跳过，绝不拖慢主流程
 PROBE_BYTES = 256 * 1024   # 探测只取文件头，绝不整文件下载
 PROBE_TAIL_BYTES = 128 * 1024  # ogg / 非 faststart 的 m4a 需要读文件尾
+MAX_EXTRA_RESOLVES = 2     # 为"跳过疑似短资源"而多解析几个候选的上限（成本封顶）
 
 __all__ = ["Pipeline", "JobResult"]
 
@@ -79,6 +85,18 @@ def _needs_tail(head: bytes) -> bool:
     if head[4:8] == b"ftyp":
         return b"moov" not in head[:256 * 1024]   # moov not faststarted -> at the end
     return False
+
+
+def _avg_bitrate(total: int, duration: "float | None") -> int:
+    """整段文件的**平均**码率（kbps）。
+
+    只认"体积 ÷ 实测时长"，不用首帧码率 —— VBR 的首帧可能是 32k，看着像低码率，
+    实为误判。平台声明值已被实测证伪（酷我"声明 320 → 实际 128"，甚至 48k），
+    所以日志/台账一律以这个实测值为准。
+    """
+    if not total or not duration or duration <= 0:
+        return 0
+    return int(round(total * 8.0 / duration / 1000.0))
 
 
 def _plausible_max(values) -> "float | None":
@@ -150,7 +168,7 @@ class Pipeline:
         else:
             # never drop the ledger into the cwd (for a frozen exe that is its
             # own install folder); keep it beside the settings instead
-            cache_file = default_config_dir() / "hashcache.json"
+            cache_file = resolve_config_dir() / "hashcache.json"
         self.cache = HashCache(cache_file)
         # 资源台账（内容去重记忆 / 负缓存 / 源健康）。与哈希缓存共用同一个开关：
         # 用户关掉“记住以免重复工作”时，两者一起停用。
@@ -336,8 +354,19 @@ class Pipeline:
 
     def _write_decoded(self, src: Path, name: str, result: AudioResult, mode: str, digest: str) -> JobResult:
         out_dir = self._out_dir_for(src)
-        title = result.title or src.stem
-        artist = result.artist
+        # 离线解密结果不带标签时，回读**源文件自带**的 title/artist/album 与内嵌封面：
+        # ① 不要把源里正确的标题覆盖成文件名；② 源里若有封面，转码后一并带过去。
+        # 只解析头部（毫秒级）、只在本机做，失败即静默退回原行为。
+        src_tags: dict = {}
+        src_cover = b""
+        if mode == "offline":
+            try:
+                src_tags, src_cover = read_source_meta(result.audio)
+            except Exception:  # noqa: BLE001 - 标签永不阻断解密
+                src_tags, src_cover = {}, b""
+        title = result.title or src_tags.get("title") or src.stem
+        artist = result.artist or src_tags.get("artist", "")
+        album = result.album or src_tags.get("album", "")
         base = self._safe_name(artist, title)
         audio, out_ext, fmt_note = self._final_format(result.audio, result.ext, name)
         if fmt_note:
@@ -354,11 +383,11 @@ class Pipeline:
         out_path = self._unique(out_dir, base, out_ext)
         out_path.write_bytes(audio)
 
-        cover = result.cover
+        cover = result.cover or src_cover
         if not cover and self.settings.fetch_cover and result.cover_url:
             cover = self._fetch_cover(result.cover_url)
         if self.settings.write_metadata:
-            write_tags(out_path, title=title, artist=artist, album=result.album, cover=cover)
+            write_tags(out_path, title=title, artist=artist, album=album, cover=cover)
 
         if digest and self.settings.remember_hashes:
             self.cache.add(digest, out_path=str(out_path), mode=mode, fmt=result.ext)
@@ -501,6 +530,18 @@ class Pipeline:
         # 实测交叉验证：只取文件头（最多 MAX_PROBES 个、超时 8s、失败即跳过）
         self._log(f"  · 开始时长核验（探测前 {min(len(candidates), MAX_PROBES)} 个候选）")
         self._probe_durations(candidates)
+        short_n = sum(1 for t in candidates if t.short_asset)
+        last_n = sum(1 for t in candidates
+                     if t.source in _LAST_RESORT_SOURCES and not t.short_asset)
+        if short_n or last_n:
+            bits = []
+            if short_n:
+                bits.append(f"{short_n} 个疑似短资源（直链形态判定）")
+            if last_n:
+                bits.append(f"{last_n} 个末位来源候选（{'、'.join(sorted(_LAST_RESORT_SOURCES))}）")
+            self._log("  · 已降权 " + " + ".join(bits)
+                      + "：先测其它来源/正片，仍未测到可用候选才回头补测；"
+                        "全程只降权、不做硬性排除")
         measured = [t.actual_duration for t in candidates if t.actual_duration]
         if len(measured) >= 2:
             # 有两个以上真实文件测出了时长 —— 这是"原曲原时长"最硬的一手证据，
@@ -537,6 +578,10 @@ class Pipeline:
         verified = [t for t in candidates
                     if t.actual_duration and t.actual_duration >= MIN_TRACK_SECONDS
                     and (not reference or t.actual_duration >= reference - tolerance)]
+        # 疑似短资源即便侥幸通过时长门禁也排到最后 —— 只降权、绝不硬删：
+        # 匹配度仍是第一判据，形态只在同分时决定下载先后。
+        verified.sort(key=lambda t: (-t.score, t.short_asset,
+                                     t.source in _LAST_RESORT_SOURCES))
         unverified = [t for t in candidates if not t.actual_duration]
 
         note = ""
@@ -700,8 +745,13 @@ class Pipeline:
         raw = url2pathname(parsed.path or parsed.netloc or "")
         return Path(raw) if raw else None
 
-    def _probe_duration(self, track: Track) -> "float | None":
-        """Actual audio length of a resolved candidate, from a header-only probe."""
+    def _probe_audio(self, track: Track) -> "tuple[float | None, int]":
+        """A resolved candidate's real length (s) and average bitrate (kbps).
+
+        Header-only probe (never downloads the whole file).  The measured
+        bitrate is what goes into the log / ledger, because platform-declared
+        values proved unreliable (Kuwo declared 320 but served 128, and 0 for
+        some entries)."""
         url = track.url or ""
         if not url:
             raise NetworkError("尚未解析出直链")
@@ -718,7 +768,7 @@ class Pipeline:
                     handle.seek(max(0, size - PROBE_TAIL_BYTES))
                     tail = handle.read(PROBE_TAIL_BYTES)
                 duration = audio_duration(head, size, tail)
-            return duration
+            return duration, _avg_bitrate(size, duration)
         headers = {"Referer": self._referer_for(track)}
         head, total = self.http.probe(url, limit=PROBE_BYTES, timeout=PROBE_TIMEOUT,
                                       headers=headers)
@@ -728,9 +778,10 @@ class Pipeline:
                 tail, total2 = self.http.probe_tail(url, limit=PROBE_TAIL_BYTES,
                                                     timeout=PROBE_TIMEOUT, headers=headers)
                 duration = audio_duration(head, total2 or total, tail)
+                total = total2 or total
             except MusicDecryptorError:
                 pass
-        return duration
+        return duration, _avg_bitrate(total, duration)
 
     def _fallback_result(self, src: Path, name: str, digest: str, *, note: str) -> JobResult:
         """Run the fallback and turn any expected failure into a JobResult.
@@ -821,33 +872,88 @@ class Pipeline:
 
         A candidate whose length cannot be measured is left with
         ``actual_duration = None`` and is therefore **never trusted** (it can
-        only be used as a last resort, with a warning)."""
+        only be used as a last resort, with a warning).
+
+        **疑似短资源不占探测预算**：直链形态已经能判出"试听/铃声/提示音"的候选
+        （``Track.short_asset``），先把预算花在疑似正片上，只有预算还有余才回头
+        探测它们 —— 否则两个 5~22 秒的片段就可能把名额占光，让真正完整的候选根本
+        没被测到（那是"明明有原曲却报没找到"的一个真实成因）。解析次数同样封顶。
+        """
         # 平台标注互不相同时多测几个候选：只测前 2 个很可能"全是缩短版"，
         # 真正完整的那个排在后面反而没被测到 —— 这是"原时长对不上"的主因之一。
         declared = [round(t.duration) for t in tracks[:MAX_PROBES_WIDE] if t.duration]
         limit = MAX_PROBES_WIDE if len(set(declared)) > 1 else MAX_PROBES
-        for track in tracks[:limit]:
+        budget = limit
+        resolves = limit + MAX_EXTRA_RESOLVES   # 为跳过短资源而多看几个，也要有上限
+        deferred: "list[Track]" = []
+        for track in tracks:
             if self._cancel:
                 raise CancelledError("已取消")
+            if budget <= 0:
+                break
             adapter = self._adapters.get(track.source)
             if adapter is None:
                 continue
-            try:
-                if not track.url:
+            if track.source in _LAST_RESORT_SOURCES:
+                deferred.append(track)          # 末位来源：连解析都不做，省下整笔成本
+                continue
+            if not track.url:
+                if resolves <= 0:
+                    break
+                resolves -= 1
+                try:
                     adapter.resolve(track, quality=self.settings.quality)
-                track.actual_duration = self._probe_duration(track)
-            except MusicDecryptorError as exc:
-                self._log(f"    - [{track.source}] “{track.title}” 时长探测失败：{exc.message}")
+                except MusicDecryptorError as exc:
+                    self._log(f"    - [{track.source}] “{track.title}” 时长探测失败：{exc.message}")
+                    continue
+            if track.short_asset:
+                deferred.append(track)          # 疑似短资源：先让位，别占预算
                 continue
-            if not track.actual_duration:
-                self._log(f"    - [{track.source}] “{track.title}” 无法解析出音频时长，视为不可信")
-                continue
-            self._log(f"    · [{track.source}] “{track.title}” 实测时长 "
-                      f"{format_seconds(track.actual_duration)}"
-                      f"（接口标注 {format_seconds(track.duration) if track.duration else '无'}）")
-            if track.duration and abs(track.actual_duration - track.duration) > max(15.0, 0.10 * track.duration):
-                self._log(f"      ⚠ 接口标注与实测相差 "
-                          f"{int(abs(track.actual_duration - track.duration))}s，元数据可能不准")
+            budget -= 1
+            self._measure_and_log(track)
+        # 还没测到任何"达到时长下限"的候选时，才用**独立额度**补测被降权的候选 ——
+        # 既不为末位来源白花解析/探测成本，也绝不因为预算被坏候选吃光就误报"没找到"。
+        if not any(t.actual_duration and t.actual_duration >= MIN_TRACK_SECONDS
+                   for t in tracks):
+            extra = MAX_EXTRA_RESOLVES
+            for track in deferred:
+                if self._cancel:
+                    raise CancelledError("已取消")
+                if extra <= 0:
+                    break
+                extra -= 1
+                if not track.url:
+                    adapter = self._adapters.get(track.source)
+                    if adapter is None:
+                        continue
+                    try:
+                        adapter.resolve(track, quality=self.settings.quality)
+                    except MusicDecryptorError as exc:
+                        self._log(f"    - [{track.source}] “{track.title}” 时长探测失败：{exc.message}")
+                        continue
+                self._measure_and_log(track)
+
+    def _measure_and_log(self, track: Track) -> None:
+        """探测一个**已解析**候选的真实时长/码率并写回 track（失败只记日志）。"""
+        try:
+            duration, measured_kbps = self._probe_audio(track)
+        except MusicDecryptorError as exc:
+            self._log(f"    - [{track.source}] “{track.title}” 时长探测失败：{exc.message}")
+            return
+        track.actual_duration = duration
+        if not track.actual_duration:
+            self._log(f"    - [{track.source}] “{track.title}” 无法解析出音频时长，视为不可信")
+            return
+        self._log(f"    · [{track.source}] “{track.title}” 实测时长 "
+                  f"{format_seconds(track.actual_duration)}"
+                  f"（接口标注 {format_seconds(track.duration) if track.duration else '无'}）")
+        if measured_kbps and measured_kbps != track.bitrate:
+            declared_kbps = f"{track.bitrate}k" if track.bitrate else "无"
+            self._log(f"      · 实测码率 {measured_kbps}k（接口标注 {declared_kbps}），以实测为准")
+            track.bitrate = measured_kbps
+        if track.duration and abs(track.actual_duration - track.duration) > max(15.0, 0.10 * track.duration):
+            self._log(f"      ⚠ 接口标注与实测相差 "
+                      f"{int(abs(track.actual_duration - track.duration))}s，元数据可能不准")
 
     def _download(self, track: Track) -> bytes:
         url = track.url or ""

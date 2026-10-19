@@ -145,12 +145,16 @@ def main(argv=None) -> int:
         return 1 if failed else 0
     if args.sources_report:
         _ensure_utf8_console()
-        from mmusic.config import AppConfig
+        from mmusic.config import AppConfig, default_config_dir
         from mmusic.search.index import ResourceIndex
         from mmusic.search.pack import pack_summary
         from mmusic.search.registry import specs_for
 
         config = AppConfig()
+        portable = config.dir != default_config_dir()
+        print(f"配置目录：{config.dir}"
+              f"（{'便携模式：配置随 exe 走' if portable else '默认：%APPDATA%'}）")
+        print(f"哈希缓存：{config.cache_path}")
         print("配置的音源（按尝试顺序）：")
         print(pack_summary(specs_for(config.settings.to_dict())))
         ledger = ResourceIndex(config.cache_path.parent / "resources.db")

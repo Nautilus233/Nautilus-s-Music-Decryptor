@@ -13,6 +13,24 @@ from ..errors import NetworkError
 from ..model import Track
 from .base import SearchSource
 
+#: 2026-10-19 实测（真实直链，6/6 一致）：
+#: * ``/resource/30106/trackmedia/M500….mp3`` → 正片（3.69MB/230s、3.00MB/188s，与声明时长一致）
+#: * ``/ev/ /lx/ /gf/ /nf/`` + ``/resource/n2|n3/…`` → 短资源（0.08MB=5s、0.13MB=22s、0.18MB）
+#: 只凭 URL 形态就能判，**不用下载**；判定结果只用于降权，不做硬性排除。
+_FULL_LINK = re.compile(r"/resource/30106/trackmedia/", re.I)
+_SHORT_LINK = re.compile(r"/resource/n\d+/|/(?:ev|lx|gf|nf|ce|rs)/", re.I)
+
+
+def classify_link(url: str) -> str:
+    """``"full"`` / ``"short"`` / ``""``（未知）—— 纯形态判断，零网络开销。"""
+    if not url:
+        return ""
+    if _FULL_LINK.search(url):
+        return "full"
+    if _SHORT_LINK.search(url):
+        return "short"
+    return ""
+
 _FIELD = re.compile(r"'([A-Za-z_0-9]+)':'(.*?)'(?=,\s*'|\s*\})", re.S)
 _UNESC = re.compile(r"\\+u([0-9a-fA-F]{4})")
 
@@ -85,7 +103,9 @@ class KuwoSource(SearchSource):
 
     SEARCH = ("http://search.kuwo.cn/r.s?all={q}&ft=music&itemset=web_2013&client=kt"
               "&pn=0&rn={n}&rformat=json&encoding=utf8")
-    RESOLVE = "http://antiserver.kuwo.cn/anti.s?type=convert_url3&rid={rid}&format={fmt}&response=url"
+    # 实测 https 与 http 返回完全一致（code 200 + 同一 CDN 直链），因此走 https：
+    # 明文请求没有任何好处，只是徒增被中间人篡改的机会。
+    RESOLVE = "https://antiserver.kuwo.cn/anti.s?type=convert_url3&rid={rid}&format={fmt}&response=url"
 
     def search(self, query: str, *, quality: str = "mp3", limit: int = 10) -> list[Track]:
         url = self.SEARCH.format(q=urllib.parse.quote(query), n=max(1, limit))
@@ -118,6 +138,9 @@ class KuwoSource(SearchSource):
             raise NetworkError("酷我无可用直链", detail=rid)
         track.url = data["url"]
         track.ext = fmt
+        # 直链形态当场判定"疑似短资源"：交给流水线降权（省探测/下载预算）；
+        # 真正的判定仍由时长门禁用**实测时长**做。
+        track.short_asset = classify_link(track.url) == "short"
         if fmt == "flac":
             track.bitrate = track.bitrate or 0
         return track
