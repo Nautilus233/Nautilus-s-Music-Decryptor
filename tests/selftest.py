@@ -1844,6 +1844,10 @@ def test_target_format_matrix() -> None:
           and plan("wav", "mp3")[0] == "mp3")
     check("quality: already-matching format is a no-op",
           plan("mp3", "mp3") == ("keep", "") and plan("flac", "flac") == ("keep", ""))
+    check("quality: 源已是 MP3 + 无损目标 → 保持原样（不做无效转码，体积不翻倍）",
+          plan("mp3", "flac")[0] == "keep" and plan("mp3", "wav")[0] == "keep"
+          and "无效转换" in plan("mp3", "flac")[1],
+          f"{plan('mp3','flac')} {plan('mp3','wav')}")
     check("quality: flac target upgrades lossless, degrades lossy with a note",
           plan("wav", "flac") == ("flac", "")
           and plan("ogg", "flac")[0] == "mp3" and "有损" in plan("ogg", "flac")[1])
@@ -2209,6 +2213,267 @@ def test_settings_roundtrip() -> None:
     check("settings: new fields round-trip (creds / auto-start / quality)",
           back.qqmusic_uin == "1" and back.qqmusic_key == "K"
           and back.auto_start is False and back.quality == "flac")
+
+
+def test_lossless_first_source() -> None:
+    """目标无损（FLAC/WAV）：聚合通道优先 —— 实测全链唯一能给真无损的源。"""
+    print("\n[lossless target: aggregator-first policy]")
+    from mmusic.search.base import SearchSource
+
+    class Src(SearchSource):
+        def __init__(self, name, artist, path, ext):
+            super().__init__(None, {})
+            self.name = self.label = name
+            self._artist, self._path, self._ext = artist, str(path), ext
+
+        def search(self, query, *, quality="mp3", limit=10):
+            return [Track(self.name, "晴天", self._artist, ext=self._ext,
+                          raw={"p": self._path})]
+
+        def resolve(self, track, *, quality="mp3"):
+            track.url = Path(track.raw["p"]).resolve().as_uri()
+            track.ext = self._ext
+            return track
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        mp3 = tmp / "migu.mp3"
+        mp3.write_bytes(fx.make_mp3_xing(200, pad=40000))
+        flac = tmp / "agg.flac"
+        flac.write_bytes(fx.make_flac(200, pad=40000))
+        # 聚合通道故意用"稍弱但过门槛"的歌手写法：默认排序下它不该天然取胜
+        agg = Src("aggregator", "周杰伦 Jay Chou", flac, "flac")
+        migu = Src("migu", "周杰伦", mp3, "mp3")
+
+        def run(quality, tag):
+            d = tmp / tag
+            d.mkdir()
+            src = d / "晴天 - 周杰伦.mgg"
+            src.write_bytes(os.urandom(8192) + b"STag")
+            logs: "list[str]" = []
+            pipe = Pipeline(Settings(output_dir=str(d / "out"), quality=quality,
+                                     enable_fallback=True, write_metadata=False,
+                                     fetch_cover=False, remember_hashes=False, min_bitrate=0),
+                            cache_path=d / "c.json", on_log=logs.append,
+                            sources=[migu, agg])          # 用户配置顺序：咪咕在前
+            res = pipe.process_file(src)
+            out = Path(res.out_path) if res.out_path else None
+            return res, out, (out.read_bytes() if out and out.exists() else b""), logs
+
+        # ① 检索顺序：无损目标时聚合通道排到联网源最前；mp3 目标保持用户顺序
+        order_flac = [x.name for x in Pipeline(
+            Settings(quality="flac"), cache_path=tmp / "o1.json",
+            sources=[migu, agg])._search_order(False)]
+        order_mp3 = [x.name for x in Pipeline(
+            Settings(quality="mp3"), cache_path=tmp / "o2.json",
+            sources=[migu, agg])._search_order(False)]
+        order_cjk = [x.name for x in Pipeline(
+            Settings(quality="flac"), cache_path=tmp / "o3.json",
+            sources=[migu, agg])._search_order(True)]
+        check("无损优先: 目标 FLAC 时聚合通道排到最前",
+              order_flac == ["aggregator", "migu"], str(order_flac))
+        check("无损优先: 目标 MP3 时保持用户配置顺序",
+              order_mp3 == ["migu", "aggregator"], str(order_mp3))
+        check("无损优先: 华语 + 无损时聚合通道仍排在咪咕之前",
+              order_cjk == ["aggregator", "migu"], str(order_cjk))
+
+        # ② 端到端：同样的候选，只切换目标音质，产物必须不同
+        r_flac, out_flac, got_flac, logs_flac = run("flac", "flac")
+        check("无损优先: 目标 FLAC → 选中聚合通道的无损文件且不做降级转码",
+              out_flac is not None and out_flac.suffix == ".flac"
+              and got_flac == flac.read_bytes(),
+              f"{r_flac.status} {out_flac.name if out_flac else None} {len(got_flac)}B")
+        check("无损优先: 日志说明重排原因（不静默）",
+              any("目标无损" in m for m in logs_flac), " | ".join(logs_flac[-4:]))
+
+        r_mp3, out_mp3, got_mp3, _ = run("mp3", "mp3")
+        check("无损优先: 目标 MP3 → 排序不受影响，仍按匹配度取咪咕那份",
+              got_mp3 == mp3.read_bytes(),
+              f"{r_mp3.status} {out_mp3.name if out_mp3 else None} {len(got_mp3)}B")
+
+        # ③ 源已是有损 MP3 + 目标 FLAC（没有无损候选时）：必须"保持原样"。
+        #    旧行为会把 128k mp3 重新编码成 320k mp3（实测体积 3.63MB → 9.07MB），
+        #    体积翻倍却没有音质收益，还多一代损失。
+        d3 = tmp / "keep"
+        d3.mkdir()
+        s3 = d3 / "晴天 - 周杰伦.mgg"
+        s3.write_bytes(os.urandom(8192) + b"STag")
+        logs3: "list[str]" = []
+        pipe3 = Pipeline(Settings(output_dir=str(d3 / "out"), quality="flac",
+                                  enable_fallback=True, write_metadata=False,
+                                  fetch_cover=False, remember_hashes=False, min_bitrate=0),
+                         cache_path=d3 / "c.json", on_log=logs3.append, sources=[migu])
+        r3 = pipe3.process_file(s3)
+        o3 = Path(r3.out_path) if r3.out_path else None
+        got3 = o3.read_bytes() if o3 and o3.exists() else b""
+        check("无损目标: 源已是 MP3 时保持原样（不重编码、体积不变）",
+              o3 is not None and o3.suffix == ".mp3" and got3 == mp3.read_bytes(),
+              f"{r3.status} {o3.name if o3 else None} {len(got3)}B vs 源 {len(mp3.read_bytes())}B")
+        check("无损目标: 如实说明为何不是无损（不做无效转换）",
+              any("无效转换" in m for m in logs3), " | ".join(logs3[-3:]))
+
+
+def test_over_long_guard() -> None:
+    """偏长防护：合辑/串烧（实测 IA 给过 25:29 / 435MB）不得通过核验与被下载。"""
+    print("\n[too-long guard: compilations must not slip through]")
+    from mmusic.downloader import check_completeness
+
+    ok, why, _ = check_completeness(fx.make_mp3_xing(1529), reference=205.0, tolerance=10.0,
+                                    min_seconds=45.0, over_tolerance=123.0)
+    check("偏长: 下载后完整度门禁拦下 25:29 的合辑",
+          not ok and "长于参考时长" in why, f"{ok} {why}")
+    ok2, _, _ = check_completeness(fx.make_mp3_xing(205), reference=205.0, tolerance=10.0,
+                                   min_seconds=45.0, over_tolerance=123.0)
+    check("偏长: 正常时长的资源不受影响", ok2)
+    ok3, _, _ = check_completeness(fx.make_mp3_xing(1529), reference=205.0, tolerance=10.0,
+                                   min_seconds=45.0)
+    check("偏长: 不传 over_tolerance 时行为与以前一致（向后兼容）", ok3)
+
+    from mmusic.search.base import SearchSource
+
+    class Src(SearchSource):
+        def __init__(self, name, path, secs):
+            super().__init__(None, {})
+            self.name = self.label = name
+            self._path, self._secs = str(path), secs
+
+        def search(self, query, *, quality="mp3", limit=10):
+            return [Track(self.name, "晴天", "周杰伦", duration=self._secs, ext="mp3",
+                          raw={"p": self._path})]
+
+        def resolve(self, track, *, quality="mp3"):
+            track.url = Path(track.raw["p"]).resolve().as_uri()
+            track.ext = "mp3"
+            return track
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        normal = tmp / "normal.mp3"
+        normal.write_bytes(fx.make_mp3_xing(200, pad=40000))
+        normal2 = tmp / "normal2.mp3"
+        normal2.write_bytes(fx.make_mp3_xing(205, pad=40000))
+        long_file = tmp / "compilation.mp3"
+        long_file.write_bytes(fx.make_mp3_xing(1529, pad=40000))
+
+        src = tmp / "晴天 - 周杰伦.mgg"
+        src.write_bytes(os.urandom(8192) + b"STag")
+        logs: "list[str]" = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), enable_fallback=True,
+                                 write_metadata=False, fetch_cover=False,
+                                 remember_hashes=False, min_bitrate=0),
+                        cache_path=tmp / "c.json", on_log=logs.append,
+                        # 第三路模拟"给出合辑"的源（现实里是互联网档案馆；
+                        # 这里用 aggregator 是为了让它进入候选池 —— IA 在华语场景
+                        # 本就有"有候选时不检索"的保护，会走不到这条判据）
+                        sources=[Src("kuwo", normal, 200), Src("migu", normal2, 205),
+                                 Src("aggregator", long_file, 1529)])
+        res = pipe.process_file(src)
+        out = Path(res.out_path) if res.out_path else None
+        got = out.read_bytes() if out and out.exists() else b""
+        tail = " | ".join(logs[-5:])
+        check("偏长: 合辑被排除、不会被下载",
+              got and got != long_file.read_bytes() and got in (normal.read_bytes(), normal2.read_bytes()),
+              f"{res.status} {out.name if out else None} :: {tail}")
+        check("偏长: 日志如实说明为什么排除",
+              any("时长异常偏长已排除" in m for m in logs), tail)
+
+
+def test_log_levels() -> None:
+    """日志分级：结论级恒显且精简；明细级保留；旧的一参数 sink 仍收到全部行。"""
+    print("\n[log levels: result vs detail]")
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        lib = tmp / "lib"
+        lib.mkdir()
+        (lib / "晴天 - 周杰伦.mp3").write_bytes(fx.make_mp3_xing(200, pad=40000))
+        src = tmp / "晴天 - 周杰伦.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+        settings = Settings(output_dir=str(tmp / "out"), sources=["local"],
+                            local_dirs=[str(lib)], enable_fallback=True,
+                            write_metadata=False, fetch_cover=False,
+                            remember_hashes=False, min_bitrate=0)
+
+        two: "list[tuple[str, str]]" = []
+        pipe = Pipeline(settings, cache_path=tmp / "c.json",
+                        on_log=lambda m, lv="detail": two.append((m, lv)))
+        res = pipe.process_file(src)
+        results = [m for m, lv in two if lv == "result"]
+        details = [m for m, lv in two if lv == "detail"]
+        check("log-levels: 结论级存在且精简（单文件 ≤3 行）",
+              0 < len(results) <= 3, f"{len(results)} 行: {results}")
+        check("log-levels: 明细级仍然保留（可展开）",
+              len(details) >= 2, f"{len(details)} 行")
+        check("log-levels: 结论级包含最终结果行",
+              any("✅" in m and "完成" in m for m in results), str(results))
+        check("log-levels: 结论级不含逐音源排除明细",
+              not any("已排除" in m for m in results), str(results))
+
+        one: "list[str]" = []
+        pipe2 = Pipeline(settings, cache_path=tmp / "c2.json", on_log=one.append)
+        pipe2.process_file(src)
+        check("log-levels: 一参数 sink（CLI / 旧调用方）仍收到全部日志",
+              len(one) == len(two) and all(isinstance(m, str) for m in one),
+              f"{len(one)} vs {len(two)}")
+        check("log-levels: 结论级的行在所有日志里都能找到（前缀一致）",
+              all(any(m == r for m, _ in two) for r in results), str(results))
+
+
+def test_log_sink_contract() -> None:
+    """接线契约：Qt 信号 emit（签名不可内省）也必须收到 (message, level)，绝不静默丢日志。"""
+    print("\n[log sink contract: Qt signal wiring]")
+    from mmusic.pipeline import _accepts_level
+    check("log-sink: list.append 判为单参数", _accepts_level([].append) is False)
+    check("log-sink: 两参数 lambda 判为带 level",
+          _accepts_level(lambda m, lv="detail": None) is True)
+    check("log-sink: 一参数 lambda 判为单参数",
+          _accepts_level(lambda m: None) is False)
+    try:
+        from PySide6.QtCore import QObject, Signal
+    except Exception as exc:  # noqa: BLE001
+        print(f"  (skip) 无 PySide6：{exc}")
+        return
+
+    class W(QObject):
+        logged = Signal(str, str)
+
+    got: "list[tuple[str, str]]" = []
+    w = W()
+    w.logged.connect(lambda m, lv: got.append((m, lv)))
+    check("log-sink: Qt 信号 emit 判为『不可内省』（曾被误判成单参数 → 日志全丢）",
+          _accepts_level(w.logged.emit) is None, str(_accepts_level(w.logged.emit)))
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        lib = tmp / "lib"
+        lib.mkdir()
+        (lib / "晴天 - 周杰伦.mp3").write_bytes(fx.make_mp3_xing(200, pad=40000))
+        src = tmp / "晴天 - 周杰伦.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+        settings = Settings(output_dir=str(tmp / "out"), sources=["local"],
+                            local_dirs=[str(lib)], enable_fallback=True,
+                            write_metadata=False, fetch_cover=False,
+                            remember_hashes=False, min_bitrate=0)
+        # ← 出事的接线方式：直接把信号 emit 当 sink
+        Pipeline(settings, cache_path=tmp / "c.json",
+                 on_log=w.logged.emit).process_file(src)
+    levels = {lv for _, lv in got}
+    check("log-sink: 用信号 emit 接线时日志一条不丢，且两种级别都在",
+          len(got) >= 3 and levels == {"result", "detail"}, f"{len(got)} 行 levels={sorted(levels)}")
+
+    from ui.worker import make_log_sink
+    sig_got: "list[tuple[str, str]]" = []
+
+    class FakeSig:
+        def emit(self, m, lv):
+            sig_got.append((m, lv))
+
+    sink = make_log_sink(FakeSig())
+    check("log-sink: worker 的 make_log_sink 可被内省为两参数",
+          _accepts_level(sink) is True, str(_accepts_level(sink)))
+    sink("x", "detail")
+    sink("y")
+    check("log-sink: make_log_sink 完整转发 (message, level) 且 level 有默认值",
+          sig_got == [("x", "detail"), ("y", "detail")], str(sig_got))
 
 
 def test_last_resort_source() -> None:
@@ -2632,6 +2897,10 @@ def main() -> int:
     test_portable_config_dir()
     test_source_link_upgrades()
     test_last_resort_source()
+    test_log_levels()
+    test_lossless_first_source()
+    test_over_long_guard()
+    test_log_sink_contract()
     test_short_asset_probe_priority()
     test_completeness_gate()
     if args.live:

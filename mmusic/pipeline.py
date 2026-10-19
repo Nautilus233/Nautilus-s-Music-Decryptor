@@ -14,6 +14,7 @@ Control flow for every input file::
 """
 from __future__ import annotations
 
+import inspect
 import os
 import re
 import time
@@ -46,7 +47,7 @@ from .search.index import ResourceIndex
 from .search.query import MAX_PER_SOURCE as MAX_VARIANTS_PER_SOURCE
 from .search.query import expand as expand_query
 from .search.registry import build_sources
-from .sniff import sniff_path
+from .sniff import looks_like_audio, sniff_path
 from . import transcode
 from .utils import sha256_file
 
@@ -61,6 +62,20 @@ MAX_DOWNLOADS = 6          # 单文件最多尝试的下载次数（按分数从
 #: 华语歌预匹配（mmusic/lang.py）：备用链路的动态排序与按需检索
 _CJK_FIRST_SOURCE = "migu"                      # 华语场景：提到联网源最前
 _CJK_DEFER_SOURCES = frozenset({"wikimedia", "internet_archive"})  # …垫底，有候选时不检索
+#: 目标无损（FLAC/WAV）时优先的源：实测 2026-10-20 —— **全链唯一能真给无损**的通道
+#: （br=999 → 806kbps FLAC），而酷我/酷狗/咪咕在 flac 目标下都只给 128k mp3。
+_LOSSLESS_FIRST_SOURCE = "aggregator"
+#: 实测时长**偏长**的上限：超过 `max(参考×1.6, 参考+120s)` 视为合辑/串烧而非同一首
+#: （实测：互联网档案馆给《致爱丽丝》的条目是 25:29 / 435MB 的合辑，会通过原先
+#: "只判偏短"的逻辑被下载下来）。只作精选期硬判据，且**必须有参考时长**才生效。
+TOL_OVER_ABS = 120.0
+TOL_OVER_REL = 0.6
+#: 「开放库例外」：CC/PD 库（维基共享 / 互联网档案馆）的文件常因容器特性测不出时长
+#: （Ogg 要读尾页 granule、m4a 的 moov 在文件尾），按"只下载通过验证的资源"会被
+#: 一律排除、等于白列。因此在**没有其它更可疑证据**时允许它们以
+#: 「音频头合法 + 体积达标」一次性通过，并在结果里如实标注 `时长未比对（开放库文件）`。
+_OPEN_LIBRARY_SOURCES = frozenset({"wikimedia", "internet_archive"})
+MIN_OPEN_LIBRARY_BYTES = 1_000_000
 #: 「末位来源」：实测（2026-10-19，30 首混合曲目）**没有任何一首是只有它才能拿到**，
 #: 平均 7.1 请求/首（酷我/咪咕 2.0），且命中的多半是 DJ版/现场/网友改编这类准正版。
 #: 因此它**照常检索**（保留兜底能力），但探测/下载排到最后，且**不为它预解析**直链；
@@ -87,6 +102,31 @@ def _needs_tail(head: bytes) -> bool:
     return False
 
 
+_RESERVED_NAMES = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{i}" for i in range(1, 10)}
+    | {f"LPT{i}" for i in range(1, 10)})
+
+
+def _atomic_write(path: Path, data: bytes) -> None:
+    """先写同目录临时文件、再 `os.replace` 原子替换。
+
+    直接 `write_bytes` 到目标路径时，写到一半崩溃/断电会留下**半个文件**，
+    而下次运行只会看到"同名冲突"再另存一份 —— 用户得到一个看起来正常、
+    其实残缺的歌词文件。临时名以 `.` 开头且用 `.part` 结尾，便于识别与清理。
+    """
+    tmp = path.with_name(f".{path.name}.part")
+    try:
+        tmp.write_bytes(data)
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
+
+
 def _avg_bitrate(total: int, duration: "float | None") -> int:
     """整段文件的**平均**码率（kbps）。
 
@@ -97,6 +137,13 @@ def _avg_bitrate(total: int, duration: "float | None") -> int:
     if not total or not duration or duration <= 0:
         return 0
     return int(round(total * 8.0 / duration / 1000.0))
+
+
+def _over_tolerance(reference: "float | None") -> float:
+    """“偏长”判据的容差；没有参考时长时返回 0（= 不判偏长，避免误杀本来就长的曲目）。"""
+    if not reference:
+        return 0.0
+    return max(TOL_OVER_ABS, TOL_OVER_REL * reference)
 
 
 def _plausible_max(values) -> "float | None":
@@ -112,6 +159,30 @@ def _plausible_max(values) -> "float | None":
     median = vals[mid] if len(vals) % 2 else (vals[mid - 1] + vals[mid]) / 2
     plausible = [v for v in vals if v <= 2 * median]
     return max(plausible) if plausible else vals[-1]
+
+
+def _accepts_level(fn) -> "bool | None":
+    """sink 的参数形态：``True`` 两参数 / ``False`` 单参数 / ``None`` 不可内省。
+
+    旧调用方（`list.append`、`print`、CLI、绝大多数测试）只收一个参数，必须继续可用；
+    UI 传两参数的 sink，好按 `level` 决定显不显示。
+
+    为什么要三态：`inspect.signature` 对 **C 实现的可调用对象**会抛 ValueError ——
+    PySide6 的 `SignalInstance.emit`（`logged(QString,QString)`）正是如此。把它误判成
+    "单参数"就会调用 `emit(msg)` → `TypeError` → 被 `_guarded` 吞掉 →
+    **整条日志链路静默失效**。实测事故（2026-10-20）：界面上只剩界面自己的 3 行，
+    用户以为「显示详细信息」没作用。因此不可内省时返回 None，交给调用方"先试两参数"。
+    """
+    if fn is None:
+        return False
+    try:
+        params = list(inspect.signature(fn).parameters.values())
+    except (TypeError, ValueError):
+        return None
+    if any(x.kind == x.VAR_POSITIONAL for x in params):
+        return True
+    return len([x for x in params
+                if x.kind in (x.POSITIONAL_ONLY, x.POSITIONAL_OR_KEYWORD)]) >= 2
 
 
 def _guarded(fn):
@@ -156,7 +227,28 @@ class Pipeline:
                  index_path: "str | Path | None" = None,
                  http=None) -> None:
         self.settings = settings
-        self._log = _guarded(on_log)
+        # 日志分级：`result` = 结论（同事必看，如"✅ 解密完成"/"❌ …"）；
+        # `detail` = 过程明细（每个音源的排除统计、探测与降权说明…）。
+        # UI 默认只渲染 result、勾选后展开 detail；CLI/测试仍拿到全部行。
+        sink = on_log
+        sink_levels = _accepts_level(sink)      # True / False / None（不可内省）
+
+        def emit(message: str, level: str = "detail") -> None:
+            if sink is None:
+                return
+            if sink_levels is True:
+                sink(message, level)
+            elif sink_levels is False:
+                sink(message)
+            else:
+                # 签名不可知（Qt 信号 emit 等 C 可调用对象）：先试两参数，
+                # 真不够再退一参数 —— 绝不因为"探测不准"把日志丢掉。
+                try:
+                    sink(message, level)
+                except TypeError:
+                    sink(message)
+
+        self._log = _guarded(emit)
         self._progress = _guarded(on_progress)
         self._on_file = _guarded(on_file)
         self.http = http if http is not None else HttpClient(timeout=settings.timeout,
@@ -225,12 +317,12 @@ class Pipeline:
         results: list[JobResult] = []
         for i, path in enumerate(paths):
             if self._cancel:
-                self._log("⛔ 已取消")
+                self._log("⛔ 已取消", level="result")
                 break
             try:
                 res = self.process_file(path)
             except CancelledError:
-                self._log("⛔ 已取消")
+                self._log("⛔ 已取消", level="result")
                 break
             except MusicDecryptorError as exc:
                 res = JobResult(str(path), Path(path).name, "failed",
@@ -262,7 +354,7 @@ class Pipeline:
                 digest = ""
             rec = self.cache.get(digest) if digest else None
             if rec and rec.get("out") and Path(rec["out"]).exists():
-                self._log(f"⏭ 已处理过（哈希命中），跳过：{name}")
+                self._log(f"⏭ 已处理过（哈希命中），跳过：{name}", level="result")
                 return JobResult(str(p), name, "skipped", mode=rec.get("mode", ""),
                                  out_path=rec["out"], fmt=rec.get("fmt", ""),
                                  message="哈希命中缓存，已跳过")
@@ -314,24 +406,29 @@ class Pipeline:
             else:
                 raise UnsupportedFormatError("无法识别的加密格式", detail=fmt.ext or "未知扩展名")
         except NeedsOnlineError as exc:
-            self._log(f"🔒 需联网破解：{name} — {exc.message}")
+            self._log(f"🔒 需联网破解：{name} — {exc.message}", level="result")
             if not self.settings.enable_fallback:
                 return JobResult(str(p), name, "failed", message=exc.message,
                                  detail="备用下载已禁用")
             return self._fallback_result(p, name, digest, note=exc.message)
         except (DecryptionFailedError, UnsupportedFormatError) as exc:
-            self._log(f"⚠ 离线解密失败：{name} — {exc.message}")
+            self._log(f"⚠ 离线解密失败：{name} — {exc.message}", level="result")
             if not self.settings.enable_fallback:
                 return JobResult(str(p), name, "failed", message=exc.message)
             return self._fallback_result(p, name, digest, note=exc.message)
+        except OSError as exc:
+            # 读取过程中文件被删掉/被独占/权限变化：如实报错，
+            # 绝不把 OSError 冒到批处理之外（否则一个坏文件会打断整批）。
+            self._log(f"❌ 读取失败：{name} — {exc}", level="result")
+            return JobResult(str(p), name, "failed", message="无法读取文件", detail=str(exc))
 
         try:
             return self._write_decoded(p, name, result, mode, digest)
         except MusicDecryptorError as exc:
-            self._log(f"❌ 写入失败：{name} — {exc}")
+            self._log(f"❌ 写入失败：{name} — {exc}", level="result")
             return JobResult(str(p), name, "failed", message=exc.message, detail=exc.detail)
         except OSError as exc:
-            self._log(f"❌ 写入失败：{name} — {exc}")
+            self._log(f"❌ 写入失败：{name} — {exc}", level="result")
             return JobResult(str(p), name, "failed", message="写入输出文件失败", detail=str(exc))
 
     # ------------------------------------------------------------------ #
@@ -370,18 +467,22 @@ class Pipeline:
         base = self._safe_name(artist, title)
         audio, out_ext, fmt_note = self._final_format(result.audio, result.ext, name)
         if fmt_note:
-            self._log(f"  · {name}：{fmt_note}")
+            # 转码"失败/引擎不可用"是用户必须知道的（产物不是他要的格式）→ 结论级；
+            # 正常的"转码完成"只是过程说明 → 明细级。
+            failed_note = ("失败" in fmt_note) or ("不可用" in fmt_note)
+            self._log(f"  · {name}：{fmt_note}",
+                      level="result" if failed_note else "detail")
 
         # an input that is *already* plain audio and would land on its own
         # filename needs no copy at all
         if (mode == "plain" and out_ext == result.ext and out_dir == src.resolve().parent
                 and f"{base}.{out_ext}".lower() == src.name.lower()):
-            self._log(f"⏭ 已是明文音频，无需处理：{src.name}")
+            self._log(f"⏭ 已是明文音频，无需处理：{src.name}", level="result")
             return JobResult(str(src), src.name, "skipped", mode="plain",
                              out_path=str(src), fmt=out_ext, message="已是明文，无需处理")
 
         out_path = self._unique(out_dir, base, out_ext)
-        out_path.write_bytes(audio)
+        _atomic_write(out_path, audio)
 
         cover = result.cover or src_cover
         if not cover and self.settings.fetch_cover and result.cover_url:
@@ -399,30 +500,41 @@ class Pipeline:
 
         status = "copied" if mode == "plain" else "decoded"
         tag = "解密" if mode == "offline" else ("转码" if out_ext != result.ext else "复制")
-        self._log(f"✅ {tag}完成：{name} → {out_path.name}  [{out_ext.upper()}]")
+        self._log(f"✅ {tag}完成：{name} → {out_path.name}  [{out_ext.upper()}]", level="result")
         return JobResult(str(src), name, status, mode=mode, out_path=str(out_path),
                          fmt=out_ext, message="完成")
 
     # ------------------------------------------------------------------ #
-    def _search_order(self, chinese: bool) -> "list":
-        """华语歌预匹配后的本次信源顺序（静默、自动）。
+    def _want_lossless(self) -> bool:
+        """用户是否明确要无损（FLAC / WAV 目标）。"""
+        return (getattr(self.settings, "quality", "") or "").lower() in ("flac", "wav")
 
-        非华语：原样返回用户配置的顺序。
-        华语：离线/补链源保持最前；咪咕提到联网源最前；维基共享 / 互联网档案馆
-        压到最后 —— 是否真正检索由 `_fallback` 决定（只有当此前没有任何通过
-        门槛的候选时才去碰它们）。
+    def _search_order(self, chinese: bool) -> "list":
+        """本次备用链路的信源顺序（静默、自动、零额外请求）。
+
+        * **目标无损**：聚合通道提到联网源最前 —— 实测它是全链唯一能给真无损的源，
+          否则前面的源只会给 128k mp3。
+        * **华语**：离线/补链源保持最前；咪咕提到联网源最前；维基共享 / 互联网档案馆
+          压到最后 —— 是否真正检索由 `_fallback` 决定（只有当此前没有任何通过
+          门槛的候选时才去碰它们）。
+        * 其它：原样返回用户配置顺序。
         """
         sources = list(self.sources)
-        if not chinese:
+        want_lossless = self._want_lossless()
+        if not chinese and not want_lossless:
             return sources
         head = [s for s in sources
                 if getattr(s, "offline", False) or getattr(s, "trusted_links", False)]
         online = [s for s in sources if s not in head]
-        migu = [s for s in online if s.name == _CJK_FIRST_SOURCE]
-        defer = [s for s in online if s.name in _CJK_DEFER_SOURCES]
-        middle = [s for s in online
-                  if s.name != _CJK_FIRST_SOURCE and s.name not in _CJK_DEFER_SOURCES]
-        return head + migu + middle + defer
+        front: "list" = []
+        if want_lossless:
+            front += [s for s in online if s.name == _LOSSLESS_FIRST_SOURCE]
+        if chinese:
+            front += [s for s in online
+                      if s.name == _CJK_FIRST_SOURCE and s not in front]
+        defer = [s for s in online if chinese and s.name in _CJK_DEFER_SOURCES]
+        middle = [s for s in online if s not in front and s not in defer]
+        return head + front + middle + defer
 
     def _fallback(self, src: Path, digest: str, *, note: str) -> JobResult:
         readings = parse_song_filename_candidates(src.stem) or [(src.stem, "")]
@@ -434,6 +546,10 @@ class Pipeline:
         if chinese and any(s.name == _CJK_FIRST_SOURCE or s.name in _CJK_DEFER_SOURCES
                            for s in search_order):
             self._log("  · 华语歌预匹配：咪咕优先；维基共享/互联网档案馆仅在无其他候选时检索")
+        want_lossless = self._want_lossless()
+        if want_lossless and any(s.name == _LOSSLESS_FIRST_SOURCE for s in search_order):
+            self._log(f"  · 目标无损：{_LOSSLESS_FIRST_SOURCE} 优先"
+                      "（实测全链唯一能给真无损的通道，其它源只会给 128k mp3）")
         if len(readings) > 1:
             self._log("  · 文件名有两种读法：" +
                       " / ".join(f"歌名「{t}」歌手「{a}」" for t, a in readings))
@@ -561,6 +677,15 @@ class Pipeline:
                 self._log(f"  · 参考时长 {format_seconds(reference)}"
                           f"（实测 + 平台标注综合取值，容差 ±{int(TOL_REL * reference)}s）")
         tolerance = max(TOL_ABS, TOL_REL * reference) if reference else TOL_ABS
+        over_tolerance = _over_tolerance(reference)
+
+        too_long = [t for t in candidates
+                    if over_tolerance and t.actual_duration
+                    and t.actual_duration > reference + over_tolerance]
+        for track in too_long[:3]:
+            self._log(f"    ✗ 时长异常偏长已排除：{track.source} “{track.title}” "
+                      f"实测 {format_seconds(track.actual_duration)}"
+                      f"（参考 {format_seconds(reference)}，疑似合辑/串烧）")
 
         shortened = [t for t in candidates
                      if t.actual_duration and reference and t.actual_duration < reference - tolerance]
@@ -575,18 +700,37 @@ class Pipeline:
                       f"仅 {format_seconds(track.actual_duration)}"
                       f"（< {int(MIN_TRACK_SECONDS)}s，疑似片段）")
 
+        over_ids = {id(t) for t in too_long}
         verified = [t for t in candidates
-                    if t.actual_duration and t.actual_duration >= MIN_TRACK_SECONDS
+                    if id(t) not in over_ids
+                    and t.actual_duration and t.actual_duration >= MIN_TRACK_SECONDS
                     and (not reference or t.actual_duration >= reference - tolerance)]
-        # 疑似短资源即便侥幸通过时长门禁也排到最后 —— 只降权、绝不硬删：
-        # 匹配度仍是第一判据，形态只在同分时决定下载先后。
-        verified.sort(key=lambda t: (-t.score, t.short_asset,
-                                     t.source in _LAST_RESORT_SOURCES))
+        # 排序决定**最终下载哪一个**：默认匹配度第一，短资源/末位来源只作次序；
+        # 但用户明确要无损时，把"唯一能给真无损"的源排到最前 —— 否则前面的源
+        # 只会给 128k mp3，等于把"选 FLAC"变成空承诺。两者都只在该候选**已通过
+        # 全部硬门槛与时长核验**之后再排，不影响正确性。
+        if self._want_lossless():
+            verified.sort(key=lambda t: (t.source != _LOSSLESS_FIRST_SOURCE, -t.score,
+                                         t.short_asset,
+                                         t.source in _LAST_RESORT_SOURCES))
+        else:
+            verified.sort(key=lambda t: (-t.score, t.short_asset,
+                                         t.source in _LAST_RESORT_SOURCES))
         unverified = [t for t in candidates if not t.actual_duration]
+        # 「开放库例外」：只在**没有任何"偏短/偏长/短资源"证据**时才启用
+        suspicious = bool(shortened or too_short or short_meta or too_long)
+        trusted_unverified = [] if suspicious else [
+            t for t in unverified
+            if t.source in _OPEN_LIBRARY_SOURCES and t.header_ok
+            and t.size >= MIN_OPEN_LIBRARY_BYTES]
 
         note = ""
-        if not verified:
-            if shortened or too_short or short_meta:
+        if not verified and trusted_unverified:
+            note = "时长未比对（开放库文件）"
+            self._log(f"  · CC/PD 开放库例外：{len(trusted_unverified)} 个候选音频头合法、"
+                      "体积达标但容器测不出时长，按完整文件处理（结果里如实标注）")
+        elif not verified:
+            if shortened or too_short or short_meta or too_long:
                 note = "时长存疑"
                 self._log("  · ⚠ 可下载候选均短于参考时长，已按可疑版本处理")
             else:
@@ -601,21 +745,22 @@ class Pipeline:
         # 用户要求：**最终只下载通过时长验证的资源**。
         # 只要拿到了参考时长，测不出/对不上的候选就一律不作为可信选项，
         # 绝不用"没验证过的"去凑一个结果（宁可如实说没找到原曲）。
-        known_bad = {id(t) for t in shortened} | {id(t) for t in too_short}
+        known_bad = {id(t) for t in shortened} | {id(t) for t in too_short} | over_ids
         if reference is not None:
-            order = verified
+            order = verified or trusted_unverified
             if not order:
                 excluded = len(short_meta) + len(known_bad)
                 if excluded:
                     raise SearchNoResultError(
                         "未找到原曲，当前仅有伴奏/改编版，请确认是否需要下载。",
-                        detail=f"已排除 {excluded} 个时长偏短的候选")
+                        detail=f"已排除 {excluded} 个时长不符的候选（偏短/偏长）")
                 raise SearchNoResultError(
                     "候选音源均不可用（无版权/校验失败/反爬），请更换关键词或手动补全直链",
                     detail="已有参考时长，但候选都没能测出音频时长")
         else:
             # 连参考时长都取不到：如实标注"未比对"后再兜底，不让用户白等
-            order = verified or [t for t in candidates if id(t) not in known_bad]
+            order = (verified or trusted_unverified
+                     or [t for t in candidates if id(t) not in known_bad])
 
         # ---- 内容去重：同一首歌经多个源命中时只保留排名最高的一个 ---------- #
         order, duplicates = collapse_duplicates(order)
@@ -665,7 +810,8 @@ class Pipeline:
             # 完整度门禁：下载回来的东西必须真的是一整首歌
             ok_len, why_len, got_secs = check_completeness(
                 data, reference=reference or 0.0, tolerance=tolerance,
-                min_seconds=MIN_TRACK_SECONDS, measured=track.actual_duration or 0.0)
+                min_seconds=MIN_TRACK_SECONDS, measured=track.actual_duration or 0.0,
+                over_tolerance=over_tolerance)
             if not ok_len:
                 self._log(f"    ✗ 完整度未通过：{track.source} “{track.title}” —— {why_len}")
                 _remember(track, ok=False)
@@ -690,7 +836,7 @@ class Pipeline:
         out_dir = self._out_dir_for(src)
         base = self._safe_name(track.artist, track.title or src.stem)
         out_path = self._unique(out_dir, base, out_ext)
-        out_path.write_bytes(data)
+        _atomic_write(out_path, data)
 
         cover = b""
         if self.settings.fetch_cover:
@@ -715,7 +861,7 @@ class Pipeline:
         br = f"，{v.bitrate}kbps" if (v.bitrate and out_ext == v.ext) else ""
         dur = f"，时长 {format_seconds(track.actual_duration)}" if track.actual_duration else ""
         self._log(f"✅ 备用下载完成：{src.name} → {out_path.name}  [{out_ext.upper()}{br}{dur}] "
-                  f"来源：{track.source}" + (f"  ⚠ {note}" if note else ""))
+                  f"来源：{track.source}" + (f"  ⚠ {note}" if note else ""), level="result")
         return JobResult(str(src), src.name, "downloaded", mode="fallback", out_path=str(out_path),
                          fmt=out_ext, bitrate=v.bitrate, source=track.source,
                          message="完成" if not note else f"完成（{note}）")
@@ -760,8 +906,10 @@ class Pipeline:
             if not local.is_file():
                 raise NetworkError("本地文件不可读", detail=str(local))
             size = local.stat().st_size
+            track.size = track.size or size
             with open(local, "rb") as handle:
                 head = handle.read(PROBE_BYTES)
+            track.header_ok = bool(looks_like_audio(head))
             duration = audio_duration(head, size)
             if duration is None and _needs_tail(head) and size > PROBE_BYTES:
                 with open(local, "rb") as handle:
@@ -772,6 +920,8 @@ class Pipeline:
         headers = {"Referer": self._referer_for(track)}
         head, total = self.http.probe(url, limit=PROBE_BYTES, timeout=PROBE_TIMEOUT,
                                       headers=headers)
+        track.size = track.size or total
+        track.header_ok = bool(looks_like_audio(head))
         duration = audio_duration(head, total)
         if duration is None and _needs_tail(head):
             try:
@@ -794,7 +944,7 @@ class Pipeline:
         except CancelledError:
             raise
         except MusicDecryptorError as exc:
-            self._log(f"❌ {name}：{exc}")
+            self._log(f"❌ {name}：{exc}", level="result")
             return JobResult(str(src), name, "failed", message=exc.message, detail=exc.detail)
 
     def _search_and_gate(self, source, variant, readings, requested):
@@ -988,6 +1138,11 @@ class Pipeline:
         name = re.sub(r"\s+", " ", name)
         if len(name) > limit:
             name = name[:limit].rstrip(" .")
+        # Windows 保留设备名（CON/PRN/NUL/COM1…）无法作为文件名创建：
+        # 不加这一步，一首叫《CON》的歌会在写盘时抛 OSError（虽然会被兜住，
+        # 但用户看到的是"写入失败"而不是"已解密"）。
+        if name.split(".")[0].strip().upper() in _RESERVED_NAMES:
+            name = f"{name}_"
         return name or "track"
 
     def _unique(self, directory: Path, base: str, ext: str) -> Path:

@@ -59,6 +59,71 @@ def run(app, *, verbose: bool = True) -> int:
               f"row ends at y={bottom}, height={win.height()}")
         log_bottom = win.log.mapTo(win, QPoint(0, 0)).y() + win.log.height()
         check("main: log panel not clipped", log_bottom <= win.height())
+
+        # 日志分级：同事默认只看到"结论"，过程明细折叠在「显示详细信息」后面
+        win._log("✅ 结论行（应始终可见）")
+        win._log("· 明细行（默认折叠）", "detail")
+        shown = win.log.toPlainText()
+        check("main: 日志默认只显示结论（过程明细已折叠）",
+              "结论行" in shown and "明细行" not in shown, repr(shown[-90:]))
+        check("main: 折叠时如实提示折了多少行",
+              "已折叠" in win.log_hint.text(), win.log_hint.text())
+        win.chk_detail.setChecked(True)
+        app.processEvents()
+        shown2 = win.log.toPlainText()
+        check("main: 勾选「显示详细信息」后明细可见（且结论仍在）",
+              "明细行" in shown2 and "结论行" in shown2, repr(shown2[-90:]))
+        win.chk_detail.setChecked(False)
+        app.processEvents()
+        check("main: 取消勾选后重新折叠",
+              "明细行" not in win.log.toPlainText())
+
+        # 接线契约（2026-10-20 事故）：`SignalInstance.emit` 的签名不可内省，一旦
+        # Pipeline 把它当成"单参数 sink"，`emit(msg)` 会抛 TypeError 并被 `_guarded`
+        # 吞掉 —— 整条日志静默失效（界面只剩界面自己的几行，用户以为开关没用）。
+        from PySide6.QtCore import QObject as _QObject, Signal as _Signal
+
+        from mmusic.pipeline import _accepts_level
+
+        from .worker import make_log_sink
+
+        class _Holder(_QObject):
+            logged = _Signal(str, str)
+
+        check("logging: Qt 信号 emit 被判为『不可内省』（不误判成单参数）",
+              _accepts_level(_Holder().logged.emit) is None,
+              str(_accepts_level(_Holder().logged.emit)))
+
+        forwarded: list = []
+
+        class _FakeSig:
+            def emit(self, m, lv): forwarded.append((m, lv))
+
+        sink = make_log_sink(_FakeSig())
+        check("logging: worker 的日志 sink 可内省为两参数（不会被静默丢掉）",
+              _accepts_level(sink) is True, str(_accepts_level(sink)))
+        sink("· 明细行", "detail")
+        sink("结论行")
+        check("logging: 该 sink 完整转发 (message, level)",
+              forwarded == [("· 明细行", "detail"), ("结论行", "detail")], str(forwarded))
+
+        # 真正走一遍"worker 信号 → 窗口"：结论可见、明细折叠
+        holder = _Holder()
+        holder.logged.connect(win._log)
+        deliver = make_log_sink(holder.logged)
+        deliver("✅ 结论行（经信号）", "result")
+        deliver("· 明细行（经信号）", "detail")
+        app.processEvents()
+        shown3 = win.log.toPlainText()
+        check("main: 经 worker 信号投递的日志同样分级显示",
+              "结论行（经信号）" in shown3 and "明细行（经信号）" not in shown3,
+              repr(shown3[-100:]))
+        win.chk_detail.setChecked(True)
+        app.processEvents()
+        check("main: 展开后经信号投递的明细也看得到",
+              "明细行（经信号）" in win.log.toPlainText())
+        win.chk_detail.setChecked(False)
+        app.processEvents()
         win.setGeometry(avail.x(), avail.y(), avail.width() + 600, avail.height() + 400)
         win._clamp_to_screen()
         app.processEvents()

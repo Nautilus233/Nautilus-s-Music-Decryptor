@@ -6,7 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QRect, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import (QColor, QDesktopServices, QDragEnterEvent,
                            QDropEvent, QIcon)
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QComboBox,
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
                                QFileDialog, QFrame, QHBoxLayout, QHeaderView,
                                QLabel, QLineEdit, QMainWindow, QMessageBox,
                                QPlainTextEdit, QProgressBar, QPushButton,
@@ -43,6 +43,12 @@ class MainWindow(QMainWindow):
         self.settings = config.settings
         self._rows: "dict[str, int]" = {}
         self._worker: "DecryptWorker | None" = None
+        # 日志分级状态：全部行 (文本, level) + 被折叠的明细行数
+        self._log_lines: "list[tuple[str, str]]" = []
+        self._hidden_details = 0
+        #: 跑完但"线程还没真正结束"的 worker：必须保住强引用直到 QThread.finished，
+        #: 否则 Python GC 掉 C++ 对象会触发原生崩溃（见 _retire_worker）。
+        self._retired: "list" = []
 
         self.setWindowTitle("音乐解密工具 · Music Decryptor")
         icon = resource_path("assets", "icon.ico")
@@ -148,7 +154,19 @@ class MainWindow(QMainWindow):
         prog_row.addWidget(self.status_label)
         outer.addLayout(prog_row)
 
-        # log
+        # log（默认只显示"结论"，明细收进「显示详细信息」）
+        log_row = QHBoxLayout()
+        log_row.addWidget(QLabel("运行日志"))
+        self.chk_detail = QCheckBox("显示详细信息")
+        self.chk_detail.setToolTip("展开每个音源的排除统计、时长探测、降权说明等过程明细")
+        self.chk_detail.toggled.connect(self._on_detail_toggled)
+        log_row.addWidget(self.chk_detail)
+        log_row.addStretch(1)
+        self.log_hint = QLabel("")
+        self.log_hint.setProperty("role", "muted")
+        log_row.addWidget(self.log_hint)
+        outer.addLayout(log_row)
+
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(4000)
@@ -237,8 +255,19 @@ class MainWindow(QMainWindow):
             self._settings_store().setValue("geometry", self.saveGeometry())
         except Exception:  # noqa: BLE001
             pass
-        if self._worker is not None and self._worker.isRunning():
-            self._worker.cancel()
+        # 关窗时必须等线程收尾（协作式取消 + 有界等待）：线程活过窗口/进程，
+        # 既可能崩在解释器退出，也会让"已写了一半的产物"停在不确定状态。
+        pending = [w for w in ([self._worker] + list(self._retired)) if w is not None]
+        for w in pending:
+            try:
+                w.cancel()
+                if w.isRunning():
+                    w.wait(5000)
+            except Exception:  # noqa: BLE001
+                pass
+        for w in pending:
+            self._release_worker(w)
+        self._worker = None
         super().closeEvent(event)
 
     # ------------------------------------------------------------------ #
@@ -356,7 +385,7 @@ class MainWindow(QMainWindow):
             self.table.item(r, 4).setText("")
         self.progress.setValue(0)
         self.progress.setRange(0, max(1, len(paths)))
-        self._log("=" * 46)
+        self._log("=" * 46, level="detail")
         self._log(f"▶ 开始处理 {len(paths)} 个文件 | 音质：{self.settings.quality.upper()} | "
                   f"备用下载：{'开' if self.settings.enable_fallback else '关'}")
 
@@ -397,6 +426,36 @@ class MainWindow(QMainWindow):
         if "重新粘贴" in (res.message or ""):
             self.status_label.setText("⚠ QQ 登录态可能已失效：请管理员到 设置 → QQ 音乐凭证 重新粘贴")
 
+    def _retire_worker(self, worker) -> None:
+        """回收 worker：先摘掉 `_worker`（UI 可立即开新任务），再等线程**真正结束**才销毁。
+
+        为什么必须这样：`completed` / `failed` 是在 `run()` **内部**发出的 —— 那一刻
+        线程尚未返回。旧代码在槽里直接 `self._worker = None`，等于把 QThread 的最后
+        引用丢在"仍在运行"的瞬间：Python 一侧一 GC，C++ 对象先于线程结束被销毁。
+        实测（2026-10-20 猴子测试）：跑完一次任务后退出进程 → 退出码 0xC0000409
+        （STATUS_STACK_BUFFER_OVERRUN），offline 平台下必现 —— 真实用户表现为
+        "关窗退出时偶尔弹崩溃"。
+        """
+        if worker is None:
+            return
+        self._worker = None
+        try:
+            worker.finished.connect(lambda w=worker: self._release_worker(w))
+            self._retired.append(worker)
+        except Exception:  # noqa: BLE001 - 回收失败也不能影响 UI
+            pass
+
+    def _release_worker(self, worker) -> None:
+        try:
+            if worker in self._retired:
+                self._retired.remove(worker)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            worker.deleteLater()
+        except Exception:  # noqa: BLE001
+            pass
+
     def _on_completed(self, results) -> None:
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
@@ -412,7 +471,7 @@ class MainWindow(QMainWindow):
                       and self.table.item(r, 1).text() == "等待")
         if waiting:
             self._log(f"⏳ 列表里还有 {waiting} 个待处理文件：点「开始解密」即可继续")
-        self._worker = None
+        self._retire_worker(self._worker)
 
     def _on_failed(self, message: str) -> None:
         self._log(f"❌ 任务异常：{message}")
@@ -420,11 +479,36 @@ class MainWindow(QMainWindow):
         self.btn_stop.setEnabled(False)
         self.btn_add_files.setEnabled(True)
         self.btn_add_dir.setEnabled(True)
-        self._worker = None
+        self._retire_worker(self._worker)
 
     # ------------------------------------------------------------------ #
-    def _log(self, message: str) -> None:
-        self.log.appendPlainText(message)
+    # 日志分级：`result`（结论，同事必看）恒显示；`detail`（过程明细）默认折叠。
+    def _log(self, message: str, level: str = "result") -> None:
+        self._log_lines.append((message, level))
+        if len(self._log_lines) > 4000:
+            del self._log_lines[:len(self._log_lines) - 4000]
+        if level == "result" or self.chk_detail.isChecked():
+            self.log.appendPlainText(message)
+        else:
+            self._hidden_details += 1
+        self._update_log_hint()
+
+    def _on_detail_toggled(self, checked: bool) -> None:
+        """切换「显示详细信息」：即时重渲染，不用重跑任务。"""
+        if checked:
+            self._hidden_details = 0
+            self.log.setPlainText("\n".join(m for m, _ in self._log_lines))
+        else:
+            kept = [m for m, lv in self._log_lines if lv == "result"]
+            self._hidden_details = len(self._log_lines) - len(kept)
+            self.log.setPlainText("\n".join(kept))
+        self._update_log_hint()
+
+    def _update_log_hint(self) -> None:
+        if self.chk_detail.isChecked() or not self._hidden_details:
+            self.log_hint.setText("")
+        else:
+            self.log_hint.setText(f"已折叠 {self._hidden_details} 行详细过程")
 
     def _open_out_dir(self) -> None:
         """在文件管理器中打开上次输出（或设置里指定）的目录。"""

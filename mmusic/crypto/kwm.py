@@ -25,6 +25,7 @@ import struct
 from dataclasses import dataclass
 from typing import Optional
 
+from ..errors import DecryptionFailedError
 from ..model import AudioResult
 from ..sniff import looks_like_audio
 from ..utils import xor_repeating
@@ -75,10 +76,12 @@ class KwmResult:
 
 class KwmDecoder:
     def __init__(self, data: bytes) -> None:
+        # 统一抛 DecryptionFailedError：管线只把这个家族的异常当"可预期失败"
+        # 来换源/如实报错；抛 ValueError 会变成"未预期的错误"（实测 fuzz 命中）。
         if not is_kwm(data):
-            raise ValueError("不是有效的 KWM 文件（缺少 yeelion-kuwo 魔数）")
+            raise DecryptionFailedError("不是有效的 KWM 文件（缺少 yeelion-kuwo 魔数）")
         if len(data) <= KWM_HEADER_SIZE:
-            raise ValueError("KWM 文件过短")
+            raise DecryptionFailedError("KWM 文件过短（缺少 0x400 头部或音频体）")
         self.raw = data
 
     def decode(self) -> AudioResult:
@@ -87,7 +90,12 @@ class KwmDecoder:
         mask = mask_from_key(key_bytes)
         audio = xor_repeating(self.raw[KWM_HEADER_SIZE:], mask)
         sniffed = looks_like_audio(audio[:16])
-        # 密钥不匹配时解出来的是随机字节；这里如实记录"没嗅探出音频头"，
-        # 让上层给出警告，而不是安静地产出一个无法播放的文件。
-        return AudioResult(audio=audio, ext=sniffed or "mp3",
-                           meta={"kwm_key_id": key_id, "audio_sniffed": bool(sniffed)})
+        if not sniffed:
+            # 密钥不匹配 / 文件被截断时解出来的是随机字节。以前只写一条警告然后照样
+            # 落盘（用户拿到一个打不开的文件），现在**直接判失败** —— 与 QMC/NCM 的
+            # "解码结果安全网"一致，交给上层如实报错或转备用搜索。
+            raise DecryptionFailedError(
+                "KWM 解出的音频头无法识别（文件可能不完整，或不是 KWM 加密的音频）",
+                detail=f"key_id={key_id} size={len(self.raw)}")
+        return AudioResult(audio=audio, ext=sniffed,
+                           meta={"kwm_key_id": key_id, "audio_sniffed": True})

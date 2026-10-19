@@ -77,7 +77,13 @@ def qmc_derive_key(raw: bytes) -> bytes:
     for i in range(8):
         tea_key[i << 1] = simple[i]
         tea_key[(i << 1) + 1] = raw_dec[i]
-    sub = decrypt_tencent_tea(bytes(raw_dec[8:]), bytes(tea_key))
+    try:
+        sub = decrypt_tencent_tea(bytes(raw_dec[8:]), bytes(tea_key))
+    except ValueError as exc:
+        # TEA 的零校验失败意味着"这段 trailer 不是合法密钥"（文件被损坏/被改写/
+        # 根本不是 QTag）。以前这里漏出 ValueError（非可预期异常），fuzz 一碰就中；
+        # 现在统一成 DecryptionFailedError，交给上层如实报错或转备用搜索。
+        raise DecryptionFailedError(f"QMC 密钥解析失败（密钥块不合法：{exc}）") from exc
 
     out = bytearray(8 + len(sub))
     out[:8] = raw_dec[:8]

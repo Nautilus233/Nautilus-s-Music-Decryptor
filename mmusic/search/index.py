@@ -86,6 +86,7 @@ class ResourceIndex:
     def _connect(self) -> "sqlite3.Connection | None":
         if not self.enabled:
             return None
+        db = None
         try:
             fresh = self.path not in _SCHEMA_READY
             if fresh:
@@ -101,6 +102,14 @@ class ResourceIndex:
                 _SCHEMA_READY.add(self.path)
             return db
         except Exception:  # noqa: BLE001 - degrade silently
+            # 关键：异常路径也必须关掉刚打开的连接。否则"坏台账文件"这个场景下
+            # 每次调用都泄漏一个文件句柄（实测：句柄累积到临时目录都删不掉，
+            # 且 UI 每次任务都新建 ResourceIndex → 会一路累积）。
+            if db is not None:
+                try:
+                    db.close()
+                except Exception:  # noqa: BLE001
+                    pass
             return None
 
     @property

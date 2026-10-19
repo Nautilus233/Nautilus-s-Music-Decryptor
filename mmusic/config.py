@@ -3,12 +3,48 @@ from __future__ import annotations
 
 import json
 import os
+import dataclasses
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from .paths import program_dir
 
 APP_NAME = "MusicDecryptor"
+
+
+def _coerce_value(cls, key: str, value):
+    """把字段值"整形"成默认值的类型；形状完全不符则返回 ``(False, None)``。
+
+    容忍并转换：`timeout` 是 float 字段 → 整数 3 收下（转 3.0）；
+    `min_bitrate` 是 int 字段 → 320.0 收下（转 320），但 320.5 这种带小数的
+    直接拒绝（宁可保留默认值，也不要在很远处才炸）。
+    """
+    field_def = cls.__dataclass_fields__[key]
+    default = field_def.default
+    if default is dataclasses.MISSING and field_def.default_factory is not dataclasses.MISSING:
+        try:
+            default = field_def.default_factory()      # 例如 sources / local_dirs
+        except Exception:  # noqa: BLE001
+            default = None
+    if isinstance(default, bool):
+        return (True, value) if isinstance(value, bool) else (False, None)
+    if isinstance(default, str):
+        return (True, value) if isinstance(value, str) else (False, None)
+    if isinstance(default, float):
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return True, float(value)
+        return False, None
+    if isinstance(default, int):
+        if isinstance(value, bool):
+            return False, None
+        if isinstance(value, int):
+            return True, value
+        if isinstance(value, float) and float(value).is_integer():
+            return True, int(value)
+        return False, None
+    if isinstance(default, list):
+        return (True, value) if isinstance(value, list) else (False, None)
+    return True, value
 
 #: 便携模式的触发标记：程序目录下存在 `settings.json` 或 `portable` 即启用
 PORTABLE_MARKERS = ("settings.json", "portable")
@@ -20,7 +56,7 @@ def default_config_dir() -> Path:
 
 
 def resolve_config_dir(program_dir_path: "str | Path | None" = None) -> Path:
-    """配置目录：**便携模式优先**，否则 ``%APPDATA%\MusicDecryptor``。
+    """配置目录：**便携模式优先**，否则 ``%APPDATA%\\MusicDecryptor``。
 
     便携模式 = 程序目录（冻结后即 exe 所在目录）下已经有 ``settings.json``，
     或放了一个空的 ``portable`` 标记文件/文件夹。此时配置与哈希缓存都落在
@@ -72,8 +108,22 @@ class Settings:
 
     @classmethod
     def from_dict(cls, data: dict) -> "Settings":
+        """只接受"字段名 + 类型都对"的项。
+
+        手改坏的 `settings.json`（例如把 `quality` 写成数字、把 `sources` 写成字符串）
+        以前会**原样塞进对象**，然后在很远处才炸（实测：`quality=5` →
+        后面 `quality.lower()` 直接 AttributeError，整个界面起不来）。这里按默认值
+        做一次轻量类型校验：类型不符就**忽略该项、保留默认值**，坏配置绝不致命。
+        """
         allowed = set(cls.__dataclass_fields__)
-        return cls(**{k: v for k, v in (data or {}).items() if k in allowed})
+        out: dict = {}
+        for key, value in (data or {}).items():
+            if key not in allowed:
+                continue
+            ok, fixed = _coerce_value(cls, key, value)
+            if ok:
+                out[key] = fixed
+        return cls(**out)
 
 
 class AppConfig:

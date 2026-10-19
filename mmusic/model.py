@@ -40,3 +40,6 @@ class Track:
     #: 直链形态上一次就看得出的"疑似短资源"（试听/铃声/提示音）。目前由酷我适配器
     #: 依据 CDN 路径判定；只用于**降权**（少花探测/下载预算），绝不硬性排除。
     short_asset: bool = False
+    #: 头部探测确认过"看起来是音频"（`_probe_audio` 写入）。测不出时长时，
+    #: CC/PD 开放库（wikimedia / internet_archive）靠它做"完整文件"例外判定。
+    header_ok: bool = False

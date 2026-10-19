@@ -14,6 +14,14 @@ from ..model import Track
 from .base import SearchSource
 
 DEFAULT_BASE = "https://music-api.gdstudio.xyz/api.php"
+#: 实测（2026-10-20）该网关比主流源慢 2~3 倍（检索中位 1.5s、抖动到 6s），
+#: 而它只是**备选**：单次请求超时收到 8s（与探测一致），别让它拖住整链。
+TIMEOUT = 8.0
+#: 音质档位（实测语义）：999/740 都返回**同一个 FLAC**（740 是 999 的别名），
+#: 320/192/128 返回对应码率的真实 mp3。因此降级链去掉冗余档：
+#: 无损目标 999→320→128（最多 3 次，原为 5 次）；mp3 目标 320→128（最多 2 次，原为 3 次）。
+BR_CHAIN_LOSSLESS = (999, 320, 128)
+BR_CHAIN_LOSSY = (320, 128)
 
 
 class AggregatorSource(SearchSource):
@@ -31,7 +39,7 @@ class AggregatorSource(SearchSource):
     def search(self, query: str, *, quality: str = "mp3", limit: int = 10) -> list[Track]:
         url = (f"{self.base}?types=search&source={urllib.parse.quote(self.provider)}"
                f"&name={urllib.parse.quote(query)}&count={max(1, limit)}&pages=1")
-        data = self.http.get_json(url)
+        data = self.http.get_json(url, timeout=TIMEOUT)
         if not isinstance(data, list):
             return []
         tracks = []
@@ -55,11 +63,11 @@ class AggregatorSource(SearchSource):
         ident = str(track.raw.get("id", ""))
         if not ident:
             raise NetworkError("聚合条目缺少 id")
-        for br in ([999, 740, 320, 192, 128] if quality == "flac" else [320, 192, 128]):
+        for br in (BR_CHAIN_LOSSLESS if quality == "flac" else BR_CHAIN_LOSSY):
             url = (f"{self.base}?types=url&source={urllib.parse.quote(self.provider)}"
                    f"&id={urllib.parse.quote(ident)}&br={br}")
             try:
-                data = self.http.get_json(url)
+                data = self.http.get_json(url, timeout=TIMEOUT)
             except NetworkError:
                 continue
             if isinstance(data, dict) and data.get("url"):
@@ -74,7 +82,7 @@ class AggregatorSource(SearchSource):
         url = (f"{self.base}?types=pic&source={urllib.parse.quote(self.provider)}"
                f"&id={urllib.parse.quote(pic_id)}&size={size}")
         try:
-            data = self.http.get_json(url)
+            data = self.http.get_json(url, timeout=TIMEOUT)
         except NetworkError:
             return ""
         return (data or {}).get("url", "") if isinstance(data, dict) else ""

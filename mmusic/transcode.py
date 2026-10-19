@@ -72,6 +72,12 @@ def plan(src_ext: str, target: str) -> "tuple[str, str]":
         return "mp3", ""
     if src in _LOSSLESS:
         return ("flac", "") if tgt == "flac" else ("keep", "")
+    if src == "mp3":
+        # 源已经是 MP3、用户要无损：**保持原样**。此前这里会走下面的 "mp3" 分支，
+        # 于是 128k mp3 被重新编码成 320k mp3（实测 3.63MB → 9.07MB）—— 体积翻倍、
+        # 音质没有任何提升，还凭空多一代编码损失。这正是用户明确要求过的
+        # "本身是有损源，不进行无效转换"。
+        return "keep", "源本身是有损 MP3，无法产出真无损：已保持原样，不做无效转换"
     return "mp3", "源本身是有损，无法产出真无损：已按目标降级为 MP3（未做无效升格）"
 
 

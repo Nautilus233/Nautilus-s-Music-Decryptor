@@ -87,7 +87,8 @@ def validate(data: bytes, expected_ext: str = "", *, expected_bitrate: int = 0,
     return ValidationResult(True, ext, bitrate, size, "")
 
 def check_completeness(data: bytes, *, reference: float = 0.0, tolerance: float = 0.0,
-                       min_seconds: float = 45.0, measured: float = 0.0
+                       min_seconds: float = 45.0, measured: float = 0.0,
+                       over_tolerance: float = 0.0
                        ) -> "tuple[bool, str, float]":
     """下载**之后**的完整度门禁：把提示音 / 试听 / 截短挡在播出门外。
 
@@ -100,7 +101,10 @@ def check_completeness(data: bytes, *, reference: float = 0.0, tolerance: float 
     但只要测得出，就必须同时满足三条：不短于下限、不短于探测时测得的自身
     时长（防止服务端"探测给好的、下载给差的"）、不短于跨平台参考时长。
     """
-    seconds = audio_duration(data, len(data)) or 0.0
+    # Ogg 的时长写在**最后一页**的 granule、非 faststart 的 m4a 把 moov 放在文件尾：
+    # 只传 data 会永远测不出（门禁形同虚设），所以把文件尾一并交给解析器。
+    _tail = data[-131072:] if len(data) > 131072 else b""
+    seconds = audio_duration(data, len(data), _tail) or 0.0
     if not seconds:
         return True, "", 0.0
     if seconds < min_seconds:
@@ -111,5 +115,8 @@ def check_completeness(data: bytes, *, reference: float = 0.0, tolerance: float 
     if reference and seconds < reference - tolerance:
         return False, (f"下载结果 {format_seconds(seconds)} 短于参考时长 "
                        f"{format_seconds(reference)}"), seconds
+    if over_tolerance and reference and seconds > reference + over_tolerance:
+        return False, (f"下载结果 {format_seconds(seconds)} 长于参考时长 "
+                       f"{format_seconds(reference)}（疑似合辑/串烧）"), seconds
     return True, "", seconds
 

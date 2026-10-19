@@ -139,6 +139,23 @@ class NcmDecoder:
 
     # ------------------------------------------------------------------ #
     def decode(self) -> AudioResult:
+        """解析并解密；任何"容器级"异常都归一成 DecryptionFailedError。
+
+        变异/截断的 NCM 会让偏移量读到缓冲区之外（`struct.error: unpack_from
+        requires a buffer of at least …`）。这类异常以前会直接冒到批处理层，
+        被显示成"未预期的错误"；现在统一成可读的失败原因（深度 fuzz 15,000
+        次变异实测命中 3 例，已由此收口）。
+        """
+        try:
+            return self._decode_inner()
+        except DecryptionFailedError:
+            raise
+        except (struct.error, ValueError, IndexError, OverflowError) as exc:
+            raise DecryptionFailedError(
+                "NCM 容器解析失败（文件不完整或已被改写）",
+                detail=f"{type(exc).__name__}: {exc}") from exc
+
+    def _decode_inner(self) -> AudioResult:
         keybox = self._key_box()
         meta = self._meta()
         start = self._audio_start(keybox)
@@ -148,7 +165,15 @@ class NcmDecoder:
         declared = str(meta.get("format") or "").lower()
         if declared == "mp4":
             declared = "m4a"
-        ext = sniffed or declared or "mp3"
+        if not sniffed:
+            # 解密结果过不了音频头校验 → 密钥不匹配 / 容器被改写 / 文件被截断。
+            # 以前这里会"按声明格式"硬给一个扩展名然后照样落盘（fuzz 实测：
+            # 300 个变异容器里 2 个静默产出无法播放的文件），现在一律判失败，
+            # 与 QMC/KWM 的解码安全网保持一致。
+            raise DecryptionFailedError(
+                "解密结果不是有效音频（密钥不匹配或文件已损坏，未写出文件）",
+                detail=f"declared={declared or '无'} size={len(audio)}")
+        ext = sniffed
 
         artists: list[str] = []
         for entry in meta.get("artist") or []:

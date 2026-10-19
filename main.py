@@ -120,6 +120,8 @@ def main(argv=None) -> int:
     parser.add_argument("--selftest", action="store_true", help="运行自检")
     parser.add_argument("--check-qt", action="store_true", help="自检：加载 Qt 并打印版本后退出")
     parser.add_argument("--check-ui", action="store_true", help="自检：校验主窗口与设置弹窗的屏幕自适应")
+    parser.add_argument("--check-worker", action="store_true",
+                        help="自检：跑一次后台任务后正常退出（验证 QThread 生命周期）")
     parser.add_argument("--links", help="手动补链：直链或本地路径（逗号/换行分隔），优先于自动音源")
     parser.add_argument("--links-file", help="从文本文件读取补链（每行一条）")
     parser.add_argument("--sources-report", action="store_true",
@@ -143,6 +145,40 @@ def main(argv=None) -> int:
         theme.apply(app)
         failed = selfcheck.run(app)
         return 1 if failed else 0
+    if args.check_worker:
+        _ensure_utf8_console()
+        import tempfile
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QApplication
+
+        from mmusic.config import AppConfig
+        from ui.main_window import MainWindow
+
+        # 这一条专门盯"任务线程生命周期"（2026-10-20 猴子测试挖出的真实崩溃）：
+        # 旧代码在任务完成/关窗时把 QThread 的最后引用丢掉，进程退出时会原生崩溃
+        # （0xC0000409，Windows 下必现）。这个形状（建窗 → 灌一批文件 → 起任务 →
+        # 定时关窗 → app.exec 事件循环 → app.quit → 进程退出）能稳定复现，
+        # 因此冻结产物也跑一遍：退出码非 0 就是回归。
+        app = QApplication.instance() or QApplication([])
+        tmp = Path(tempfile.mkdtemp(prefix="mmusic-worker-"))
+        cfg = AppConfig(path=tmp / "settings.json")
+        cfg.settings.output_dir = str(tmp / "out")
+        cfg.settings.enable_fallback = False
+        cfg.settings.write_metadata = False
+        cfg.settings.fetch_cover = False
+        cfg.settings.remember_hashes = False
+        cfg.settings.overwrite = True
+        for i in range(60):
+            (tmp / f"sample{i}.mgg").write_bytes(b"\x00" * 2048)
+        win = MainWindow(cfg)
+        win.show()
+        win.add_paths([str(p) for p in sorted(tmp.glob("*.mgg"))])
+        win.start_job()
+        QTimer.singleShot(20, win.close)          # 任务还在跑时关窗（用户最常见的动作）
+        QTimer.singleShot(3000, app.quit)
+        app.exec()
+        print("worker lifecycle: OK（若进程退出码非 0，说明线程收尾有问题）")
+        return 0
     if args.sources_report:
         _ensure_utf8_console()
         from mmusic.config import AppConfig, default_config_dir
