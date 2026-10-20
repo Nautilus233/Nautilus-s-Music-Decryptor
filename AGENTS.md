@@ -49,19 +49,37 @@
 ## 5. 交付前必过的自检（任一失败即不可交付）
 
 ```
-python tests/selftest.py            # 功能与容器往返
-python tests/test_gui.py            # 界面冒烟
-python tests/test_ui_fit.py         # 真实屏幕自适应（主窗口 + 设置弹窗）
-dist\MusicDecryptor.exe --check-qt  # 冻结后 Qt 可加载（无对话框）
-dist\MusicDecryptor.exe --check-ui  # 冻结后界面/弹窗不越界
+python tests/selftest.py                # 功能与容器往返（离线用例）
+python tests/test_gui.py                # 界面冒烟
+python tests/test_ui_fit.py             # 真实屏幕自适应（主窗口 + 设置弹窗）
+python tests/test_robustness.py         # 边界 / 负面 / fuzz / 故障注入 / 内存
+python tests/test_monkey_ui.py          # 猴子测试：随机乱点全部控件
+dist\MusicDecryptor.exe --check-qt      # 冻结后 Qt 可加载（无对话框）
+dist\MusicDecryptor.exe --check-ui      # 冻结后界面/弹窗不越界
+dist\MusicDecryptor.exe --check-worker  # 冻结后任务线程生命周期（跑任务→关窗→退出不崩）
+dist\MusicDecryptor.exe --sources-report # 音源清单与台账健康（信息性，但须 exit 0）
 ```
 
-## 5. Git 与推送规则
+后三条是 2026-10-20 补上的，**各自都抓到过真实缺陷**，不是凑数：
+
+- `test_robustness.py` → 抓到 NCM/KWM **静默产出打不开的文件**、台账 `_connect()` 异常分支的
+  **文件句柄泄漏**、以及手改坏的 `settings.json` 会把界面炸在远处；
+- `test_monkey_ui.py` + `--check-worker` → 抓到 **QThread 生命周期导致的退出崩溃**
+  （`0xC0000409`：`completed` 在 `run()` 内发出时就丢掉最后引用 + 关窗只 `cancel()` 不等）。
+  冻结产物也跑这条，是因为"源码能跑 ≠ exe 能跑"（见 DESIGN §5.6）。
+
+深度浸泡（`test_robustness.py --soak`、`test_monkey_ui.py --iters 1500 --rounds 5`）与换随机种子
+（`--seed`）按需跑，不进常规门禁。
+
+## 6. Git 与推送规则
 
 - 远端仓库：`https://github.com/Nautilus233/Nautilus-s-Music-Decryptor.git`，分支 `main`（**公开仓库**）。
 - **禁止自动/顺带推送**：只有当用户在当次消息里**明确要求推送**时，才允许 `git push`；
   用户已说明“以后的进展也是，但要在我说本次推送再推”。未经明确要求，连 commit 都不要主动做。
-- 推送前必须跑通 §4 的自检。
+- 推送前必须跑通 §5 的**全部**自检（含上面那条新增门禁）。
 - **禁止提交**：`dist/` 产物、`build/work*/` 缓存，以及任何**真实歌曲文件**
   （例如 `_testfile/` 内的 `.mgg`）。公开仓库严禁包含受版权保护的音频（详见 `.gitignore`）。
+- 提交前扫一眼 `git status`：**仓库根不得出现测试垃圾目录**（猴子测试会把"输出目录"填成
+  `设置` / `🎵🎤` 这类脏值；`tests/test_monkey_ui.py` 已用 `os.chdir` 隔离并自带"零新增"自检，
+  发现残留就说明隔离失效，先修测试再提交）。
 
