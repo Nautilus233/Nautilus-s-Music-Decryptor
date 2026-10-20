@@ -1,90 +1,72 @@
-"""Generate assets/icon.ico (and a preview PNG) with Pillow.
+"""Generate assets/icon.ico from assets/icon_source.png with Pillow.
 
     python assets/make_icon.py
 
-Draws a rounded-square gradient badge with a music note whose "lock" has
-popped open - the app's whole job in one glyph.  Rendered at 4x and
-down-sampled for clean anti-aliasing.
+源图是一张 Win98 风格的 32×32 像素画（纯色块 + 透明背景）。像素画必须用
+**最近邻**缩放才能保持清晰：把每个源像素整块放大，边缘是硬的；用 LANCZOS 之类的
+插值会把色块糊成一团渐变，反而"不清晰"。
+
+* ≥ 原生尺寸：最近邻放大（64/128/256 是整数倍，48 是 1.5 倍，全部保持色块）；
+* < 原生尺寸（16/24）：按 alpha 覆盖率决定像素去留、颜色取最近的原像素 —— 硬边降采样，
+  轮廓还在，不会糊成灰边。
 """
 from __future__ import annotations
 
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image
 
 OUT = Path(__file__).resolve().parent
-SIZE = 256
-SS = 4                      # supersampling factor
-ICO_SIZES = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
+SOURCE = OUT / "icon_source.png"
+NATIVE = 32                                   # 源图原生尺寸（像素画一格一个像素）
+ICO_SIZES = [16, 24, 32, 48, 64, 128, 256]
+PREVIEW = 256
+ALPHA_CUT = 112                               # 降采样时的覆盖率阈值（0-255），>50% 才保留
 
 
-def _gradient(size: int) -> Image.Image:
-    top, bottom = (37, 99, 235), (124, 58, 237)          # blue -> violet
-    img = Image.new("RGB", (1, size))
-    px = img.load()
-    for y in range(size):
-        t = y / max(1, size - 1)
-        px[0, y] = tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3))
-    return img.resize((size, size))
+def load_source() -> Image.Image:
+    """读源图并统一成 RGBA/原生尺寸；缺图时给出可读错误。"""
+    if not SOURCE.is_file():
+        raise SystemExit(f"缺少图标源图：{SOURCE}")
+    img = Image.open(SOURCE).convert("RGBA")
+    if img.size != (NATIVE, NATIVE):
+        img = img.resize((NATIVE, NATIVE), Image.NEAREST)
+    return img
 
 
-def build() -> Image.Image:
-    S = SIZE * SS
-    base = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+def _crisp_downscale(src: Image.Image, n: int) -> Image.Image:
+    """硬边降采样到 n×n：alpha 取覆盖率，颜色取最近的原像素（不混色、不发灰）。"""
+    alpha = src.getchannel("A").resize((n, n), Image.BOX)
+    nearest = src.resize((n, n), Image.NEAREST)
+    out = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+    sp, ap, op = nearest.load(), alpha.load(), out.load()
+    for y in range(n):
+        for x in range(n):
+            if ap[x, y] >= ALPHA_CUT:
+                r, g, b, _ = sp[x, y]
+                op[x, y] = (r, g, b, 255)
+    return out
 
-    # rounded-square gradient plate
-    plate = _gradient(S).convert("RGBA")
-    mask = Image.new("L", (S, S), 0)
-    ImageDraw.Draw(mask).rounded_rectangle([0, 0, S - 1, S - 1], radius=int(S * 0.22), fill=255)
-    base.paste(plate, (0, 0), mask)
 
-    d = ImageDraw.Draw(base)
-    white = (255, 255, 255, 255)
-    blue = (37, 99, 235, 255)
+def render(n: int) -> Image.Image:
+    src = load_source()
+    if n == NATIVE:
+        return src
+    if n > NATIVE:
+        return src.resize((n, n), Image.NEAREST)
+    return _crisp_downscale(src, n)
 
-    # ---- music note (eighth note, upper-left) --------------------------
-    stem_w = int(S * 0.062)
-    stem_x = int(S * 0.55)
-    stem_top = int(S * 0.18)
-    stem_bottom = int(S * 0.60)
-    d.rounded_rectangle([stem_x, stem_top, stem_x + stem_w, stem_bottom],
-                        radius=stem_w // 2, fill=white)
-
-    head_r = int(S * 0.115)
-    hx, hy = int(S * 0.40), int(S * 0.60)
-    d.ellipse([hx - head_r, hy - head_r * 0.80, hx + head_r, hy + head_r * 0.80], fill=white)
-
-    flag = [(stem_x + stem_w, stem_top),
-            (int(S * 0.80), int(S * 0.25)),
-            (int(S * 0.755), int(S * 0.40)),
-            (stem_x + stem_w, stem_top + int(S * 0.10))]
-    d.polygon(flag, fill=white)
-
-    # ---- unlock badge (lower-right) ------------------------------------
-    bc = int(S * 0.745)
-    br = int(S * 0.235)
-    d.ellipse([bc - br, bc - br, bc + br, bc + br], fill=white)
-
-    lw, lh = int(br * 0.66), int(br * 0.52)
-    lx, ly = bc - lw // 2, bc - int(br * 0.02)
-    d.rounded_rectangle([lx, ly, lx + lw, ly + lh], radius=int(br * 0.13), fill=blue)
-
-    aw = int(br * 0.44)
-    ax, ay = bc - aw // 2 + int(br * 0.12), ly - int(br * 0.36)
-    d.arc([ax, ay, ax + aw, ay + aw], start=180, end=360, fill=blue, width=int(br * 0.12))
-
-    kr = int(br * 0.105)
-    cx, cy = bc, ly + lh // 2
-    d.ellipse([cx - kr, cy - kr, cx + kr, cy + kr], fill=white)
-
-    return base.resize((SIZE, SIZE), Image.LANCZOS)
 
 def main() -> None:
-    img = build()
+    base = render(PREVIEW)
+    others = [render(n) for n in ICO_SIZES if n != PREVIEW]
     png = OUT / "icon.png"
-    img.save(png)
-    img.save(OUT / "icon.ico", sizes=ICO_SIZES)
-    print(f"wrote {OUT / 'icon.ico'} and {png}")
+    ico = OUT / "icon.ico"
+    base.save(png)
+    # 每个尺寸都显式给图，避免 Pillow 自己按 LANCZOS 缩放（那样就不清晰了）
+    base.save(ico, format="ICO", sizes=[(n, n) for n in ICO_SIZES],
+              append_images=others)
+    print(f"wrote {ico} and {png}")
 
 
 if __name__ == "__main__":
