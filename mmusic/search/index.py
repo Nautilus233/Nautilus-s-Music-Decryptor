@@ -161,14 +161,6 @@ class ResourceIndex:
                 pass
 
     # ---- negative query cache ---------------------------------------- #
-    def note_query(self, query: str, source: str, *, found: bool, error: bool = False) -> None:
-        state = _STATE_ERROR if error else (_STATE_FOUND if found else _STATE_EMPTY)
-        self._write(
-            "INSERT INTO query_state(q, source, state, at) VALUES(?,?,?,?) "
-            "ON CONFLICT(q, source) DO UPDATE SET state=excluded.state, at=excluded.at",
-            (query, source, state, int(time.time())),
-        )
-
     def note_search(self, source: str, query: str, *, found: bool, error: bool = False,
                     seconds: float = 0.0) -> None:
         """Record a whole search outcome (health + query state) in ONE commit."""
@@ -260,21 +252,6 @@ class ResourceIndex:
                 "sources": int(sources or 0)}
 
     # ---- source health ----------------------------------------------- #
-    def note_attempt(self, source: str, *, ok: bool, seconds: float = 0.0) -> None:
-        now = int(time.time())
-        self._write(
-            "INSERT INTO source_health(source, attempts, successes, failures, total_ms,"
-            " last_ok, last_fail) VALUES(?,?,?,?,?,?,?) "
-            "ON CONFLICT(source) DO UPDATE SET attempts=source_health.attempts + 1,"
-            " successes=source_health.successes + excluded.successes,"
-            " failures=source_health.failures + excluded.failures,"
-            " total_ms=source_health.total_ms + excluded.total_ms,"
-            " last_ok=MAX(source_health.last_ok, excluded.last_ok),"
-            " last_fail=MAX(source_health.last_fail, excluded.last_fail)",
-            (source, 1, 1 if ok else 0, 0 if ok else 1,
-             int(max(0.0, seconds) * 1000), now if ok else 0, 0 if ok else now),
-        )
-
     def health(self) -> list[dict]:
         rows = self._rows("SELECT source, attempts, successes, failures, total_ms,"
                           " last_ok, last_fail FROM source_health ORDER BY attempts DESC")

@@ -37,7 +37,8 @@ from mmusic.match import (filename_query, title_match_score,  # noqa: E402
                         split_originals, track_version_markers, version_markers)
 from mmusic.model import Track  # noqa: E402
 from mmusic.net import HttpClient  # noqa: E402
-from mmusic.pipeline import (MIN_ACCEPT, MIN_TITLE_SIMILARITY,  # noqa: E402
+from mmusic.pipeline import (MIN_ACCEPT, MIN_ARTIST_SIMILARITY,  # noqa: E402
+                             MIN_TITLE_SIMILARITY,
                              MIN_TRACK_SECONDS, Pipeline, _plausible_max)
 from mmusic.search.registry import build_sources  # noqa: E402
 from mmusic.search.base import SearchSource  # noqa: E402
@@ -2223,9 +2224,11 @@ def test_acquire_by_name() -> None:
                 super().__init__(None, {})
                 self.name = name
                 self.label = label
+                self.calls = 0                      # 检索次数（用于断言"点名下载不再重搜"）
                 self._t, self._a, self._p, self._d = title, artist, str(path), duration
 
             def search(self, query, *, quality="mp3", limit=10):
+                self.calls += 1
                 return [Track(self.name, self._t, self._a, duration=self._d, bitrate=320,
                               ext="mp3", raw={"path": self._p})]
 
@@ -2274,25 +2277,78 @@ def test_acquire_by_name() -> None:
               str(res.path).startswith(pl.SEARCH_PREFIX), res.path)
         check("acquire: 不删除任何文件", full.exists() and cut.exists())
 
-        # ③ 人工点选"截短版"：必须如实拒绝，不许偷偷换成完整版
-        chosen_cut = cut_src.search("夜曲")[0]
+        # ③ 「先列候选 → 下载选中」：**不得重新检索**（2026-10-21 用户反馈的原始诉求），
+        #    并且要能用列表里带过来的参考时长把"截短版"挡住。
+        listed = pipe.search_candidates("夜曲", artist="周杰伦")
+        searches_after_list = cut_src.calls + full_src.calls
+        check("acquire: 列候选阶段会检索（计数生效）", searches_after_list >= 2,
+              f"cut={cut_src.calls} full={full_src.calls}")
+
+        pick_full = next(t for t in listed if t.source == "full1")
+        r_pick = pipe.acquire("周杰伦 - 夜曲", chosen=pick_full, reference=240.0)
+        got_pick = (audio_duration(Path(r_pick.out_path).read_bytes())
+                    if r_pick.out_path and Path(r_pick.out_path).exists() else None)
+        check("acquire: 点名下载**不再重新检索**",
+              (cut_src.calls + full_src.calls) == searches_after_list,
+              f"检索次数 {searches_after_list} → {cut_src.calls + full_src.calls}")
+        check("acquire: 点名下载能正常落盘（用真实文件过校验/完整度）",
+              r_pick.status == "downloaded" and got_pick is not None and 235 <= got_pick <= 245,
+              f"{r_pick.status} {r_pick.out_path} 实测={got_pick}")
+
+        # ④ 点名一条"截短版"（参考 4:00 / 实测 2:00）：照样如实拒绝，不写文件
+        pick_cut = next(t for t in listed if t.source == "cut1")
+        out_before = sorted(p.name for p in (tmp / "out").glob("*.mp3"))
         try:
-            r3 = pipe.acquire("夜曲", artist="周杰伦", chosen=chosen_cut)
+            r3 = pipe.acquire("周杰伦 - 夜曲", chosen=pick_cut, reference=240.0)
             ok3, msg3 = False, r3.message
         except MusicDecryptorError as exc:
-            ok3, msg3 = "未通过时长核验" in exc.message, exc.message
-        check("acquire: 人工点选的候选没通过核验时如实拒绝（绝不换别的版本）", ok3, msg3)
+            ok3, msg3 = "完整度门禁" in exc.message, exc.message
+        check("acquire: 点名的候选若是截短版，下载后照样如实拒绝（绝不写盘）",
+              ok3 and sorted(p.name for p in (tmp / "out").glob("*.mp3")) == out_before, msg3)
 
-        # ④ 人工点选完整版：跨 Pipeline 重新检索后必须按「音源 + 资源指纹」定位
-        chosen_full = full_src.search("夜曲")[0]
-        r4 = pipe.acquire("夜曲", artist="周杰伦", chosen=chosen_full)
-        out4 = Path(r4.out_path) if r4.out_path else None
-        got4 = audio_duration(out4.read_bytes()) if out4 and out4.exists() else None
-        check("acquire: 人工点选（对象不同、靠指纹定位）能正常下载",
-              r4.status == "downloaded" and got4 is not None and 235 <= got4 <= 245,
-              f"{r4.status} {r4.out_path} 实测={got4}")
+        # ⑤ 「先列候选」只列**能下**的：解析不出直链 / 标注就过短的都不该出现
+        from mmusic.errors import NetworkError
 
-        # ⑤ 搜不到：批量入口给可读的失败结果，而不是抛异常或卡住
+        class NoLinkSrc(SearchSource):
+            def __init__(self):
+                super().__init__(None, {})
+                self.name, self.label = "nolink", "无直链源"
+
+            def search(self, query, *, quality="mp3", limit=10):
+                return [Track(self.name, "夜曲", "周杰伦", duration=240, bitrate=320,
+                              ext="mp3")]
+
+            def resolve(self, track, *, quality="mp3"):
+                raise NetworkError("该曲目无免费直链")
+
+        class ShortSrc(SearchSource):
+            def __init__(self):
+                super().__init__(None, {})
+                self.name, self.label = "short1", "短片段源"
+
+            def search(self, query, *, quality="mp3", limit=10):
+                return [Track(self.name, "夜曲", "周杰伦", duration=22, bitrate=320,
+                              ext="mp3", raw={"path": str(cut)})]
+
+            def resolve(self, track, *, quality="mp3"):
+                track.url = cut.resolve().as_uri()
+                track.ext = "mp3"
+                return track
+
+        pipe5, logs5 = make_pipe(tmp / "out5", [NoLinkSrc(), ShortSrc(), full_src])
+        listed5, _ref5 = pipe5.search_candidates_ex("夜曲", artist="周杰伦")
+        check("list: 解析不出直链的候选**不出现**在可选列表里（列了也下不了＝没价值）",
+              all(t.source != "nolink" for t in listed5)
+              and any("无法解析直链" in m for m in logs5),
+              " | ".join(m for m in logs5 if "剔除" in m)[:120])
+        check("list: 标注就短于下限的候选也不列出",
+              all(t.source != "short1" for t in listed5),
+              str([t.source for t in listed5]))
+        check("list: 能下的候选照常列出（并且直链已就绪）",
+              any(t.source == "full1" for t in listed5)
+              and all(t.url for t in listed5), str([(t.source, bool(t.url)) for t in listed5]))
+
+        # ⑥ 搜不到：批量入口给可读的失败结果，而不是抛异常或卡住
         rs = pipe.acquire_many(["这首歌不存在谢谢", ("也不存在呀", "某人")])
         check("acquire_many: 无结果时返回可读的失败结果",
               len(rs) == 2 and all(r.status == "failed" for r in rs)
@@ -2366,6 +2422,20 @@ def test_query_sanitize() -> None:
     bad = [f"{src!r}->{sanitize_query_text(src)!r}" for src, want in table
            if sanitize_query_text(src) != want]
     check("sanitize: 序号/符号（前缀与后缀）全部清洗干净", not bad, "; ".join(bad))
+
+    # 歌手"包含"判定必须有边界（拉丁名单字母/短词不许当子串命中）
+    from mmusic.match import _artist_contains, artist_match_score
+    cases = [("arkinz", "r", False), ("various artists", "va", False), ("rosalia", "r", False),
+             ("jj lin", "jj", True), ("周杰伦精选", "周杰伦", True),
+             ("周杰伦 jay chou", "jay chou", True)]
+    wrong = [f"{n!r}⊂{h!r}?{_artist_contains(h, n)}" for h, n, want in cases
+             if _artist_contains(h, n) is not want]
+    check("artist-contains: 中文按子串、拉丁按词级（r ⊄ arkinz / jj ⊂ jj lin）", not wrong,
+          "; ".join(wrong))
+    bad_cand = Track("agg", "roselia", "arkinz", duration=340)
+    score = artist_match_score([("R", "Roselia"), ("Roselia", "R")], bad_cand)
+    check("artist-contains: 不再让「R - Roselia」匹配到歌手 arkinz 的候选（实测回归）",
+          score < 0.60, f"score={score:.2f}")
 
     check("sanitize: 修复的正是「卡在硬门槛下」的情形（1. 夜曲 0.57 → 夜曲 1.00）",
           similarity("1. 夜曲", "夜曲") < MIN_TITLE_SIMILARITY
@@ -2557,6 +2627,153 @@ def test_placeholder_artist() -> None:
         res2 = pipe2.acquire("周杰伦 - 夜曲")
         check("placeholder: 只有占位候选时仍然照常下载（不硬删）",
               res2.status == "downloaded", f"{res2.status} {res2.message}")
+
+
+def test_input_audit() -> None:
+    """输入解析审计：干扰项清洗 + 歌手提示 + 门槛判定（负样本不许误过）。"""
+    print("\n[input audit: 干扰项清洗与判定]")
+    from mmusic.match import best_reading_match, looks_like_song_query, sanitize_query
+
+    TARGET, DECOY = ("周杰伦", "夜曲"), ("Xai小爱", "夜曲")
+    # (输入, 期望清洗, 期望歌手提示, 目标应命中, 诱饵也应能过)
+    cases = [
+        ("夜曲", "夜曲", "", True, True),
+        ("1. 夜曲", "夜曲", "", True, True),
+        ("1、夜曲", "夜曲", "", True, True),
+        ("（1）夜曲", "夜曲", "", True, True),
+        ("第1首 夜曲", "夜曲", "", True, True),
+        ("第一首：夜曲", "夜曲", "", True, True),
+        ("01 夜曲", "夜曲", "", True, True),
+        ("#1 夜曲", "夜曲", "", True, True),
+        ("No.3 夜曲", "夜曲", "", True, True),
+        ("①夜曲", "夜曲", "", True, True),
+        ("⒈夜曲", "夜曲", "", True, True),
+        ("１．夜曲", "夜曲", "", True, True),
+        ("一、夜曲", "夜曲", "", True, True),
+        ("（一）夜曲", "夜曲", "", True, True),
+        ("I. 夜曲", "夜曲", "", True, True),
+        ("II、夜曲", "夜曲", "", True, True),
+        ("l. 夜曲", "夜曲", "", True, True),
+        ("1。夜曲", "夜曲", "", True, True),
+        ("1 夜曲", "夜曲", "", True, True),
+        ("点播：夜曲", "夜曲", "", True, True),
+        ("点播 夜曲", "夜曲", "", True, True),
+        ("求 夜曲", "夜曲", "", True, True),
+        ("【点播】夜曲", "夜曲", "", True, True),
+        ("歌名：夜曲", "夜曲", "", True, True),
+        ("歌曲名：夜曲", "夜曲", "", True, True),
+        ("song: 夜曲", "夜曲", "", True, True),
+        ("试听：夜曲", "夜曲", "", True, True),
+        ("夜曲.mp3", "夜曲", "", True, True),
+        ("夜曲 点播", "夜曲", "", True, True),
+        ("夜曲 - 点播", "夜曲", "", True, True),
+        ("夜\t曲", "夜曲", "", True, True),
+        ("夜 曲", "夜曲", "", True, True),
+        ("★ 夜曲 ★", "夜曲", "", True, True),
+        ("《夜曲》", "夜曲", "", True, True),
+        ("周杰伦 - 夜曲", "周杰伦 - 夜曲", "", True, False),
+        ("周杰伦·夜曲", "周杰伦 - 夜曲", "", True, False),
+        ("周杰伦《夜曲》", "周杰伦 - 夜曲", "", True, False),
+        ("夜曲 周杰伦", "夜曲 周杰伦", "", True, False),
+        ("周 杰伦 - 夜 曲", "周杰伦 - 夜曲", "", True, False),
+        ("1. 周杰伦 - 夜曲", "周杰伦 - 夜曲", "", True, False),
+        ("周杰伦 - 夜曲 - 点播", "周杰伦 - 夜曲", "", True, False),
+        ("夜曲 原唱：周杰伦", "夜曲", "周杰伦", True, False),
+        ("夜曲（原唱：周杰伦）", "夜曲", "周杰伦", True, False),
+        ("【原唱：周杰伦】夜曲", "夜曲", "周杰伦", True, False),
+        ("1. 夜曲 原唱：周杰伦.mp3", "夜曲", "周杰伦", True, False),
+        # 负样本：清洗后必须原样保留，且不该误过
+        ("7 Years", "7 Years", "", False, False),
+        ("30 岁的女人", "30 岁的女人", "", False, False),
+        ("2002年的第一场雪", "2002年的第一场雪", "", False, False),
+        ("12 夜曲", "12 夜曲", "", False, False),
+        ("音乐会", "音乐会", "", False, False),
+        ("Hotel California", "Hotel California", "", False, False),
+        ("夜曲 (Live)", "夜曲 (Live)", "", True, True),
+        ("", "", "", False, False),
+        ("***", "", "", False, False),
+        ("1.", "", "", False, False),
+        ("求：", "", "", False, False),
+        ("播放", "播放", "", False, False),
+    ]
+
+    def _gate(readings, artist, title, requested):
+        t = Track("s", title, artist, duration=227)
+        ok, _rd, _ts, _as = best_reading_match(readings, t, min_title=MIN_TITLE_SIMILARITY,
+                                               min_artist=MIN_ARTIST_SIMILARITY,
+                                               strict_title=not requested)
+        return ok
+
+    bad = []
+    for raw, want_clean, want_hint, want_hit, want_decoy in cases:
+        cleaned, hint = sanitize_query(raw)
+        _seed, readings, _query, requested = Pipeline._seed_for(raw)
+        hit = _gate(readings, *TARGET, requested)
+        dec = _gate(readings, *DECOY, requested)
+        if (cleaned, hint, hit, dec) != (want_clean, want_hint, want_hit, want_decoy):
+            bad.append(f"{raw!r}→{cleaned!r}/{hint!r} 命中={hit} 诱饵={dec}")
+    check(f"audit: {len(cases)} 条输入语料零误判（清洗/提示/命中/诱饵）", not bad,
+          "; ".join(bad[:4]))
+
+    # fuzz：畸形输入不得抛异常、不得返回错类型（固定种子，可复现）
+    import random as _random
+    rnd = _random.Random(20261022)
+    alphabet = " 1234567890.、（）【】★·-：:周杰伦夜曲abc🎵\t\n"
+    junk = ["", " ", "\n", "\t", "***", "（", "【【", '"', "\\", "夜" * 500, "🎵🎶",
+            "①", "第", "I.", "- - -", "夜曲" * 50, "\u200b", "。", "：：", "..", "1" * 20]
+    junk += ["".join(rnd.choice(alphabet) for _ in range(rnd.randrange(0, 40)))
+             for _ in range(80)]
+    boom = []
+    for raw in junk:
+        try:
+            cleaned, hint = sanitize_query(raw)
+            usable, _c = looks_like_song_query(raw)
+            _s, rd, _q, _r = Pipeline._seed_for(raw)
+            if not isinstance(cleaned, str) or not isinstance(hint, str) \
+                    or not isinstance(rd, list) or not isinstance(usable, bool):
+                boom.append(f"{raw!r}: 返回类型异常")
+        except Exception as exc:  # noqa: BLE001
+            boom.append(f"{raw!r}: {type(exc).__name__}: {exc}")
+    check(f"audit: fuzz 畸形输入不抛异常（{len(junk)} 例）", not boom, "; ".join(boom[:3]))
+
+
+def test_search_output_dir() -> None:
+    """以名找歌的输出目录：专用 → 主 → 默认（按需按优），且与解密模式互不影响。"""
+    print("\n[search output dir: 按需按优]")
+    from mmusic.pipeline import default_search_dir
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        main_dir, search_dir = tmp / "main", tmp / "search"
+        st = Settings(output_dir=str(main_dir), search_output_dir="", quality="mp3",
+                      enable_fallback=True, write_metadata=False, fetch_cover=False,
+                      remember_hashes=False, timeout=5.0, retries=0, min_bitrate=0)
+        pipe = Pipeline(st, cache_path=tmp / "c.json", on_log=[].append, sources=[])
+
+        check("outdir: 未设专用目录 → 跟随主输出目录",
+              pipe._out_dir_for(None) == main_dir, str(pipe._out_dir_for(None)))
+        st.search_output_dir = str(search_dir)
+        check("outdir: 设了专用目录 → 用专用目录",
+              pipe._out_dir_for(None) == search_dir, str(pipe._out_dir_for(None)))
+
+        src = tmp / "song.mgg"
+        src.write_bytes(b"x")
+        st.output_dir = ""              # 解密模式没设主目录 → 落到源文件目录（专用目录不该插手）
+        check("outdir: 专用目录**不影响**解密模式的落点（未设主目录 → 源文件目录）",
+              pipe._out_dir_for(src) == tmp, str(pipe._out_dir_for(src)))
+        st.output_dir = str(main_dir)
+        check("outdir: 解密模式仍优先主输出目录（与专用目录无关）",
+              pipe._out_dir_for(src) == main_dir, str(pipe._out_dir_for(src)))
+
+        st.search_output_dir = ""
+        st.output_dir = ""
+        check("outdir: 都没设 → 落到默认目录（不是 cwd）",
+              pipe._out_dir_for(None) == default_search_dir(),
+              str(pipe._out_dir_for(None)))
+
+        back = Settings.from_dict(Settings(search_output_dir=str(search_dir)).to_dict())
+        check("outdir: 专用目录随设置往返保存", back.search_output_dir == str(search_dir),
+              back.search_output_dir)
 
 
 def test_settings_roundtrip() -> None:
@@ -3251,6 +3468,8 @@ def main() -> int:
     test_acquire_by_name()
     test_query_sanitize()
     test_placeholder_artist()
+    test_input_audit()
+    test_search_output_dir()
     test_settings_roundtrip()
     test_portable_config_dir()
     test_source_link_upgrades()

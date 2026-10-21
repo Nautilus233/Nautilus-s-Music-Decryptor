@@ -13,7 +13,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog,
                                QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
                                QLabel, QLineEdit, QPlainTextEdit, QPushButton,
@@ -51,6 +50,7 @@ class NameSearchDialog(QDialog):
         self._retired: "list" = []
         self._rows: "dict[str, int]" = {}
         self._candidates: "list" = []
+        self._candidate_reference: "float | None" = None
         self._pick_row = -1
         self._log_lines: "list[tuple[str, str]]" = []
         self._hidden_details = 0
@@ -63,7 +63,8 @@ class NameSearchDialog(QDialog):
 
         tip = QLabel(
             "不需要加密文件：直接填歌名（一行一首＝批量），走与「开始解密」**相同**的备用音源链路。\n"
-            "歌名/歌手硬门槛、伴奏与改编版本过滤、时长核验、下载校验一律照旧 —— 只列出通过门槛的候选。")
+            "列出的候选都**已经过歌名/歌手硬门槛与版本过滤，并且解析出了直链** —— "
+            "下不了（无免费直链）或直链形态就是试听片段的候选不会出现在这里。")
         tip.setWordWrap(True)
         tip.setProperty("role", "muted")
         root.addWidget(tip)
@@ -81,12 +82,17 @@ class NameSearchDialog(QDialog):
 
         opts = QHBoxLayout()
         self.chk_auto = QCheckBox("自动挑选最优（取消勾选＝先列出候选让我挑）")
+        self.chk_auto.setToolTip("列出候选时只检索不下载；点「下载选中」直接下你选的那一条")
         self.chk_auto.setChecked(True)
         opts.addWidget(self.chk_auto)
         opts.addStretch(1)
         self.btn_out_dir = QPushButton("输出目录…")
+        self.btn_out_dir.setToolTip("给「以名找歌」单独指定一个目录（与「开始解密」的输出目录互不影响）")
         self.btn_open_out = QPushButton("打开输出目录")
+        self.btn_follow_main = QPushButton("跟随主设置")
+        self.btn_follow_main.setToolTip("清掉专用目录，改回：主输出目录 → 默认目录（按需按优）")
         opts.addWidget(self.btn_out_dir)
+        opts.addWidget(self.btn_follow_main)
         opts.addWidget(self.btn_open_out)
         root.addLayout(opts)
 
@@ -110,6 +116,7 @@ class NameSearchDialog(QDialog):
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setEnabled(False)
         self.btn_pick = QPushButton("下载选中")
+        self.btn_pick.setToolTip("直接下载你选中的这一条（不再重新检索；仍做校验与完整度门禁）")
         self.btn_pick.setEnabled(False)
         act.addWidget(self.btn_start)
         act.addWidget(self.btn_stop)
@@ -143,6 +150,7 @@ class NameSearchDialog(QDialog):
         self.btn_stop.clicked.connect(self.stop)
         self.btn_pick.clicked.connect(self.download_selected)
         self.btn_out_dir.clicked.connect(self._pick_out_dir)
+        self.btn_follow_main.clicked.connect(self._follow_main_out_dir)
         self.btn_open_out.clicked.connect(self._open_out_dir)
         self.chk_auto.toggled.connect(self._on_mode_toggled)
         self.chk_detail.toggled.connect(self._on_detail_toggled)
@@ -194,26 +202,46 @@ class NameSearchDialog(QDialog):
 
     # ---------------- 界面细节 ---------------- #
     def effective_out_dir(self) -> Path:
+        """「以名找歌」的落点，按需按优：专用目录 → 主输出目录 → 默认目录。"""
+        search_dir = (getattr(self.settings, "search_output_dir", "") or "").strip()
+        if search_dir:
+            return Path(search_dir).expanduser()
         configured = (self.settings.output_dir or "").strip()
         return Path(configured).expanduser() if configured else default_search_dir()
 
     def _refresh_out_hint(self) -> None:
+        search_dir = (getattr(self.settings, "search_output_dir", "") or "").strip()
         configured = (self.settings.output_dir or "").strip()
-        if configured:
-            self.out_hint.setText(f"输出目录：{configured}")
+        target = self.effective_out_dir()
+        if search_dir:
+            self.out_hint.setText(f"输出目录（本模式专用）：{target}")
+        elif configured:
+            self.out_hint.setText(f"输出目录：跟随主输出目录 {target}"
+                                  "（想分开就点「输出目录…」）")
         else:
-            self.out_hint.setText(f"输出目录：{default_search_dir()}（默认；可在“设置”或上方按钮里改）")
+            self.out_hint.setText(f"输出目录（默认）：{target}"
+                                  "（可在上方按钮里改成专用目录）")
 
     def _pick_out_dir(self) -> None:
         start = str(self.effective_out_dir())
-        chosen = QFileDialog.getExistingDirectory(self, "选择输出目录", start)
+        chosen = QFileDialog.getExistingDirectory(self, "选择「以名找歌」的输出目录", start)
         if chosen:
-            self.settings.output_dir = chosen
+            # 只写**本模式专用**的目录，不动「开始解密」的输出目录
+            self.settings.search_output_dir = chosen
             try:
                 self.config.save()
             except Exception:  # noqa: BLE001
                 pass
             self._refresh_out_hint()
+
+    def _follow_main_out_dir(self) -> None:
+        """清掉专用目录 → 回到"主输出目录 → 默认目录"。"""
+        self.settings.search_output_dir = ""
+        try:
+            self.config.save()
+        except Exception:  # noqa: BLE001
+            pass
+        self._refresh_out_hint()
 
     def _open_out_dir(self) -> None:
         target = self.effective_out_dir()
@@ -228,7 +256,8 @@ class NameSearchDialog(QDialog):
     def _on_mode_toggled(self, auto: bool) -> None:
         self.btn_pick.setEnabled(not auto and bool(self._candidates))
         if not auto:
-            self._log("· 已切换为「先列出候选」：只检索、不下载；选中一条后再点「下载选中」", "detail")
+            self._log("· 已切换为「先列出候选」：会逐条解析直链（不下载音频），"
+                      "**下不了的候选不列出**；选中一条再点「下载选中」", "detail")
 
     def _on_detail_toggled(self, checked: bool) -> None:
         if checked:
@@ -304,12 +333,14 @@ class NameSearchDialog(QDialog):
             return
         self._pick_row = row
         track = self._candidates[row]
-        artist = self.artist.text().strip()
-        self._log(f"· 已选：{track.source} “{track.title}”（{track.artist}）", "detail")
+        self._log(f"· 已选：{track.source} “{track.title}”（{track.artist}）—— 直接下载，不再重搜",
+                  "detail")
+        # 把列表里算好的"跨平台参考时长"带过去：下载后用**真实文件**做完整度门禁，
+        # 而不是重新检索再筛一遍（旧的"重新检索"路径会把用户看得见的候选判成未通过）。
         self._start_worker(NameSearchWorker(self.settings, cache_path=self.config.cache_path,
                                             mode=NameSearchWorker.MODE_PICK,
-                                            query=track.title or parse_lines(self.names.toPlainText())[0],
-                                            artist=artist, chosen=track, parent=self))
+                                            chosen=track, reference=self._candidate_reference,
+                                            parent=self))
 
     def stop(self) -> None:
         if self._worker is not None:
@@ -329,8 +360,9 @@ class NameSearchDialog(QDialog):
         self.status.setText("运行中…")
         worker.start()
 
-    def _on_candidates(self, query: str, tracks) -> None:
+    def _on_candidates(self, query: str, tracks, reference=None) -> None:
         self._candidates = list(tracks)
+        self._candidate_reference = reference
         self.table.setRowCount(0)
         self._rows.clear()
         for i, t in enumerate(self._candidates):
@@ -339,7 +371,14 @@ class NameSearchDialog(QDialog):
                              "时长": format_seconds(t.duration) if t.duration else "",
                              "码率": f"{t.bitrate}k" if t.bitrate else "",
                              "来源": t.source})
-        self._log(f"· 已列出 {len(self._candidates)} 个通过硬门槛的候选（按匹配度排序）", "detail")
+        ref = (f"，跨平台参考时长 {format_seconds(self._candidate_reference)}"
+               if self._candidate_reference else "")
+        if not self._candidates:
+            self._log("⚠ 没有可下载的候选：直链解析失败，或已全部被剔除（逐条原因见上方明细）")
+            self.status.setText("没有可下载的候选")
+        self._log(f"· 已列出 {len(self._candidates)} 个**可下载**候选"
+                  f"（已过硬门槛、已逐条解析直链、按匹配度排序{ref}）"
+                  "；点「下载选中」＝直接下这一条（不再重搜）", "detail")
         self.btn_pick.setEnabled(bool(self._candidates))
 
     def _on_progress(self, done: int, total: int) -> None:
@@ -347,12 +386,16 @@ class NameSearchDialog(QDialog):
 
     def _on_file_done(self, res) -> None:
         if self._pick_row >= 0 and str(res.path).startswith(SEARCH_PREFIX):
-            self._set_row(f"cand:{self._pick_row}",
-                          "已完成" if res.ok else "失败")
+            self._mark_picked("已完成" if res.ok else "失败")
         else:
             self._set_row(res.path, res.status,
                           **{"歌名": getattr(res, "name", ""),
                              "来源": res.source or ""})
+
+    def _mark_picked(self, tag: str) -> None:
+        """把"点名下载"的结果标回那一行 —— 否则用户点完看不到任何反馈。"""
+        if self._pick_row >= 0:
+            self._set_row(f"cand:{self._pick_row}", tag)
 
     def _on_completed(self, results) -> None:
         self._retire_worker(self._worker)
@@ -360,13 +403,19 @@ class NameSearchDialog(QDialog):
         self.btn_stop.setEnabled(False)
         ok = sum(1 for r in results if r.ok)
         fail = sum(1 for r in results if r.status == "failed")
-        self.status.setText(f"完成：成功 {ok} · 失败 {fail}")
+        if self._pick_row >= 0 and results:
+            # 「下载选中」走的是 completed（不是逐文件 file_done）→ 在这里把那一行标好
+            self._mark_picked("已完成" if results[0].ok else "失败")
+        skipped = sum(1 for r in results if r.status == "skipped")
+        self.status.setText(f"完成：成功 {ok} · 跳过 {skipped} · 失败 {fail}"
+                            if skipped else f"完成：成功 {ok} · 失败 {fail}")
         self._pick_row = -1
 
     def _on_failed(self, message: str) -> None:
         self._retire_worker(self._worker)
         self.btn_start.setEnabled(True)
         self.btn_stop.setEnabled(False)
-        self.status.setText("失败")
+        self.status.setText("失败（原因见日志；可换一条候选再试）")
+        self._mark_picked("失败")
         self._log(f"❌ {message}")
         self._pick_row = -1

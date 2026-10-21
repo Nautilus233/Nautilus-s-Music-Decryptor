@@ -6,7 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QRect, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import (QColor, QDesktopServices, QDragEnterEvent,
                            QDropEvent, QIcon)
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox,
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
                                QFileDialog, QFrame, QHBoxLayout, QHeaderView,
                                QLabel, QLineEdit, QMainWindow, QMessageBox,
                                QPlainTextEdit, QProgressBar, QPushButton,
@@ -219,9 +219,6 @@ class MainWindow(QMainWindow):
     def _available_geometry(self) -> QRect:
         """Work area of the current screen (taskbar excluded)."""
         return geometry.available_geometry(self)
-
-    def _frame_margins(self) -> "tuple[int, int, int, int]":
-        return geometry.frame_margins(self)
 
     def _fit_to_screen(self) -> None:
         geometry.fit(self, preferred=(1080, 760),

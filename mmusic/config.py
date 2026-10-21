@@ -90,6 +90,8 @@ class Settings:
     timeout: float = 12.0
     retries: int = 3
     min_bitrate: int = 128
+    #: 「以名找歌」专用输出目录（留空＝跟随 output_dir，再留空＝default_search_dir()）
+    search_output_dir: str = ""
     write_metadata: bool = True
     fetch_cover: bool = True
     overwrite: bool = False

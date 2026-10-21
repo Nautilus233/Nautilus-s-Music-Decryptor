@@ -3,9 +3,6 @@ from __future__ import annotations
 
 ACCENT = "#2f6bff"
 ACCENT_HOVER = "#4d81ff"
-OK = "#36c07a"
-WARN = "#f0a83c"
-ERR = "#ef5350"
 MUTED = "#8b93a7"
 
 QSS = f"""

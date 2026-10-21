@@ -8,7 +8,6 @@ from ..model import Track
 QUALITY_MP3 = "mp3"
 QUALITY_FLAC = "flac"
 QUALITY_WAV = "wav"
-VALID_QUALITIES = (QUALITY_MP3, QUALITY_FLAC, QUALITY_WAV)
 
 
 class SearchSource(ABC):

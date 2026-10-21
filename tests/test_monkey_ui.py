@@ -333,6 +333,7 @@ def phase_dialogs(cfg: AppConfig, win: MainWindow, app: QApplication,
             if not isinstance(parsed, list) or not all(isinstance(x, str) for x in parsed):
                 bad_values.append("以名找歌 parse_lines 类型异常")
             ns.btn_out_dir.click()
+            ns.btn_follow_main.click()
             ns.btn_pick.click()
             ns._refresh_out_hint()
             ns.close()

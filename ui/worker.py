@@ -61,7 +61,7 @@ class NameSearchWorker(QThread):
 
     * ``auto``：批量自动挑选最优（一键）；
     * ``list``：只检索、不下载，把候选发回界面供人工挑选；
-    * ``pick``：对用户点选的那一条执行"下载 + 全程校验"。
+    * ``pick``：对用户点选的那一条执行"**直接下载** + 校验 + 完整度门禁"（不再重搜）。
     """
 
     logged = Signal(str, str)
@@ -69,13 +69,13 @@ class NameSearchWorker(QThread):
     file_done = Signal(object)
     completed = Signal(list)
     failed = Signal(str)
-    candidates = Signal(str, object)      # (查询标签, list[Track])
+    candidates = Signal(str, object, object)   # (查询标签, list[Track], 跨平台参考时长)
 
     MODE_AUTO, MODE_LIST, MODE_PICK = "auto", "list", "pick"
 
     def __init__(self, settings, *, cache_path=None, mode: str = MODE_AUTO,
                  items=None, query: str = "", artist: str = "", chosen=None,
-                 parent=None) -> None:
+                 reference=None, parent=None) -> None:
         super().__init__(parent)
         self.settings = settings
         self.cache_path = cache_path
@@ -84,6 +84,7 @@ class NameSearchWorker(QThread):
         self.query = query
         self.artist = artist
         self.chosen = chosen
+        self.reference = reference      # 「先列候选」时带过来的跨平台参考时长
         self._pipe = None
 
     def run(self) -> None:  # noqa: D102
@@ -94,11 +95,13 @@ class NameSearchWorker(QThread):
         self._pipe = pipe
         try:
             if self.mode == self.MODE_LIST:
-                self.candidates.emit(self.query,
-                                     pipe.search_candidates(self.query, artist=self.artist))
+                tracks, reference = pipe.search_candidates_ex(self.query,
+                                                             artist=self.artist)
+                self.candidates.emit(self.query, tracks, reference)
             elif self.mode == self.MODE_PICK:
-                self.completed.emit([pipe.acquire(self.query, artist=self.artist,
-                                                  chosen=self.chosen)])
+                # 点名的那一条：直接下载，**不重新检索**
+                self.completed.emit([pipe.download_chosen(self.chosen,
+                                                          reference=self.reference)])
             else:
                 self.completed.emit(pipe.acquire_many(self.items))
         except Exception as exc:  # noqa: BLE001

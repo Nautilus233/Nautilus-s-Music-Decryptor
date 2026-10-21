@@ -102,7 +102,6 @@ _LIB_NAMES = ("avutil", "avcodec", "avformat", "swresample")
 _AUDIO = 1
 _FRAME_NBSAMPLES, _FRAME_FORMAT = 112, 116          # AVFrame 前段（跨版本稳定）
 _PKT_DATA, _PKT_SIZE = 24, 32                       # AVPacket 前段（跨版本稳定）
-_LINEAR = ctypes.c_void_p
 
 
 class AVOption(ctypes.Structure):
@@ -199,10 +198,6 @@ class _Engine:
     def _i32(self, addr: int, off: int) -> "int | None":
         b = self._read(addr + off, 4)
         return ctypes.c_int32.from_buffer_copy(b).value if b else None
-
-    def _u64(self, addr: int, off: int) -> "int | None":
-        b = self._read(addr + off, 8)
-        return ctypes.c_uint64.from_buffer_copy(b).value if b else None
 
     def _ptr(self, addr: int, off: int) -> "int | None":
         b = self._read(addr + off, 8)

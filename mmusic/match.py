@@ -185,12 +185,38 @@ def split_originals(tracks: "Sequence[Track]") -> "tuple[list[Track], list[tuple
 # --------------------------------------------------------------------- #
 _NUM_TOKEN = r"(?:\d{1,3}|[一二三四五六七八九十百零〇两]{1,3})"
 _INVISIBLE = re.compile(r"[\u200b-\u200f\u202a-\u202e\ufeff\u00ad]")
+# 圈号/带圈数字（①-⑳、❶-❿、㉑ 等）—— 当列表序号处理，且必须在 NFKC **之前**下手
+_ENCLOSED_LEAD = re.compile(r"^[\s\u3000]*[\u2460-\u24ff\u2776-\u2793\u3220-\u3239"
+                            r"\u3248-\u324f\u3251-\u325f]+[\s\u3000]*")
+_CJK_ONLY = re.compile(r"^[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]+$")
+
+
+def merge_lone_cjk(text: str) -> str:
+    """把 `夜 曲` / `周 杰伦` 这类"被空格切散的汉字"合回去。
+
+    只合并**左侧是单个汉字**的相邻片（以及两侧都只有一个汉字的情形）——
+    这样 `夜曲 周杰伦`（歌名 + 歌手两个词）的边界不会被误并成 `夜曲周杰伦`，
+    拉丁串里的空格（`Hotel California`）也照样保留。
+    """
+    if " " not in text:
+        return text
+    merged: "list[str]" = []
+    for token in text.split(" "):
+        if (merged and token and len(merged[-1]) == 1
+                and _CJK_ONLY.match(merged[-1]) and _CJK_ONLY.match(token)):
+            merged[-1] += token
+        else:
+            merged.append(token)
+    return " ".join(merged)
 # 整串被书名号/引号包起来：「《夜曲》」「"夜曲"」
 _WRAPPED = re.compile(r"^[\s\u3000]*[《「『“\"']\s*(.+?)\s*[》」』”\"']\s*$")
 # 前缀：括号序号 [1] （一） 【3】；裸序号 1. 2、 三. ；第 3 首；零填充 01␣；装饰符号
 _LEAD_BRACKET_NUM = re.compile(r"^[\s\u3000]*[（(\[{【]\s*" + _NUM_TOKEN
                                + r"\s*[)）\]}】]\s*[.．、,，:：\-–—]?\s*")
-_LEAD_NUM = re.compile(r"^[\s\u3000]*" + _NUM_TOKEN + r"\s*[.．、,，)）:：\-–—]\s*")
+_LEAD_NUM = re.compile(r"^[\s\u3000]*" + _NUM_TOKEN + r"\s*[.．、,，)），:：；;\-–—。]\s*")
+_LEAD_ROMAN = re.compile(r"^[\s\u3000]*(?:[IVXLCDM]{1,5}|[iIlL])\s*[.．、,，)）:：\-–—]+\s*")
+_LEAD_DIGIT_SPACE = re.compile(r"^[\s\u3000]*\d[\s\u3000]+(?=[\u3400-\u9fff\uf900-\ufaff"
+                               r"\u3040-\u30ff\uac00-\ud7af])")
 _LEAD_TRACK = re.compile(r"^[\s\u3000]*第\s*" + _NUM_TOKEN
                          + r"\s*[首曲个集章]\s*[.．、:：\-–—]?\s*")
 _LEAD_ZERO_PADDED = re.compile(r"^[\s\u3000]*0\d{1,2}[\s\u3000]+")
@@ -198,15 +224,20 @@ _LEAD_BULLET = re.compile(r"^[\s\u3000]*[•·※☆★◇◆○●■□▲▼�
 # 行首「说明前缀」（点播：/歌名：/推荐 - …）。**白名单**制，只认明确是"标签"的词。
 # 「带标点」就能认的标签（含单字，如 `求：`；也含 `歌手：`/`原唱：` 这种"标签后跟内容"的）
 _LABEL_LIST = ("点播", "点歌", "求歌", "求播", "点一首", "来一首", "歌名", "曲名", "歌曲",
-               "歌单", "收听", "播放", "播送", "送上", "推荐", "分享", "听歌", "试听",
-               "试唱", "原唱", "原唱歌手", "演唱", "演唱者", "歌手", "求", "听", "播", "送", "选")
+               "歌曲名", "曲目", "曲目名", "歌单", "收听", "播放", "播送", "送上", "推荐",
+               "分享", "听歌", "试听", "试唱", "原唱", "原唱歌手", "演唱", "演唱者", "歌手",
+               "求", "听", "播", "送", "选")
 _LABEL_SET = frozenset(_LABEL_LIST)
 _LABEL_WORDS = "(?:" + "|".join(_LABEL_LIST) + ")"
 # 「只带空格」也认的标签：只放**多字且不会跟歌名混**的词。
 # 刻意不含 原唱/演唱/歌手 —— `原唱 周杰伦` 里那串是歌手，不能当标签删掉。
 _LABEL_SPACE_WORDS = ("(?:" + "|".join(("点播", "点歌", "求歌", "求播", "点一首", "来一首",
-                                       "歌名", "曲名", "歌曲", "歌单", "收听", "播放",
-                                       "播送", "送上", "推荐", "分享", "听歌", "试听")) + ")")
+                                       "歌名", "曲名", "歌曲", "歌曲名", "曲目", "曲目名",
+                                       "歌单", "收听", "播放", "播送", "送上", "推荐",
+                                       "分享", "听歌", "试听",
+                                       # 单字标签只在"后面还有内容"时生效（`求 夜曲`）；
+                                       # `求` 单独出现时由"绝不擦成空串"兜底成原文
+                                       "求", "听", "播", "送", "选")) + ")")
 # ① 带标点：连单字标签也认（`求：夜曲`）—— 标点本身就是"这是标签"的信号
 _LEAD_LABEL_PUNCT = re.compile(r"^[\s\u3000]*" + _LABEL_WORDS
                                + r"\s*[：:、,，;；\-–—.。!！]+\s*")
@@ -247,7 +278,8 @@ _MIDDOT_SPLIT = re.compile(r"\s*[·・•‧]\s*")
 
 _LEAD_ALL = (_LEAD_BRACKET_NUM, _LEAD_BRACKET_LABEL, _LEAD_LABEL_PUNCT,
              _LEAD_LABEL_SPACE, _LEAD_HASH_NUM, _LEAD_NO_NUM, _LEAD_EN_LABEL,
-             _LEAD_NUM, _LEAD_TRACK, _LEAD_ZERO_PADDED, _LEAD_BULLET)
+             _LEAD_ROMAN, _LEAD_NUM, _LEAD_TRACK, _LEAD_ZERO_PADDED,
+             _LEAD_DIGIT_SPACE, _LEAD_BULLET)
 _TRAIL_ALL = (_TRAIL_BRACKET_NUM, _TRAIL_DASH_NUM, _TRAIL_BULLET, _TRAIL_SEP, _TRAIL_EXT)
 
 
@@ -286,7 +318,9 @@ def sanitize_query(text: str) -> "tuple[str, str]":
     是否值得拿去搜索；需要"绝不返回空串"的场景请用 :func:`sanitize_query_text`。
     """
     original = (text or "")
-    out = _INVISIBLE.sub("", unicodedata.normalize("NFKC", original))
+    out = _INVISIBLE.sub("", original)
+    out = _ENCLOSED_LEAD.sub("", out)          # ① 要在 NFKC 之前认
+    out = unicodedata.normalize("NFKC", out)
     out = out.replace("\u3000", " ")
 
     out = _TRAIL_EXT.sub("", out)      # 先剥掉粘贴文件名带的扩展名，再解析歌手提示
@@ -301,6 +335,13 @@ def sanitize_query(text: str) -> "tuple[str, str]":
     out = _MIDDOT_SPLIT.sub(" - ", out)        # 周杰伦·夜曲   → 周杰伦 - 夜曲
     out = _clean_chunk(out)
 
+    # 空格分隔的标签词也丢掉（`夜曲 点播` / `求 夜曲`）—— 前提是还剩别的内容
+    tokens = [t for t in out.split(" ") if t]
+    kept_tokens = [t for t in tokens if t not in _LABEL_SET]
+    if kept_tokens and len(kept_tokens) < len(tokens):
+        out = " ".join(kept_tokens)
+    out = merge_lone_cjk(out)                   # `夜 曲` → `夜曲`（不动 `夜曲 周杰伦` 的边界）
+
     # 逐段再清一遍：序号可能落在分隔符之后（周杰伦 - 1. 夜曲），
     # 整段就是说明标签的（夜曲 - 点播）直接丢掉。
     parts = [p for p in re.split(r"\s*[-–—]\s*", out) if p.strip()]
@@ -312,6 +353,8 @@ def sanitize_query(text: str) -> "tuple[str, str]":
                 kept.append(piece)
         out = " - ".join(kept) if kept else ""
 
+    # 收尾再清一次：丢掉整段标签后可能留下悬空分隔符（`夜曲 - 点播` → `夜曲 -`）
+    out = _clean_chunk(out)
     return out.strip(), hint
 
 
@@ -486,6 +529,29 @@ _CJK_RE = re.compile(r"[\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af]")
 _LATIN_RE = re.compile(r"[A-Za-z]")
 
 
+_WORD_CHARS = "0-9a-z\u3400-\u9fff\uf900-\ufaff\u3040-\u30ff\uac00-\ud7af"
+
+
+def _artist_contains(hay: str, needle: str) -> bool:
+    """``needle`` 是否作为**独立的歌手名**出现在 ``hay`` 里。
+
+    为什么需要边界：原来的 ``needle in hay`` 会把单字母歌手名当子串命中 ——
+    实测查询「R - Roselia」时，候选「arkinz - roselia」里的 ``arkinz`` **含字母 r**，
+    于是歌手门槛按 0.85 放行，最后下到了一条与该曲无关的 CC 上传物。
+
+    规则：**中文名按子串**（「周杰伦」出现在「周杰伦精选」里是合意的）；
+    **拉丁名必须词级出现**（前后是非字母数字，或串首串尾），
+    这样 `r` ⊄ `arkinz`、`va` ⊄ `various`，而 `jj` ⊂ `jj lin`、`jay chou` ⊂ `周杰伦 jay chou` 照常命中。
+    """
+    if not hay or not needle or needle not in hay:
+        return False
+    if _CJK_RE.search(needle):
+        return True
+    pattern = (r"(?:^|[^" + _WORD_CHARS + r"])" + re.escape(needle)
+               + r"(?:$|[^" + _WORD_CHARS + r"])")
+    return re.search(pattern, hay) is not None
+
+
 def _script_class(text: str) -> str:
     cjk, latin = bool(_CJK_RE.search(text)), bool(_LATIN_RE.search(text))
     if cjk and latin:
@@ -532,7 +598,7 @@ def artist_match_score(readings: "Sequence[tuple[str, str]]", track: Track) -> f
         # 同名翻唱（歌名还带修饰）就被放行了。现在：确认不了，就不下载。
         if _artist_tokens(artist) & cand_tokens:
             best = max(best, 0.85)         # 多歌手串中的同一个人
-        elif want in cand_norm or cand_norm in want:
+        elif _artist_contains(cand_norm, want) or _artist_contains(want, cand_norm):
             best = max(best, 0.85)
         else:
             best = max(best, similarity(artist, track.artist))

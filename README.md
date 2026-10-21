@@ -93,9 +93,14 @@ python -m pip install -r requirements.txt
 
 * **一行一首**（可直接粘贴一串点播清单）＝ 批量；「歌手」可留空，填了更准；
 * 默认勾选 **「自动挑选最优」**：一键下"匹配度最高、且通过全部硬门槛与时长核验"的那条；
-* 取消勾选 → **先列出候选**（只检索、不下载），列表里都是**已经过歌名/歌手硬门槛**的结果
-  （伴奏/改编版已被排除），你点一条再点「下载选中」，同样会跑完整的下载校验与完整度门禁；
-* 输出目录沿用主界面设置；**没设过**则落到 `%USERPROFILE%\Music\MusicDecryptor`（绝不落到 exe 所在目录）。
+* 取消勾选 → **先列出候选**：列表里都是**已经过歌名/歌手硬门槛**（伴奏/改编版已排除）
+  **并且已逐条解析出直链**的候选 —— **下不了的（如"该曲目无免费直链"）与直链形态就是试听/铃声的
+  不会出现在列表里**（列出来却下不了等于没列）；点一条再点「下载选中」= **直接下这一条**（不再重新检索），
+  下载后用**真实文件**做校验与完整度门禁，并把结果标回那一行（已完成 / 失败+原因见日志）；
+* **输出目录可单独指定**（与「开始解密」分开）：点「输出目录…」给本模式设**专用目录**；
+  点「跟随主设置」清掉它。生效顺序（按需按优）：**专用目录 → 主输出目录 → 默认目录**
+  （`%USERPROFILE%\Music\MusicDecryptor`，绝不落到 exe 所在目录）。界面上一行会写明当前用的是哪一种。
+  命令行对应 `--search-output`。
 * **列表序号/符号自动屏蔽**：`1.` `2、` `三、` `（一）` `【3】` `第 3 首` `01` `•` `★`、`《》` 包裹、
   零宽字符…都会在匹配前被清掉 —— 直接从点播清单/聊天里**整行粘进来**就能用
   （实测 `1. 周杰伦 - 夜曲` → 命中 `周杰伦 - 夜曲`；不清洗的话歌名相似度只有 0.57，低于 0.60 硬门槛，会误报"没找到"）。
@@ -120,6 +125,7 @@ python main.py --cli a.ncm --output D:\out --quality flac
 python main.py --check-qt          # 自检：确认 Qt 能加载（界面起不来时先跑这个）
 python main.py --check-ui          # 自检：主窗口与设置弹窗是否在本机屏幕上完整可见
 python main.py --sources-report    # 打印生效的音源清单 + 台账健康统计
+python main.py --check-transcode   # 自检：转码引擎（FFmpeg 库）能加载并转出文件
 python main.py --cli --query "周杰伦 - 夜曲"     # 以名找歌：不需要输入文件（--query 可重复）
 python main.py --cli --query-file 歌单.txt       # 以名找歌：从文件读歌名（每行一条）
 python main.py --selftest          # 运行自检
@@ -146,7 +152,7 @@ python main.py song.ncm --auto     # 启动后立即开始
 ```powershell
 python -m pip install pillow pyinstaller
 powershell -ExecutionPolicy Bypass -File build\build.ps1
-# 产物： dist\MusicDecryptor.exe （自定义图标，Windows 10+ 免安装；当前约 61.5 MB）
+# 产物： dist\MusicDecryptor.exe （自定义图标，Windows 10+ 免安装；当前约 37 MB）
 ```
 
 > 其中约 14 MB 是「目标音质」转码所需的 **4 个 FFmpeg 库**（复用 PySide6 自带，不额外下载或打包 `ffmpeg.exe`）。
@@ -157,7 +163,7 @@ powershell -ExecutionPolicy Bypass -File build\build.ps1
 ## 测试
 
 ```powershell
-python tests\selftest.py        # 388 项离线用例（合成容器端到端 / 转码引擎 / ekey 获取 / 完整度门禁 …）
+python tests\selftest.py        # 403 项离线用例（合成容器端到端 / 转码引擎 / ekey 获取 / 完整度门禁 …）
 python tests\selftest.py --live # 追加真实备用下载链路验证（联网）
 python tests\test_gui.py        # Qt 离屏冒烟（含“拖入即自动开始”）
 python tests\test_ui_fit.py     # 真实屏幕自适应（主窗口 + 设置弹窗）
@@ -169,6 +175,7 @@ python tests\test_monkey_ui.py --iters 1500 --rounds 5 --seed 7   # 重负载
 # 冻结产物同样可自检：
 dist\MusicDecryptor.exe --check-qt
 dist\MusicDecryptor.exe --check-ui
+dist\MusicDecryptor.exe --check-transcode # 转码引擎能在冻结产物里加载并转出文件
 dist\MusicDecryptor.exe --check-worker   # 任务线程生命周期（跑任务→关窗→退出不崩）
 dist\MusicDecryptor.exe --sources-report
 ```
@@ -236,6 +243,19 @@ main.py            入口（GUI / --cli / --check-* / --selftest / --sources-rep
 
 ## 更新记录
 
+- **v1.0.24（输入解析审计 + 独立输出目录 + 打包裁剪 −40%）**
+  - **打包体积 61.5 MB → 约 37 MB**（未压缩二进制 145 MB → 84 MB）：去掉 Qt hook 重复带的 FFmpeg
+    四件套、Qt 用不到的模块（Qml/Quick/OpenGL/Pdf/Network/Svg/DBus…）与软件 OpenGL 回退库
+    `opengl32sw.dll`（20.6 MB，没有任何 DLL 静态导入它）；插件只留 qwindows/qoffscreen/qminimal/
+    qmodernwindowsstyle/qico。**新增冻结门禁 `--check-transcode`** 证明裁剪后引擎照常工作
+    （实测：真 `.mgg` → 解密 → OGG→MP3 成功，299.6s），启动耗时 1.43s → **1.19s**。
+  - **输入解析审计收口**：见下方 v1.0.23 条目里的清洗/筛选；本轮把审计固化成 57 条语料 + 101 例 fuzz。
+  - **「以名找歌」独立输出目录**：专用 → 主 → 默认（按需按优），CLI `--search-output`。
+  - **死代码清理**：删掉无人引用的 `theme.OK/WARN/ERR`、`main_window._frame_margins`、
+    `transcode._u64/_LINEAR`、`sniff._PLAIN_EXTS`、`search/base.VALID_QUALITIES`、
+    `index.note_query/note_attempt`（已被 `note_search` 覆盖）与若干未使用导入。
+  - **文档编号修正**：DESIGN 里重复的 §3.4 与插错位置的 §3.10。
+
 - **v1.0.23（以名找歌 + 输入清洗/筛选）**
   - 新增主界面按钮 **「以名找歌…」**：填歌名（一行一首＝批量）即可直接去备用音源取歌，
     与「开始解密」用的是**同一条**选源链路（歌名/歌手硬门槛、伴奏与改编过滤、华语预匹配、
@@ -259,6 +279,21 @@ main.py            入口（GUI / --cli / --check-* / --selftest / --sources-rep
     直接粘文件名带的 `.mp3/.mflac` 扩展名、以及 `原唱：周杰伦`/`演唱：周杰伦` 里**抠出歌手当提示**。
   - **筛选**：批量清单里"只有序号或说明前缀"的行（`1.`、`求：`、`点播`）直接跳过并如实标注，
     不再为一堆空行白跑音源检索。
+  - **`--query` 可重复**；列表阶段会逐条解析直链并剔除下不了/疑似片段的候选（每条一次请求，封顶 8 条），
+    "无免费直链"之类会写进明细日志而不是留在可选列表里。
+  - **「以名找歌」输出目录可独立**：专用目录 → 主输出目录 → 默认目录（按需按优），
+    CLI 对应 `--search-output`；解密模式的落点不受影响。
+  - **输入解析最后一轮**：圈号（①）/罗马数字（I. II、）/单数字+空格（`1 夜曲`）/句号分隔（`1。夜曲`）/
+    被切散的汉字（`周 杰伦`）/尾部说明标签（`夜曲 点播`）/更多标签词（`歌曲名：`/`曲目：`/`求 `）
+    全部清洗；**取消了我自己引入的一个过度合并**（`夜曲 周杰伦` 曾被粘成 `夜曲周杰伦`）。
+  - **审计固化成回归**：57 条"干扰输入 × 命中/诱饵"语料 + 101 例 fuzz（畸形输入不得抛异常）。
+  - **修复歌手"包含"判定的子串误判**：`R - Roselia` 曾因候选歌手 `arkinz` **含字母 r** 被按 0.85 放行，
+    下到一条与曲目无关的 CC 上传物 —— 现在**中文名按子串、拉丁名必须词级出现**
+    （`r` ⊄ `arkinz`、`va` ⊄ `various`，而 `jj` ⊂ `jj lin`、`jay chou` ⊂ `周杰伦 jay chou` 照常命中）。
+  - **修复「下载选中」的语义**（用户实测反馈）：以前点选会**重新跑一遍检索**再按新算出的参考时长筛，
+    结果"看得见的候选"反被判"未通过核验"（它只是没排上探测名额、没测到时长）。现在改成
+    **点名即直下**：不重搜，下载后用真实文件过校验与完整度门禁（参考时长由列表带过来），
+    真的不合格（试听片段/坏文件）照样如实拒绝并说明原因；结果会标回那一行。
   - **刻意不猜**：`歌手：周杰伦 夜曲` 这种"标签后既跟歌手又跟歌名"的歧义写法不做推断（只认括号内与行尾两种无歧义形式）。
   - **堵掉一个漏口**（本轮实测发现）：清洗前的原读法作为安全网保留时，单段原文会给出**不含歌手**的读法，
     它能靠"候选项标题里含歌手名"过标题门槛、而歌手门槛因读法没歌手直接放行 —— 实测下到过

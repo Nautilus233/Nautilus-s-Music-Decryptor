@@ -56,9 +56,14 @@ python tests/test_robustness.py         # 边界 / 负面 / fuzz / 故障注入 
 python tests/test_monkey_ui.py          # 猴子测试：随机乱点全部控件
 dist\MusicDecryptor.exe --check-qt      # 冻结后 Qt 可加载（无对话框）
 dist\MusicDecryptor.exe --check-ui      # 冻结后界面/弹窗不越界
+dist\MusicDecryptor.exe --check-transcode # 冻结后转码引擎能加载并转出文件（体积裁剪后必须）
 dist\MusicDecryptor.exe --check-worker  # 冻结后任务线程生命周期（跑任务→关窗→退出不崩）
 dist\MusicDecryptor.exe --sources-report # 音源清单与台账健康（信息性，但须 exit 0）
 ```
+
+`--check-transcode` 是 2026-10-22 补的：打包裁剪掉了 Qt 的 Qml/Quick/PDF/OpenGL/Svg
+等未使用模块 **以及 opengl32sw.dll**，并把重复的 FFmpeg 四件套去重 —— 这条门禁专门证明
+"裁剪之后转码引擎在冻结产物里仍然能加载、能转出文件"（源码能跑 ≠ exe 能跑）。
 
 后三条是 2026-10-20 补上的，**各自都抓到过真实缺陷**，不是凑数：
 
@@ -82,4 +87,17 @@ dist\MusicDecryptor.exe --sources-report # 音源清单与台账健康（信息�
 - 提交前扫一眼 `git status`：**仓库根不得出现测试垃圾目录**（猴子测试会把"输出目录"填成
   `设置` / `🎵🎤` 这类脏值；`tests/test_monkey_ui.py` 已用 `os.chdir` 隔离并自带"零新增"自检，
   发现残留就说明隔离失效，先修测试再提交）。
+
+## 7. Release 发布规则（用户 2026-10-21 明确）
+
+> 用户原话：**"以后也这样，这才是软件的预期发布方式，按需设置 pre-release 和 release 而并非只有一个 release。"**
+
+- **多个 `release`（正式版）可以并存**，这是预期形态：新正式版发布后，**不要**把上一个稳定版
+  改成 pre-release —— 它是并列的稳定回退点（例：`v1.0.23` 与 `v1.0.22` 同为 release）。
+- **何时用 pre-release**：`-dev*` 迭代版、或明显还在迭代/已知有缺口、**不打算让人当稳定版使用**的版本。
+  何时用 release：走完 §5 全部门禁、可作为稳定回退点的版本。
+- **Latest 归属**：GitHub 按发布时间取最新的非 pre-release，所以新正式版发完 Latest 自然归它；
+  改任何版本的 `prerelease` 标记后，都要复核 `GET /releases/latest` 仍指向预期版本。
+- **改动范围**：只改 `prerelease` / `draft` 时**不要**重建 tag、不要动资产（除非用户要求刷新资产）。
+- 发布/改标记属于对外可见操作：**仍受"当次消息明确要求才做"的约束**（§6）。
 

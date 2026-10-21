@@ -7,13 +7,12 @@ from pathlib import Path
 
 from .constants import (AUDIO_MAGICS, M4A_FTYP, NCM_MAGIC, QMC_EXT_MAP,
                         QMC_TAG_MUSICEX, QMC_TAG_QTAG, QMC_TAG_STAG, QMC_V2_EXTS)
-from .crypto.musicex import (find_ekey_path, find_ekey_text,
+from .crypto.musicex import (find_ekey_path,
                              parse_tail as parse_musicex_tail)
 from .ekeys import VALID_SECONDS
 
 __all__ = ["FormatInfo", "looks_like_audio", "sniff", "sniff_path"]
 
-_PLAIN_EXTS = {"mp3", "flac", "ogg", "m4a", "aac", "wav", "ape", "wma", "dff", "mmp4"}
 
 
 def _ekey_is_fresh(path: "str | Path") -> bool:

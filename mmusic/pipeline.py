@@ -83,6 +83,7 @@ MIN_OPEN_LIBRARY_BYTES = 1_000_000
 #: 只有当其它来源都测不出可用候选时，才用独立额度回头补测它。
 _LAST_RESORT_SOURCES = frozenset({"kugou"})
 MAX_PROBES = 2             # 最多探测几个候选（静默的置信度操作，成本必须封顶）
+MAX_LIST_CANDIDATES = 8    # 「先列候选」最多解析/展示几条（每条一次"取直链"请求，必须封顶）
 MAX_PROBES_WIDE = 4        # 平台标注互相矛盾时多测几个：只测前 2 个可能全是缩短版
 PROBE_TIMEOUT = 8.0        # 探测用更短超时：慢就跳过，绝不拖慢主流程
 PROBE_BYTES = 256 * 1024   # 探测只取文件头，绝不整文件下载
@@ -339,12 +340,20 @@ class Pipeline:
         :func:`default_search_dir`，同样绝不落到进程工作目录。
         """
         configured = (self.settings.output_dir or "").strip()
-        if configured:
-            target = Path(configured).expanduser()
-        elif src is not None:
-            target = Path(src).resolve().parent
+        if src is not None:
+            target = Path(configured).expanduser() if configured else Path(src).resolve().parent
         else:
-            target = default_search_dir()
+            # 「以名找歌」的落点，按需按优：**专用目录 → 主输出目录 → 默认目录**
+            search_dir = (getattr(self.settings, "search_output_dir", "") or "").strip()
+            if search_dir:
+                target = Path(search_dir).expanduser()
+                self._log(f"  · 输出目录（以名找歌专用）：{target}")
+            elif configured:
+                target = Path(configured).expanduser()
+                self._log(f"  · 输出目录：跟随主输出目录 {target}")
+            else:
+                target = default_search_dir()
+                self._log(f"  · 输出目录（默认）：{target}")
         try:
             target.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -674,6 +683,11 @@ class Pipeline:
             for title, _artist in list(readings) or [(cleaned or seed, "")]:
                 if title and title != hint and (title, hint) not in readings:
                     readings.append((title, hint))
+            # 既然已经知道歌手是谁，"无歌手"的读法就只是**更弱**的版本 → 去掉，
+            # 否则别的演唱者（或同名翻唱）能顺着它绕过歌手硬门槛（实测 7 例诱饵误过）。
+            with_artist = [r for r in readings if (r[1] or "").strip()]
+            if with_artist:
+                readings = with_artist
         if not readings:
             readings = [(cleaned or seed, "")]
         # 版本标记按**清洗后**的文本判定：`试听：夜曲` 里的「试听」是说明前缀，
@@ -702,26 +716,125 @@ class Pipeline:
         给「以名找歌」的人工挑选用。硬门槛一个都不放松 —— 用户只在**已经过门槛**的
         候选里选，所以人工挑选不会削弱「歌名 + 歌手双重校验」这条红线。
         """
+        return self.search_candidates_ex(name, artist=artist)[0]
+
+    def search_candidates_ex(self, name: str, *, artist: str = "") -> "tuple[list[Track], float | None]":
+        """同 :meth:`search_candidates`，另外给出**跨平台参考时长**。
+
+        与"只检索"的差别：这里**会为每条候选解析一次直链**（一条一个请求，封顶
+        :data:`MAX_LIST_CANDIDATES`），因为**列出来却下不了等于没列**（用户 2026-10-21 反馈：
+        "酷狗该曲目无免费直链"的候选出现在可选列表里没有任何价值）。解析失败、直链形态就是
+        试听/铃声、标注时长就低于下限的候选一律**剔除并在日志里写明原因**。
+
+        参考时长只用平台标注算（``_plausible_max``），不探测音频、不下载音频；拿它去校验
+        用户点选的那一条（见 :meth:`download_chosen`），这样"点名下载"不必再重跑一遍检索。
+        """
         seed, readings, query, requested = self._seed_for(name, artist)
-        return self._collect_pool(seed, readings, query, requested,
+        pool = self._collect_pool(seed, readings, query, requested,
                                   consensus=self._nameless_artist(readings))
+        strong = [t for t in pool if t.duration and t.score >= EARLY_STOP_SCORE]
+        declared = [t.duration for t in (strong or [t for t in pool if t.duration])]
+        reference = _plausible_max(declared)
+
+        listed: "list[Track]" = []
+        dropped = 0
+        for track in pool:
+            if len(listed) >= MAX_LIST_CANDIDATES:
+                break
+            if track.duration and track.duration < MIN_TRACK_SECONDS:
+                dropped += 1
+                self._log(f"  · 已剔除 {track.source} “{track.title}”：平台标注仅 "
+                          f"{format_seconds(track.duration)}（疑似片段/铃声）")
+                continue
+            adapter = self._adapters.get(track.source)
+            if adapter is None:
+                dropped += 1
+                continue
+            try:
+                if not track.url:
+                    track = adapter.resolve(track, quality=self.settings.quality)
+                if not track.url:
+                    raise NetworkError("音源未返回直链")
+            except MusicDecryptorError as exc:
+                dropped += 1
+                self._log(f"  · 已剔除无法解析直链的候选：{track.source} “{track.title}”"
+                          f"（{exc.message}）")
+                continue
+            if getattr(track, "short_asset", False):
+                dropped += 1
+                self._log(f"  · 已剔除疑似试听/铃声的候选：{track.source} “{track.title}”"
+                          "（直链形态判定）")
+                continue
+            listed.append(track)
+        self._log(f"  · 可下载候选 {len(listed)} 个（已逐条解析直链"
+                  + (f"，剔除 {dropped} 个下不了/疑似片段的" if dropped else "") + "）")
+        return listed, reference
 
     def acquire(self, name: str, *, artist: str = "", chosen: "Track | None" = None,
-                note: str = "") -> JobResult:
+                reference: "float | None" = None, note: str = "") -> JobResult:
         """以名取资源：不依赖任何输入文件，走与备用链路**完全相同**的选源逻辑。
 
         ``chosen=None`` → 自动选最优（一键）；给定 ``chosen`` 时锁定该候选，
         仍要过时长核验与完整度门禁，失败如实报错（绝不偷偷换成别的版本）。
         """
+        label = f"{artist} - {name}" if (artist and name) else (name or artist)
+        if chosen is not None:
+            # 用户点名的那一条：直接下，**不再检索**（见 download_chosen 的说明）
+            return self.download_chosen(chosen, reference=reference, label=label,
+                                        note=note)
         seed, readings, query, requested = self._seed_for(name, artist)
         self._log(f"🔎 以名找歌：{query}"
                   + (f"（指定歌手：{artist}）" if artist else ""))
         consensus = self._nameless_artist(readings)
         pool = self._collect_pool(seed, readings, query, requested, consensus=consensus)
-        label = f"{artist} - {name}" if (artist and name) else (name or artist)
         return self._take_from_pool(pool, src=None, digest="", note=note, label=label,
-                                    chosen=chosen, exclusive=chosen is not None,
                                     consensus=consensus)
+
+    def download_chosen(self, track: Track, *, reference: "float | None" = None,
+                        label: str = "", note: str = "") -> JobResult:
+        """下载**用户点名的那一条**：不再检索、不再重新比对跨平台时长。
+
+        为什么这样设计（2026-10-21 用户反馈）：候选列表已经过全部硬门槛，用户点
+        「下载选中」期望的就是"就下这条"。旧实现会**重新跑一遍检索**再按新算出来的参考
+        时长筛一遍 —— 既多花一轮请求，又因为"没排上探测名额 → ``actual_duration`` 为空
+        → 不在 verified 里"把用户看得见的候选判成"未通过核验"。
+
+        现在的语义：解析直链 → 下载 → **用下载回来的真实文件**做校验与完整度门禁
+        （参考时长由列表带过来；没有参考就退化成"最短时长 + 文件头/码率"兜底）。
+        真的不合格（试听片段、坏文件）照样如实拒绝，只是不再拿"测不出时长"当理由。
+        """
+        display = label or f"{track.artist} - {track.title}".strip(" -")
+        adapter = self._adapters.get(track.source)
+        if adapter is None:
+            raise SearchNoResultError("该候选的音源当前不可用，请换一条",
+                                      detail=track.source)
+        self._log(f"⬇ 点名下载：{track.source} “{track.title}”（{track.artist}）")
+        if not track.url:
+            track = adapter.resolve(track, quality=self.settings.quality)
+        try:
+            data = self._download(track)
+        except MusicDecryptorError:
+            # 列表里解析出来的直链可能已过期 → 重新解析一次（仍然**不重新检索**）
+            self._log("  · 直链可能已过期，重新解析一次")
+            track = adapter.resolve(track, quality=self.settings.quality)
+            data = self._download(track)
+
+        v = validate(data, track.ext, expected_bitrate=track.bitrate,
+                     duration=track.duration, min_bitrate=self.settings.min_bitrate)
+        if not v.ok:
+            raise SearchNoResultError(f"你选择的候选校验未通过：{v.reason}",
+                                      detail=f"{track.source} “{track.title}”")
+        tolerance = max(TOL_ABS, TOL_REL * reference) if reference else TOL_ABS
+        ok_len, why_len, got_secs = check_completeness(
+            data, reference=reference or 0.0, tolerance=tolerance,
+            min_seconds=MIN_TRACK_SECONDS, measured=track.actual_duration or 0.0,
+            over_tolerance=_over_tolerance(reference))
+        if not ok_len:
+            raise SearchNoResultError(f"你选择的候选未通过完整度门禁：{why_len}",
+                                      detail=f"{track.source} “{track.title}”")
+        if got_secs:
+            track.actual_duration = track.actual_duration or got_secs
+        return self._write_downloaded(None, track, data, v, "", note=note, label=display)
 
     def acquire_many(self, items) -> "list[JobResult]":
         """批量以名找歌。``items`` 可以是 "歌名"、"歌手 - 歌名" 或 ``(歌名, 歌手)``。"""
@@ -848,7 +961,6 @@ class Pipeline:
         return pool
 
     def _take_from_pool(self, pool, *, src, digest, note, label,
-                        chosen: "Track | None" = None, exclusive: bool = False,
                         consensus: bool = False) -> JobResult:
         """候选池 → 跨平台时长核验 → 下载 → 校验/完整度门禁 → 落盘（两种模式共用）。"""
         adapters = self._adapters
@@ -1034,20 +1146,6 @@ class Pipeline:
 
         # 「以名找歌」的人工挑选：只在**已经过全部硬门槛与时长核验**的候选里锁定，
         # 门槛一个都不放松；用户点名的那条若没通过核验，就如实报错，不偷偷换别的版本。
-        if chosen is not None:
-            # 人工挑选的候选来自**另一次**检索（对象是新造的、音源名一致）→ 必须按
-            # 「同一音源 + 同一资源指纹」重新定位；用对象身份比对会永远匹配不上。
-            key = (chosen.source, dedupe_key(chosen))
-            picked = [t for t in order
-                      if t is chosen or (t.source, dedupe_key(t)) == key]
-            if not picked:
-                raise SearchNoResultError(
-                    "你选择的候选未通过时长核验（实测时长与参考不符），本次不下载",
-                    detail=f"{chosen.source} “{chosen.title}”（{chosen.artist}）")
-            self._log(f"  · 已锁定你选择的候选：{chosen.source} “{chosen.title}”"
-                      f"（{chosen.artist}）")
-            order = picked if exclusive else picked + [t for t in order if t is not chosen]
-
         def _remember(track: Track, ok: bool) -> None:
             """把这次资源结果写进台账（失败也记，便于下次不再白试）。"""
             index.note_resource(dedupe_key(track), track.source, track.url or "",

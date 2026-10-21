@@ -64,6 +64,8 @@ def run_cli(paths, args) -> int:
         config.settings.quality = args.quality
     if args.no_fallback:
         config.settings.enable_fallback = False
+    if getattr(args, "search_output", None):
+        config.settings.search_output_dir = args.search_output
     links: list[str] = []
     if args.links:
         links += [x for x in re.split(r"[,\n;]+", args.links) if x.strip()]
@@ -134,11 +136,14 @@ def main(argv=None) -> int:
     parser.add_argument("--selftest", action="store_true", help="运行自检")
     parser.add_argument("--check-qt", action="store_true", help="自检：加载 Qt 并打印版本后退出")
     parser.add_argument("--check-ui", action="store_true", help="自检：校验主窗口与设置弹窗的屏幕自适应")
+    parser.add_argument("--check-transcode", action="store_true",
+                        help="自检：转码引擎（FFmpeg 库）能在冻结产物里加载并转出文件")
     parser.add_argument("--check-worker", action="store_true",
                         help="自检：跑一次后台任务后正常退出（验证 QThread 生命周期）")
     parser.add_argument("--query", action="append",
                         help="以名找歌：歌名（可重复该参数；也支持逗号/分号/换行分隔多条，无需输入文件）")
     parser.add_argument("--query-file", help="以名找歌：从文本文件读取歌名（每行一条）")
+    parser.add_argument("--search-output", help="以名找歌专用输出目录（不填则跟随 --output / 默认目录）")
     parser.add_argument("--links", help="手动补链：直链或本地路径（逗号/换行分隔），优先于自动音源")
     parser.add_argument("--links-file", help="从文本文件读取补链（每行一条）")
     parser.add_argument("--sources-report", action="store_true",
@@ -196,6 +201,27 @@ def main(argv=None) -> int:
         app.exec()
         print("worker lifecycle: OK（若进程退出码非 0，说明线程收尾有问题）")
         return 0
+    if args.check_transcode:
+        _ensure_utf8_console()
+        import io
+        import wave
+
+        from mmusic import transcode
+
+        if not transcode.available():
+            print("转码引擎不可用：" + (transcode.unavailable_reason() or "未知原因"))
+            return 1
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(44100)
+            w.writeframes(b"\x00\x00" * 13230)          # ~0.3s 静音
+        data, out_ext = transcode.convert_bytes(buf.getvalue(), "wav", "mp3")
+        ok = out_ext == "mp3" and len(data) > 1000
+        print(f"转码引擎 OK：{transcode.engine_info()} → {len(data)} 字节 .{out_ext}")
+        return 0 if ok else 1
+
     if args.sources_report:
         _ensure_utf8_console()
         from mmusic.config import AppConfig, default_config_dir
