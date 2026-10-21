@@ -9,6 +9,8 @@ from typing import Sequence
 from .model import Track
 
 __all__ = ["ARTIST_UNKNOWN", "artist_match_score", "best_reading_match",
+           "sanitize_query", "sanitize_query_text", "looks_like_song_query",
+           "space_split_readings",
            "title_gate_ok",
            "split_filename_raw",
            "clean_text",
@@ -176,6 +178,178 @@ def split_originals(tracks: "Sequence[Track]") -> "tuple[list[Track], list[tuple
         else:
             originals.append(t)
     return originals, dropped
+
+
+# --------------------------------------------------------------------- #
+# 手动搜索 / 点播清单：清洗序号与符号
+# --------------------------------------------------------------------- #
+_NUM_TOKEN = r"(?:\d{1,3}|[一二三四五六七八九十百零〇两]{1,3})"
+_INVISIBLE = re.compile(r"[\u200b-\u200f\u202a-\u202e\ufeff\u00ad]")
+# 整串被书名号/引号包起来：「《夜曲》」「"夜曲"」
+_WRAPPED = re.compile(r"^[\s\u3000]*[《「『“\"']\s*(.+?)\s*[》」』”\"']\s*$")
+# 前缀：括号序号 [1] （一） 【3】；裸序号 1. 2、 三. ；第 3 首；零填充 01␣；装饰符号
+_LEAD_BRACKET_NUM = re.compile(r"^[\s\u3000]*[（(\[{【]\s*" + _NUM_TOKEN
+                               + r"\s*[)）\]}】]\s*[.．、,，:：\-–—]?\s*")
+_LEAD_NUM = re.compile(r"^[\s\u3000]*" + _NUM_TOKEN + r"\s*[.．、,，)）:：\-–—]\s*")
+_LEAD_TRACK = re.compile(r"^[\s\u3000]*第\s*" + _NUM_TOKEN
+                         + r"\s*[首曲个集章]\s*[.．、:：\-–—]?\s*")
+_LEAD_ZERO_PADDED = re.compile(r"^[\s\u3000]*0\d{1,2}[\s\u3000]+")
+_LEAD_BULLET = re.compile(r"^[\s\u3000]*[•·※☆★◇◆○●■□▲▼►▶▸▹→⇒➜・、,，\-–—~～＋+*#<>）》】\]]+\s*")
+# 行首「说明前缀」（点播：/歌名：/推荐 - …）。**白名单**制，只认明确是"标签"的词。
+# 「带标点」就能认的标签（含单字，如 `求：`；也含 `歌手：`/`原唱：` 这种"标签后跟内容"的）
+_LABEL_LIST = ("点播", "点歌", "求歌", "求播", "点一首", "来一首", "歌名", "曲名", "歌曲",
+               "歌单", "收听", "播放", "播送", "送上", "推荐", "分享", "听歌", "试听",
+               "试唱", "原唱", "原唱歌手", "演唱", "演唱者", "歌手", "求", "听", "播", "送", "选")
+_LABEL_SET = frozenset(_LABEL_LIST)
+_LABEL_WORDS = "(?:" + "|".join(_LABEL_LIST) + ")"
+# 「只带空格」也认的标签：只放**多字且不会跟歌名混**的词。
+# 刻意不含 原唱/演唱/歌手 —— `原唱 周杰伦` 里那串是歌手，不能当标签删掉。
+_LABEL_SPACE_WORDS = ("(?:" + "|".join(("点播", "点歌", "求歌", "求播", "点一首", "来一首",
+                                       "歌名", "曲名", "歌曲", "歌单", "收听", "播放",
+                                       "播送", "送上", "推荐", "分享", "听歌", "试听")) + ")")
+# ① 带标点：连单字标签也认（`求：夜曲`）—— 标点本身就是"这是标签"的信号
+_LEAD_LABEL_PUNCT = re.compile(r"^[\s\u3000]*" + _LABEL_WORDS
+                               + r"\s*[：:、,，;；\-–—.。!！]+\s*")
+# ② 只带空格：只认多字标签，且后面必须真的有内容（`点播 夜曲`）
+_LEAD_LABEL_SPACE = re.compile(r"^[\s\u3000]*" + _LABEL_SPACE_WORDS + r"\s+")
+# ③ 方括号里恰好是标签词：`【点播】夜曲`
+_LEAD_BRACKET_LABEL = re.compile(r"^[\s\u3000]*[（(\[{【]\s*(?:点播|点歌|求歌|歌名|曲名|歌曲"
+                                 r"|歌单|收听|播放|推荐|分享)\s*[)）\]}】]\s*[：:、,，\-–—]?\s*")
+# 后缀：括号序号 夜曲（2）；分隔符+序号 夜曲-2；装饰符号；悬空分隔符
+_TRAIL_BRACKET_NUM = re.compile(r"[\s\u3000]*[（(\[{【]\s*" + _NUM_TOKEN
+                                + r"\s*[)）\]}】]\s*$")
+_TRAIL_DASH_NUM = re.compile(r"[\s\u3000]*[\-–—·]\s*" + _NUM_TOKEN
+                             + r"\s*[.．、]?\s*$")
+_TRAIL_BULLET = re.compile(r"[\s\u3000]*[•·※☆★◇◆○●■□▲▼►▶▸▹*#]+\s*$")
+# 直接粘贴文件名时带的扩展名（夜曲.mp3）也算噪声 —— 它不是歌名的一部分
+_TRAIL_EXT = re.compile(r"[\s\u3000]*\.(?:mp3|flac|m4a|aac|wav|ogg|opus|ape|wma|dff|mgg|mflac"
+                        r"|mmp4|ncm|qmc\d*|kwm|kwd|mp4)\s*$", re.IGNORECASE)
+_TRAIL_SEP = re.compile(r"[\s\u3000]*[\-–—·、,，:：;；.。]+\s*$")
+
+_LEAD_HASH_NUM = re.compile(r"^[\s\u3000]*[#＃]\s*" + _NUM_TOKEN + r"\s*[.．、,，)）:：\-–—]?\s*")
+_LEAD_NO_NUM = re.compile(r"^[\s\u3000]*[Nn][oO]\.?\s*" + _NUM_TOKEN + r"\s*[.．、,，)）:：\-–—]?\s*")
+# 英文标签必须带标点（否则《Title》这种真的歌名会被啃）
+_LEAD_EN_LABEL = re.compile(r"^[\s\u3000]*(?:song|title|track|name|music)\s*[:：=\-–—]+\s*",
+                            re.IGNORECASE)
+# 点歌清单里的「原唱：周杰伦」「歌手: 周杰伦」—— 把歌手抠出来当提示，而不是丢掉
+# 只认两种**无歧义**的歌手提示，其余（如「歌手：周杰伦 夜曲」）刻意不猜：
+#   ① 括号里整段就是歌手：`夜曲（原唱：周杰伦）`
+#   ② 行尾整段就是歌手：  `夜曲 原唱：周杰伦`
+_ARTIST_HINT = re.compile(
+    r"[（(\[{【]\s*(?:原唱|原唱歌手|演唱|演唱者|歌手|artist|singer)\s*[:：=]\s*"
+    r"([^)\]}）】,，;；/|（(\[{【]+)\s*[)\]}）】]"
+    r"|(?:^|[\s\u3000])(?:原唱|原唱歌手|演唱|演唱者|歌手|artist|singer)\s*[:：=]\s*"
+    r"([^)\]}）】,，;；/|（(\[{【\s]+)\s*$")
+# 书名号/引号出现在中间时当分隔符（整串被包住的情况由 _WRAPPED 处理）
+_BOOK_SPLIT = re.compile(r"[《「『]\s*(.+?)\s*[》」』]")
+# 间隔号/中点也常当"歌手·歌名"的分隔符
+_MIDDOT_SPLIT = re.compile(r"\s*[·・•‧]\s*")
+
+_LEAD_ALL = (_LEAD_BRACKET_NUM, _LEAD_BRACKET_LABEL, _LEAD_LABEL_PUNCT,
+             _LEAD_LABEL_SPACE, _LEAD_HASH_NUM, _LEAD_NO_NUM, _LEAD_EN_LABEL,
+             _LEAD_NUM, _LEAD_TRACK, _LEAD_ZERO_PADDED, _LEAD_BULLET)
+_TRAIL_ALL = (_TRAIL_BRACKET_NUM, _TRAIL_DASH_NUM, _TRAIL_BULLET, _TRAIL_SEP, _TRAIL_EXT)
+
+
+def _clean_chunk(chunk: str) -> str:
+    """对一段文本反复清洗序号/符号/标签（「1.（一）夜曲」这种叠加形态要迭代）。"""
+    for _ in range(4):
+        before = chunk
+        chunk = _WRAPPED.sub(r"\1", chunk.strip()) or chunk
+        for pattern in _LEAD_ALL:
+            chunk = pattern.sub("", chunk)
+        for pattern in _TRAIL_ALL:
+            chunk = pattern.sub("", chunk)
+        chunk = re.sub(r"\s+", " ", chunk).strip()
+        if chunk == before.strip():
+            break
+    return chunk
+
+
+def sanitize_query(text: str) -> "tuple[str, str]":
+    """清洗用户输入 → ``(歌名文本, 提示歌手)``。
+
+    做四类事（全部只针对"输入噪声"，不动歌名本身）：
+
+    1. **归一化**：NFKC（全角→半角）、去零宽字符、全角空格→空格；
+    2. **抠出歌手提示**：``夜曲 原唱：周杰伦`` / ``歌手: 周杰伦`` → 歌手=周杰伦、
+       文本变 ``夜曲``（这类写法在点歌清单里很常见，直接丢掉等于白丢一个歌手参照）；
+    3. **分隔符归一**：``《夜曲》`` 在句子中间当分隔符（``周杰伦《夜曲》`` → ``周杰伦 - 夜曲``）、
+       ``周杰伦·夜曲`` 的间隔号同理；
+    4. **清掉序号/符号/说明前缀**（`_LEAD_ALL` / `_TRAIL_ALL`），并**逐段**处理
+       （``周杰伦 - 1. 夜曲``、``夜曲 - 点播``），整段就是说明标签的直接丢掉。
+
+    精度护栏（宁可不洗，也不洗错）：``（Live）``/``(伴奏)`` 这类版本标记原样保留；
+    ``7 Years``/``30 岁的女人``/``2002年的第一场雪`` 不动；``音乐会`` 不被当成标签。
+
+    返回的文本可能为空（例如整行只有 ``1.``）—— 由 :func:`looks_like_song_query` 判断
+    是否值得拿去搜索；需要"绝不返回空串"的场景请用 :func:`sanitize_query_text`。
+    """
+    original = (text or "")
+    out = _INVISIBLE.sub("", unicodedata.normalize("NFKC", original))
+    out = out.replace("\u3000", " ")
+
+    out = _TRAIL_EXT.sub("", out)      # 先剥掉粘贴文件名带的扩展名，再解析歌手提示
+
+    hint = ""
+    found = _ARTIST_HINT.search(out)
+    if found:
+        hint = _clean_chunk(found.group(1) or found.group(2) or "")
+        out = f"{out[:found.start()]} {out[found.end():]}"
+
+    out = _BOOK_SPLIT.sub(r" - \1", out)      # 周杰伦《夜曲》 → 周杰伦 - 夜曲
+    out = _MIDDOT_SPLIT.sub(" - ", out)        # 周杰伦·夜曲   → 周杰伦 - 夜曲
+    out = _clean_chunk(out)
+
+    # 逐段再清一遍：序号可能落在分隔符之后（周杰伦 - 1. 夜曲），
+    # 整段就是说明标签的（夜曲 - 点播）直接丢掉。
+    parts = [p for p in re.split(r"\s*[-–—]\s*", out) if p.strip()]
+    if len(parts) > 1:
+        kept: "list[str]" = []
+        for part in parts:
+            piece = _clean_chunk(part)
+            if piece and piece not in _LABEL_SET:
+                kept.append(piece)
+        out = " - ".join(kept) if kept else ""
+
+    return out.strip(), hint
+
+
+def sanitize_query_text(text: str) -> str:
+    """同 :func:`sanitize_query`，但**保证不返回空串**（清洗结果为空时回退原文）。"""
+    cleaned, _hint = sanitize_query(text)
+    return cleaned.strip() or (text or "").strip()
+
+
+def looks_like_song_query(text: str) -> "tuple[bool, str]":
+    """这一行值不值得拿去搜？返回 ``(可用, 清洗后的歌名)``。
+
+    用于批量点播清单：``1.``、``求：``、``点播`` 这种清洗完什么都没有、或**只剩说明标签**的行，
+    直接跳过（免得白跑一整轮音源检索，还污染日志）—— 这是"筛选"那一半。
+    """
+    cleaned, _hint = sanitize_query(text)
+    return (bool(cleaned) and cleaned not in _LABEL_SET), cleaned
+
+
+def space_split_readings(text: str) -> "list[tuple[str, str]]":
+    """把"空格分隔的两段"当成可能的「歌名 歌手」（两种顺序都试）。
+
+    手动搜索框里写 ``夜曲 周杰伦`` 是很自然的写法，但空格不是文件名里的分隔符约定
+    （那里用的是 ``-``），所以这里**只补读法、不替换**原有的读法 —— 排名取各读法的
+    最大值，多一种读法只会更容易命中，不会让原本能过的匹配失败。
+    """
+    text = (text or "").strip()
+    if re.search(r"[-–—]", text):
+        return []       # 已经有明确分隔符 → 读法交给文件名解析，别在这里重复拆
+    parts = [p for p in re.split(r"\s+", text) if p.strip(" -–—·.,;:()[]{}（）【】")]
+    if len(parts) < 2:
+        return []
+    out: "list[tuple[str, str]]" = []
+    for title, artist in ((parts[0], " ".join(parts[1:])),
+                          (" ".join(parts[:-1]), parts[-1])):
+        if title and artist and title != artist and (title, artist) not in out:
+            out.append((title, artist))
+    return out
 
 
 def filename_parts(stem: str) -> list[str]:

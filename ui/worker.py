@@ -1,4 +1,10 @@
-"""Background worker running the pipeline off the GUI thread."""
+"""后台线程：解密任务 / 以名找歌任务。
+
+两者的生命周期纪律**完全一致**（2026-10-20 猴子测试挖出的崩溃形状）：
+`completed` / `failed` 是在 `run()` **内部**发出的 —— 那一刻线程尚未返回，
+宿主必须保住强引用、等 `QThread.finished` 再 `deleteLater()`（见
+`MainWindow._retire_worker`）。所以两种 worker 都只发信号、不自杀。
+"""
 from __future__ import annotations
 
 from PySide6.QtCore import QThread, Signal
@@ -39,6 +45,62 @@ class DecryptWorker(QThread):
         try:
             results = pipe.process_many(self.paths)
             self.completed.emit(results)
+        except Exception as exc:  # noqa: BLE001
+            self.failed.emit(str(exc))
+        finally:
+            pipe.close()
+            self._pipe = None
+
+    def cancel(self) -> None:
+        if self._pipe is not None:
+            self._pipe.cancel()
+
+
+class NameSearchWorker(QThread):
+    """「以名找歌」后台线程（三种模式）。
+
+    * ``auto``：批量自动挑选最优（一键）；
+    * ``list``：只检索、不下载，把候选发回界面供人工挑选；
+    * ``pick``：对用户点选的那一条执行"下载 + 全程校验"。
+    """
+
+    logged = Signal(str, str)
+    progressed = Signal(int, int)
+    file_done = Signal(object)
+    completed = Signal(list)
+    failed = Signal(str)
+    candidates = Signal(str, object)      # (查询标签, list[Track])
+
+    MODE_AUTO, MODE_LIST, MODE_PICK = "auto", "list", "pick"
+
+    def __init__(self, settings, *, cache_path=None, mode: str = MODE_AUTO,
+                 items=None, query: str = "", artist: str = "", chosen=None,
+                 parent=None) -> None:
+        super().__init__(parent)
+        self.settings = settings
+        self.cache_path = cache_path
+        self.mode = mode
+        self.items = list(items or [])
+        self.query = query
+        self.artist = artist
+        self.chosen = chosen
+        self._pipe = None
+
+    def run(self) -> None:  # noqa: D102
+        pipe = Pipeline(self.settings, cache_path=self.cache_path,
+                        on_log=make_log_sink(self.logged),
+                        on_progress=self.progressed.emit,
+                        on_file=self.file_done.emit)
+        self._pipe = pipe
+        try:
+            if self.mode == self.MODE_LIST:
+                self.candidates.emit(self.query,
+                                     pipe.search_candidates(self.query, artist=self.artist))
+            elif self.mode == self.MODE_PICK:
+                self.completed.emit([pipe.acquire(self.query, artist=self.artist,
+                                                  chosen=self.chosen)])
+            else:
+                self.completed.emit(pipe.acquire_many(self.items))
         except Exception as exc:  # noqa: BLE001
             self.failed.emit(str(exc))
         finally:

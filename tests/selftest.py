@@ -2204,6 +2204,361 @@ def test_source_tag_and_cover_carry() -> None:
               f"http_calls={http.calls}")
 
 
+def test_acquire_by_name() -> None:
+    """以名找歌：不依赖任何输入文件，走与备用链路**完全相同**的选源与校验逻辑。"""
+    print("\n[acquire by name: 以名找歌]")
+    import mmusic.pipeline as pl
+    from mmusic.errors import MusicDecryptorError
+    from mmusic.search.base import SearchSource
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        full = tmp / "full.mp3"
+        full.write_bytes(fx.make_mp3_xing(240))
+        cut = tmp / "cut.mp3"
+        cut.write_bytes(fx.make_mp3_xing(120))
+
+        class Fake(SearchSource):
+            def __init__(self, name, label, title, artist, path, duration):
+                super().__init__(None, {})
+                self.name = name
+                self.label = label
+                self._t, self._a, self._p, self._d = title, artist, str(path), duration
+
+            def search(self, query, *, quality="mp3", limit=10):
+                return [Track(self.name, self._t, self._a, duration=self._d, bitrate=320,
+                              ext="mp3", raw={"path": self._p})]
+
+            def resolve(self, track, *, quality="mp3"):
+                track.url = Path(track.raw["path"]).resolve().as_uri()
+                track.ext = "mp3"
+                return track
+
+        cut_src = Fake("cut1", "截短源", "夜曲", "周杰伦", cut, 120)
+        full_src = Fake("full1", "完整源", "夜曲", "周杰伦", full, 240)
+
+        def make_pipe(out_dir, sources):
+            st = Settings(output_dir=str(out_dir), quality="mp3", enable_fallback=True,
+                          write_metadata=True, fetch_cover=False, remember_hashes=False,
+                          timeout=5.0, retries=0, min_bitrate=0)
+            logs: "list[str]" = []
+            return Pipeline(st, cache_path=tmp / "c.json", on_log=logs.append,
+                            sources=sources), logs
+
+        pipe, _logs = make_pipe(tmp / "out", [cut_src, full_src])
+
+        # ① 只检索、不下载：一个文件都不许落盘
+        cands = pipe.search_candidates("夜曲", artist="周杰伦")
+        check("acquire: search_candidates 返回候选且不落盘",
+              len(cands) == 2 and not (tmp / "out").exists(),
+              f"{len(cands)} 个候选 / out 目录存在={(tmp / 'out').exists()}")
+
+        # ② 自动挑最优：绕过 120s 截短版，下完整版
+        res = pipe.acquire("夜曲", artist="周杰伦")
+        out = Path(res.out_path) if res.out_path else None
+        check("acquire: 无需输入文件即可下载（downloaded / fallback）",
+              res.status == "downloaded" and res.mode == "fallback", f"{res.status}/{res.mode}")
+        got_dur = audio_duration(out.read_bytes()) if out and out.exists() else None
+        check("acquire: 落盘的是通过时长核验的那条（实测 ≈240s，120s 截短版被淘汰）",
+              got_dur is not None and 235 <= got_dur <= 245, f"{got_dur} :: {out}")
+        from mutagen.id3 import ID3 as _ID3
+        frames = _ID3(str(out)) if out and out.exists() else {}
+        check("acquire: 以名找歌的产物同样写入标签（歌名/歌手）",
+              frames and str(frames.get("TIT2")) == "夜曲"
+              and str(frames.get("TPE1")) == "周杰伦",
+              f"{frames.get('TIT2') if frames else None} / {frames.get('TPE1') if frames else None}")
+        check("acquire: 产物文件名用「歌手 - 歌名」",
+              out is not None and out.name == "周杰伦 - 夜曲.mp3",
+              out.name if out else res.message)
+        check("acquire: JobResult.path 用 search:// 前缀（不是真实文件路径）",
+              str(res.path).startswith(pl.SEARCH_PREFIX), res.path)
+        check("acquire: 不删除任何文件", full.exists() and cut.exists())
+
+        # ③ 人工点选"截短版"：必须如实拒绝，不许偷偷换成完整版
+        chosen_cut = cut_src.search("夜曲")[0]
+        try:
+            r3 = pipe.acquire("夜曲", artist="周杰伦", chosen=chosen_cut)
+            ok3, msg3 = False, r3.message
+        except MusicDecryptorError as exc:
+            ok3, msg3 = "未通过时长核验" in exc.message, exc.message
+        check("acquire: 人工点选的候选没通过核验时如实拒绝（绝不换别的版本）", ok3, msg3)
+
+        # ④ 人工点选完整版：跨 Pipeline 重新检索后必须按「音源 + 资源指纹」定位
+        chosen_full = full_src.search("夜曲")[0]
+        r4 = pipe.acquire("夜曲", artist="周杰伦", chosen=chosen_full)
+        out4 = Path(r4.out_path) if r4.out_path else None
+        got4 = audio_duration(out4.read_bytes()) if out4 and out4.exists() else None
+        check("acquire: 人工点选（对象不同、靠指纹定位）能正常下载",
+              r4.status == "downloaded" and got4 is not None and 235 <= got4 <= 245,
+              f"{r4.status} {r4.out_path} 实测={got4}")
+
+        # ⑤ 搜不到：批量入口给可读的失败结果，而不是抛异常或卡住
+        rs = pipe.acquire_many(["这首歌不存在谢谢", ("也不存在呀", "某人")])
+        check("acquire_many: 无结果时返回可读的失败结果",
+              len(rs) == 2 and all(r.status == "failed" for r in rs)
+              and all("搜索无结果" in (r.message or "") for r in rs),
+              " | ".join(f"{r.status}:{r.message}" for r in rs))
+
+        # ⑥ 未设输出目录 → default_search_dir()（绝不落到进程工作目录）
+        orig_default = pl.default_search_dir
+        pl.default_search_dir = lambda: tmp / "default_out"
+        try:
+            pipe2, _ = make_pipe("", [full_src])
+            r6 = pipe2.acquire("夜曲", artist="周杰伦")
+            out6 = Path(r6.out_path) if r6.out_path else None
+            check("acquire: 未设输出目录时落到 default_search_dir（不是进程工作目录）",
+                  out6 is not None and out6.parent == tmp / "default_out",
+                  str(out6))
+        finally:
+            pl.default_search_dir = orig_default
+
+        # ⑦ 只给歌名：按"多数演唱者"静默优先（只排序、不排除任何候选）
+        ids, display, n, total = Pipeline._dominant_artist([
+            Track("s1", "夜曲", "周杰伦"), Track("s2", "夜曲", "周杰伦 Jay Chou"),
+            Track("s3", "夜曲", "Xai小爱")])
+        check("acquire: 多数演唱者共识（写法差异按包含关系归并）",
+              display == "周杰伦" and n == 2 and total == 3,
+              f"{display} {n}/{total}")
+
+        reshuffle = [Track("m", "夜曲", "Xai小爱"), Track("a1", "夜曲", "周杰伦"),
+                     Track("a2", "夜曲", "周杰伦")]
+        pipe._prefer_dominant_artist(reshuffle)
+        check("acquire: 静默共识会真的重排（少数派从第 1 位挪到末尾）",
+              [t.artist for t in reshuffle] == ["周杰伦", "周杰伦", "Xai小爱"],
+              str([t.artist for t in reshuffle]))
+
+        # 少数派音源排在前面时，候选列表仍必须以多数演唱者开头
+        dup_a = Fake("dup_a", "同歌手源A", "夜曲", "周杰伦", full, 240)
+        dup_b = Fake("dup_b", "同歌手源B", "夜曲", "周杰伦", full, 240)
+        minority = Fake("min1", "少数派源", "夜曲", "Xai小爱", cut, 120)
+        pipe3, _ = make_pipe(tmp / "out3", [minority, dup_a, dup_b])
+        order3 = [t.artist for t in pipe3.search_candidates("夜曲")]
+        check("acquire: 只给歌名时候选列表以多数演唱者开头（少数派排后）",
+              order3[:2] == ["周杰伦", "周杰伦"] and order3[-1] == "Xai小爱", str(order3))
+
+
+def test_query_sanitize() -> None:
+    """手动字段搜索：序号/符号清洗 + 空格分隔读法（修"明明有资源却匹配不到"）。"""
+    print("\n[query sanitize: 序号与符号]")
+    from mmusic.match import sanitize_query_text, space_split_readings
+    from mmusic.search.base import SearchSource
+
+    table = [
+        ("1. 夜曲", "夜曲"), ("2、发如雪", "发如雪"), ("三、发如雪", "发如雪"),
+        ("（一）发如雪", "发如雪"), ("（二）夜曲", "夜曲"), ("【3】夜曲", "夜曲"),
+        ("1)夜曲", "夜曲"), ("3．发如雪", "发如雪"), ("第1首 夜曲", "夜曲"),
+        ("第 3 曲 发如雪", "发如雪"), ("★ 2.（一）发如雪", "发如雪"),
+        ("• 夜曲", "夜曲"), ("《夜曲》", "夜曲"), ("01 夜曲", "夜曲"),
+        (" 12- 夜曲", "夜曲"), ("夜曲（2）", "夜曲"), ("夜曲-2", "夜曲"),
+        ("1. 周杰伦 - 夜曲", "周杰伦 - 夜曲"),
+        # 行首中文说明前缀（白名单）
+        ("点播：夜曲", "夜曲"), ("歌曲：夜曲", "夜曲"), ("歌名:夜曲", "夜曲"),
+        ("点播 夜曲", "夜曲"), ("【点播】夜曲", "夜曲"), ("求：夜曲", "夜曲"),
+        ("1. 点播：夜曲", "夜曲"), ("点播 → 夜曲", "夜曲"),
+        ("推荐 - 周杰伦 - 夜曲", "周杰伦 - 夜曲"), ("试听：夜曲", "夜曲"),
+        # 最后一轮：更多"值得忽略"的输入形态
+        ("#1 夜曲", "夜曲"), ("No.3 夜曲", "夜曲"), ("song: 夜曲", "夜曲"),
+        ("夜曲 - 点播", "夜曲"), ("周杰伦 - 夜曲 - 点播", "周杰伦 - 夜曲"),
+        ("周杰伦《夜曲》", "周杰伦 - 夜曲"), ("周杰伦·夜曲", "周杰伦 - 夜曲"),
+        ("歌手：周杰伦 - 夜曲", "周杰伦 - 夜曲"), ("【原唱：周杰伦】夜曲", "夜曲"),
+        ("夜曲.mp3", "夜曲"), ("周杰伦 - 夜曲.mflac", "周杰伦 - 夜曲"),
+    ]
+    bad = [f"{src!r}->{sanitize_query_text(src)!r}" for src, want in table
+           if sanitize_query_text(src) != want]
+    check("sanitize: 序号/符号（前缀与后缀）全部清洗干净", not bad, "; ".join(bad))
+
+    check("sanitize: 修复的正是「卡在硬门槛下」的情形（1. 夜曲 0.57 → 夜曲 1.00）",
+          similarity("1. 夜曲", "夜曲") < MIN_TITLE_SIMILARITY
+          <= similarity(sanitize_query_text("1. 夜曲"), "夜曲"),
+          f"{similarity('1. 夜曲', '夜曲'):.2f} -> "
+          f"{similarity(sanitize_query_text('1. 夜曲'), '夜曲'):.2f}")
+
+    check("sanitize: 版本标记（Live/伴奏）原样保留（版本过滤依赖它们）",
+          sanitize_query_text("夜曲 (Live)").lower() == "夜曲 (live)"
+          and "伴奏" in sanitize_query_text("夜曲（伴奏）")
+          and "live" in version_markers(sanitize_query_text("夜曲 (Live)")),
+          f"{sanitize_query_text('夜曲 (Live)')!r}")
+    check("sanitize: 数字开头是真歌名的不动（7 Years / 30 岁的女人 / 2002年的第一场雪）",
+          sanitize_query_text("7 Years") == "7 Years"
+          and sanitize_query_text("30 岁的女人") == "30 岁的女人"
+          and sanitize_query_text("2002年的第一场雪") == "2002年的第一场雪")
+    check("sanitize: 全是序号时绝不把输入擦成空串", sanitize_query_text("1.") == "1.")
+    check("sanitize: 说明前缀用白名单，不误伤正常歌名（音乐会 / 点播）",
+          sanitize_query_text("音乐会") == "音乐会"
+          and sanitize_query_text("点播") == "点播",
+          f"{sanitize_query_text('音乐会')!r} / {sanitize_query_text('点播')!r}")
+    check("sanitize: 「伴奏：」「Live:」不会被当说明前缀删掉（点名版本仍生效）",
+          "伴奏" in sanitize_query_text("伴奏：夜曲")
+          and "live" in version_markers(sanitize_query_text("Live:夜曲")),
+          f"{sanitize_query_text('伴奏：夜曲')!r}")
+    check("sanitize: 零宽字符/全角空格被清掉",
+          sanitize_query_text("夜\u200b曲\u3000") == "夜曲",
+          repr(sanitize_query_text("夜\u200b曲\u3000")))
+
+    from mmusic.match import looks_like_song_query, sanitize_query
+
+    check("sanitize: 从「原唱/演唱/歌手：」里抠出歌手提示（无歧义形式）",
+          sanitize_query("夜曲 原唱：周杰伦") == ("夜曲", "周杰伦")
+          and sanitize_query("夜曲（原唱：周杰伦）") == ("夜曲", "周杰伦")
+          and sanitize_query("【演唱：周杰伦】夜曲") == ("夜曲", "周杰伦"),
+          f"{sanitize_query('夜曲 原唱：周杰伦')}")
+    check("sanitize: 歧义形式（标签后既跟歌手又跟歌名）刻意不猜",
+          sanitize_query("歌手：周杰伦 夜曲")[1] == "",
+          f"{sanitize_query('歌手：周杰伦 夜曲')}")
+
+    usable = [looks_like_song_query(x) for x in ("1.", "求：", "点播", "点播：", "  ")]
+    check("筛选: 只有序号/说明前缀的行被判定为不可用",
+          not any(ok for ok, _ in usable), str(usable))
+    keep = [looks_like_song_query(x) for x in ("夜曲", "3、发如雪", "夜曲.mp3", "求：夜曲")]
+    check("筛选: 有歌名的行全部保留",
+          all(ok for ok, _ in keep), str(keep))
+
+    # 回归：单段原文给出的"不含歌手"读法，不能靠"候选标题里含歌手名"绕过歌手门槛
+    # （实测下到过「稳重的牧牛铃 - 周杰伦 - 发如雪」这种垃圾）
+    from mmusic.match import best_reading_match as _brm
+    _sr, rd5, _q5, _rr = Pipeline._seed_for("周杰伦·发如雪")
+    check("seed: 分隔符归一后不再保留「无歌手」的原始读法（堵漏口）",
+          bool(rd5) and all(a for _t, a in rd5), str(rd5))
+    bad = Track("agg", "周杰伦 - 发如雪", "稳重的牧牛铃", duration=240)
+    ok5, _rd, _ts, _as = _brm(rd5, bad, min_title=0.60, min_artist=0.60, strict_title=False)
+    check("seed: 「周杰伦·发如雪」不会被“标题含歌手名”的垃圾候选蒙混过关", not ok5,
+          f"ts={_ts:.2f} as={_as:.2f}")
+
+    check("space-split: 「夜曲 周杰伦」补出 (歌名, 歌手) 读法",
+          ("夜曲", "周杰伦") in space_split_readings("夜曲 周杰伦"))
+    check("space-split: 单段输入不硬拆", space_split_readings("夜曲") == [])
+
+    # 落到选择种子：查询词与读法都必须干净
+    _s1, rd1, q1, _r1 = Pipeline._seed_for("1. 夜曲")
+    check("seed: 带序号的歌名 → 发给音源的查询词被清洗为「夜曲」", q1 == "夜曲", q1)
+    check("seed: 带序号的歌名 → 读法里含干净的 (夜曲, \"\")",
+          ("夜曲", "") in rd1, str(rd1))
+    _sp, _rdp, qp, wantp = Pipeline._seed_for("试听：夜曲")
+    check("seed: 说明前缀「试听：」被清掉，且不被误当成\"点名要试听版\"",
+          qp == "夜曲" and not wantp, f"{qp} {sorted(wantp)}")
+
+    _s2, rd2, _q2, _r2 = Pipeline._seed_for("夜曲 周杰伦")
+    check("seed: 空格分隔的「歌名 歌手」→ 读法含 (夜曲, 周杰伦)",
+          ("夜曲", "周杰伦") in rd2, str(rd2))
+    _rd3, q3, want3 = Pipeline._seed_from_name("夜曲 (Live)")
+    check("seed: 点名版本标记不被清洗掉，仍接力给版本过滤",
+          "live" in want3 and q3 == "夜曲", f"{sorted(want3)} {q3}")
+    rd4, q4, _r4 = Pipeline._seed_from_name("1. 夜曲")
+    check("seed: 文件名模式同样受益（拖入「1. 夜曲.mgg」也能匹配）",
+          q4 == "夜曲" and ("夜曲", "") in rd4, f"{q4} {rd4}")
+
+    # 端到端回归：带序号的手动输入必须真的能匹配到资源
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        audio = tmp / "song.mp3"
+        audio.write_bytes(fx.make_mp3_xing(240))
+
+        class Fake(SearchSource):
+            def __init__(self):
+                super().__init__(None, {})
+                self.name = "f1"
+                self.label = "测试源"
+
+            def search(self, query, *, quality="mp3", limit=10):
+                return [Track(self.name, "夜曲", "周杰伦", duration=240, bitrate=320,
+                              ext="mp3", raw={"path": str(audio)})]
+
+            def resolve(self, track, *, quality="mp3"):
+                track.url = audio.resolve().as_uri()
+                track.ext = "mp3"
+                return track
+
+        st = Settings(output_dir=str(tmp / "out"), quality="mp3", enable_fallback=True,
+                      write_metadata=False, fetch_cover=False, remember_hashes=False,
+                      timeout=5.0, retries=0, min_bitrate=0)
+        logs: "list[str]" = []
+        pipe = Pipeline(st, cache_path=tmp / "c.json", on_log=logs.append, sources=[Fake()])
+        r_num = pipe.acquire("1. 夜曲", artist="周杰伦")
+        check("acquire: 带序号的手动输入也能匹配并下载（端到端回归）",
+              r_num.status == "downloaded",
+              f"{r_num.status} {r_num.message}")
+        r_sp = pipe.acquire("夜曲 周杰伦")
+        check("acquire: 空格分隔的手动输入也能匹配并下载（端到端回归）",
+              r_sp.status == "downloaded",
+              f"{r_sp.status} {r_sp.message}")
+
+        # 批量清单里混进"只有序号/说明前缀"的行：跳过而不是白跑一轮检索
+        batch = pipe.acquire_many(["1.", "求：", "点播", "夜曲"])
+        check("acquire_many: 只有序号/说明前缀的行被跳过（不白跑检索）",
+              len(batch) == 4 and sum(1 for r in batch if r.status == "skipped") == 3
+              and sum(1 for r in batch if r.status == "downloaded") == 1,
+              " | ".join(f"{r.name}:{r.status}" for r in batch))
+
+
+def test_placeholder_artist() -> None:
+    """占位歌手（群星/未知/VA）不能挤掉"用户明确点名的歌手"（实测回归）。"""
+    print("\n[placeholder artist: 群星/未知 不当证据]")
+    import mmusic.pipeline as pl
+    from mmusic.search.base import SearchSource
+
+    def _ph(name: str) -> bool:
+        return pl._placeholder_credit(Track("s", "夜曲", name))
+
+    check("placeholder: 群星/VA/未知 被判为占位歌手",
+          _ph("群星") and _ph("群星(合辑)") and _ph("VA") and _ph("Various Artists")
+          and _ph("未知") and _ph("未知歌手"), "")
+    check("placeholder: 空歌手不算占位（CC/PD、本地曲库没有歌手信息）", not _ph(""))
+    check("placeholder: 正常歌手不算占位", not _ph("周杰伦") and not _ph("Jay Chou"), "")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        long_file = tmp / "long.mp3"
+        long_file.write_bytes(fx.make_mp3_xing(276))       # 4:36 的合辑版（群星）
+        good_file = tmp / "good.mp3"
+        good_file.write_bytes(fx.make_mp3_xing(227))       # 3:47 的正片（周杰伦）
+
+        class Fake(SearchSource):
+            def __init__(self, name, label, artist, path, duration):
+                super().__init__(None, {})
+                self.name, self.label = name, label
+                self._a, self._p, self._d = artist, str(path), duration
+
+            def search(self, query, *, quality="mp3", limit=10):
+                return [Track(self.name, "夜曲", self._a, duration=self._d, bitrate=320,
+                              ext="mp3", raw={"path": self._p})]
+
+            def resolve(self, track, *, quality="mp3"):
+                track.url = Path(track.raw["path"]).resolve().as_uri()
+                track.ext = "mp3"
+                return track
+
+        agg = Fake("agg", "聚合源", "群星", long_file, 276)
+        migu = Fake("migu", "咪咕源", "周杰伦", good_file, 227)
+
+        def run(sources, tag):
+            st = Settings(output_dir=str(tmp / ("out_" + tag)), quality="mp3",
+                          enable_fallback=True, write_metadata=False, fetch_cover=False,
+                          remember_hashes=False, timeout=5.0, retries=0, min_bitrate=0)
+            logs: "list[str]" = []
+            pipe = Pipeline(st, cache_path=tmp / (tag + ".json"), on_log=logs.append,
+                            sources=sources)
+            return pipe, logs
+
+        # ① 明确的歌手 vs 占位歌手：参考时长不能取自占位候选，最终必须下明确歌手那条
+        pipe, logs = run([agg, migu], "both")
+        res = pipe.acquire("周杰伦 - 夜曲")
+        out = Path(res.out_path) if res.out_path else None
+        got = audio_duration(out.read_bytes()) if out and out.exists() else None
+        check("placeholder: 有明确歌手候选时，占位（群星 4:36）不参与参考时长",
+              any("3:47" in m or "3:46" in m for m in logs), " | ".join(logs[:3])[:120])
+        check("placeholder: 最终下载的是明确歌手那条（实测 ≈227s，不是群星 276s）",
+              res.status == "downloaded" and got is not None and 222 <= got <= 232,
+              f"{res.status} 实测={got} {out}")
+        check("placeholder: 产物文件名用明确歌手",
+              out is not None and out.name == "周杰伦 - 夜曲.mp3", out.name if out else res.message)
+
+        # ② 只有占位候选时**照常下载**（只降权、不硬删）
+        pipe2, _ = run([agg], "only")
+        res2 = pipe2.acquire("周杰伦 - 夜曲")
+        check("placeholder: 只有占位候选时仍然照常下载（不硬删）",
+              res2.status == "downloaded", f"{res2.status} {res2.message}")
+
+
 def test_settings_roundtrip() -> None:
     """设置项往返：凭证 / 自动开始 / 目标音质等字段不丢、类型正确。"""
     print("\n[settings: round-trip]")
@@ -2893,6 +3248,9 @@ def main() -> int:
     test_ekey_fetch()
     test_ekey_pipeline_e2e()
     test_source_tag_and_cover_carry()
+    test_acquire_by_name()
+    test_query_sanitize()
+    test_placeholder_artist()
     test_settings_roundtrip()
     test_portable_config_dir()
     test_source_link_upgrades()

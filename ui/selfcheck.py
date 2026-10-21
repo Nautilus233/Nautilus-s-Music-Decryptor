@@ -15,6 +15,8 @@ from PySide6.QtWidgets import QDialogButtonBox, QScrollArea
 from mmusic.config import AppConfig
 
 from .main_window import MainWindow
+from .name_search_dialog import MIN_SIZE as NS_MIN, NameSearchDialog
+from .name_search_dialog import parse_lines as ns_parse_lines
 from .settings_dialog import MIN_SIZE, SettingsDialog
 
 __all__ = ["run"]
@@ -171,6 +173,47 @@ def run(app, *, verbose: bool = True) -> int:
             app.processEvents()
         check("dialog: footer still visible at minimum size",
               box.mapTo(dlg, QPoint(0, 0)).y() + box.height() <= dlg.height())
+
+        # ---------------- name-search dialog ------------------------- #
+        ns = NameSearchDialog(cfg.settings, cfg, parent=win)
+        ns.show()
+        for _ in range(3):
+            app.processEvents()
+        nframe = ns.frameGeometry()
+        if verbose:
+            print(f"[name-search dialog] frame {nframe.width()}x{nframe.height()} "
+                  f"@({nframe.x()},{nframe.y()}) | minimum client {NS_MIN[0]}x{NS_MIN[1]}")
+        check("dialog(以名找歌): frame inside the work area",
+              avail.contains(nframe), f"{nframe} not in {avail}")
+        nbox = ns.findChild(QDialogButtonBox)
+        nb = nbox.mapTo(ns, QPoint(0, 0)).y() + nbox.height()
+        check("dialog(以名找歌): 关闭按钮不被截断",
+              nbox is not None and nbox.isVisible() and nb <= ns.height(),
+              f"footer ends at y={nb}, client height={ns.height()}")
+        row_bottom = ns.btn_start.mapTo(ns, QPoint(0, 0)).y() + ns.btn_start.height()
+        check("dialog(以名找歌): 开始/停止/下载选中 一行不被截断",
+              ns.btn_start.isVisible() and row_bottom <= ns.height(),
+              f"row ends at y={row_bottom}, height={ns.height()}")
+        check("dialog(以名找歌): 候选表格可见且有可用高度",
+              ns.table.isVisible() and ns.table.height() >= 60, f"table h={ns.table.height()}")
+        check("dialog(以名找歌): 日志区可见",
+              ns.log.isVisible() and ns.log.height() >= 40, f"log h={ns.log.height()}")
+        check("dialog(以名找歌): 未检索前「下载选中」不可用（不会误发请求）",
+              not ns.btn_pick.isEnabled())
+        check("dialog(以名找歌): 歌名解析会去重且保序",
+              ns_parse_lines(" 夜曲 \n夜曲\n发如雪\n\n") == ["夜曲", "发如雪"],
+              str(ns_parse_lines(" 夜曲 \n夜曲\n发如雪\n\n")))
+        ns.names.setPlainText("夜曲\n周杰伦 - 发如雪")
+        ns.chk_auto.setChecked(False)
+        app.processEvents()
+        check("dialog(以名找歌): 切换「先列出候选」不抛异常",
+              not ns.btn_pick.isEnabled())
+        ns.resize(*NS_MIN)
+        for _ in range(3):
+            app.processEvents()
+        check("dialog(以名找歌): 最小尺寸下底部按钮仍可见",
+              ns.btn_start.mapTo(ns, QPoint(0, 0)).y() + ns.btn_start.height() <= ns.height())
+        ns.close()
 
         dlg.close()
         win.close()

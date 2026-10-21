@@ -78,6 +78,20 @@ def run_cli(paths, args) -> int:
         config.settings.manual_links = links
         print(f"已载入 {len(links)} 条手动补链（将优先使用）")
 
+    queries: list[str] = []
+    for raw_query in (getattr(args, "query", None) or []):
+        # --query 可重复；同一个值里也能用逗号/分号/换行分隔多条
+        queries += [x.strip() for x in re.split(r"[,\n;]+", raw_query) if x.strip()]
+    if getattr(args, "query_file", None):
+        try:
+            queries += [l.strip() for l in
+                        Path(args.query_file).read_text("utf-8").splitlines() if l.strip()]
+        except OSError as exc:
+            print(f"读取歌名文件失败：{exc}")
+            return 2
+    if queries:
+        print(f"以名找歌：{len(queries)} 首（不需要输入文件，走备用音源链路）")
+
     targets: list[str] = []
     for raw in paths:
         p = Path(raw)
@@ -89,7 +103,7 @@ def run_cli(paths, args) -> int:
     pipe = Pipeline(config.settings, cache_path=config.cache_path,
                     on_log=lambda m: print(m, flush=True))
     try:
-        results = pipe.process_many(targets)
+        results = pipe.acquire_many(queries) if queries else pipe.process_many(targets)
     finally:
         pipe.close()
 
@@ -122,6 +136,9 @@ def main(argv=None) -> int:
     parser.add_argument("--check-ui", action="store_true", help="自检：校验主窗口与设置弹窗的屏幕自适应")
     parser.add_argument("--check-worker", action="store_true",
                         help="自检：跑一次后台任务后正常退出（验证 QThread 生命周期）")
+    parser.add_argument("--query", action="append",
+                        help="以名找歌：歌名（可重复该参数；也支持逗号/分号/换行分隔多条，无需输入文件）")
+    parser.add_argument("--query-file", help="以名找歌：从文本文件读取歌名（每行一条）")
     parser.add_argument("--links", help="手动补链：直链或本地路径（逗号/换行分隔），优先于自动音源")
     parser.add_argument("--links-file", help="从文本文件读取补链（每行一条）")
     parser.add_argument("--sources-report", action="store_true",

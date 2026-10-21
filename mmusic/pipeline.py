@@ -35,9 +35,10 @@ from .errors import (CancelledError, DecryptionFailedError, MusicDecryptorError,
                      UnsupportedFormatError)
 from .hashcache import HashCache
 from .lang import is_chinese_likely
-from .match import (best_reading_match, filename_query, parse_song_filename_candidates,
-                    rank_tracks_multi, reading_scores, split_originals,
-                    version_markers)
+from .match import (ARTIST_UNKNOWN, best_reading_match, clean_text, filename_query,
+                    parse_song_filename_candidates, rank_tracks_multi, reading_scores,
+                    looks_like_song_query, sanitize_query, sanitize_query_text,
+                    space_split_readings, split_originals, version_markers)
 from .metadata import read_source_meta, write_tags
 from .model import AudioResult, Track
 from .net import HttpClient
@@ -88,7 +89,7 @@ PROBE_BYTES = 256 * 1024   # 探测只取文件头，绝不整文件下载
 PROBE_TAIL_BYTES = 128 * 1024  # ogg / 非 faststart 的 m4a 需要读文件尾
 MAX_EXTRA_RESOLVES = 2     # 为"跳过疑似短资源"而多解析几个候选的上限（成本封顶）
 
-__all__ = ["Pipeline", "JobResult"]
+__all__ = ["Pipeline", "JobResult", "default_search_dir", "SEARCH_PREFIX"]
 
 
 def _needs_tail(head: bytes) -> bool:
@@ -200,6 +201,41 @@ def _guarded(fn):
     return inner
 
 
+#: 「以名找歌」的 ``JobResult.path`` 前缀：它不是真实文件路径，便于 UI / 日志区分
+SEARCH_PREFIX = "search://"
+
+
+#: 「群星 / 未知 / VA」这类**占位歌手**的关键词（空串不算 —— 那是"没有歌手信息"）
+_PLACEHOLDER_HINTS = ("群星", "合辑", "未知")
+
+
+def _placeholder_credit(track: Track) -> bool:
+    """候选的歌手是不是"占位符"。
+
+    背景（2026-10-21 实测）：``artist_match_score`` 对"候选没有歌手信息（空/未知/群星）"
+    刻意返回 1.0（无法判定就不淘汰），于是「群星 - 夜曲」能过歌手硬门槛；再叠加参考时长
+    "取最完整值"，一个 4:36 的合辑版本就把正确的 3:47 判成了"偏短"，最终下载了群星版 ——
+    用户明确给了歌手却拿到别人的版本，明显不贴近预期。
+
+    注意：**空串不算占位符**（CC/PD、本地曲库经常没有歌手信息，那些是"没有信息"而不是
+    "写着别人"），所以这个判定只用来**给现场有明确歌手的候选让路**，绝不硬删。
+    """
+    name = (track.artist or "").strip().casefold()
+    if not name:
+        return False
+    return name in ARTIST_UNKNOWN or any(hint in name for hint in _PLACEHOLDER_HINTS)
+
+
+def default_search_dir() -> Path:
+    """「以名找歌」在没有输出目录时的落点。
+
+    以名找歌**没有源文件可依附**，而写入进程工作目录（双击 exe 时就是它自己的
+    ``dist`` 目录）是历史事故；所以给一个固定、可预期、与音乐库同级的目录，
+    并在界面上明示当前生效目录。
+    """
+    return Path.home() / "Music" / "MusicDecryptor"
+
+
 @dataclass
 class JobResult:
     path: str
@@ -291,16 +327,24 @@ class Pipeline:
         except OSError:
             return False
 
-    def _out_dir_for(self, src: "str | Path") -> Path:
+    def _out_dir_for(self, src: "str | Path | None" = None) -> Path:
         """Resolve where a produced file goes.
 
         An explicitly configured ``output_dir`` wins; otherwise the output is
         written **next to the source file** - exactly what the UI promises -
         never the process working directory (which for a double-clicked exe
         would be its own install folder, ``dist``).
+
+        「以名找歌」没有源文件可依附（``src is None``）→ 落到
+        :func:`default_search_dir`，同样绝不落到进程工作目录。
         """
         configured = (self.settings.output_dir or "").strip()
-        target = Path(configured).expanduser() if configured else Path(src).resolve().parent
+        if configured:
+            target = Path(configured).expanduser()
+        elif src is not None:
+            target = Path(src).resolve().parent
+        else:
+            target = default_search_dir()
         try:
             target.mkdir(parents=True, exist_ok=True)
         except OSError as exc:
@@ -537,11 +581,192 @@ class Pipeline:
         return head + front + middle + defer
 
     def _fallback(self, src: Path, digest: str, *, note: str) -> JobResult:
-        readings = parse_song_filename_candidates(src.stem) or [(src.stem, "")]
-        query = filename_query(src.stem) or src.stem
+        """文件名模式：把文件名当查询词，走一遍「以名取资源」。"""
+        readings, query, requested = self._seed_from_name(src.stem)
         self._log(f"🔎 触发备用搜索：{query}")
+        consensus = self._nameless_artist(readings)
+        pool = self._collect_pool(src.stem, readings, query, requested,
+                                  consensus=consensus)
+        return self._take_from_pool(pool, src=src, digest=digest, note=note,
+                                    label=src.name, consensus=consensus)
+
+    # ---------------- 以名找歌（不依赖任何输入文件）------------------- #
+    @staticmethod
+    @staticmethod
+    def _nameless_artist(readings) -> bool:
+        """所有读法里都没有歌手 → 没有可比对的歌手参照（用户只给了歌名）。"""
+        return not any((a or "").strip() for _t, a in readings)
+
+    @staticmethod
+    def _dominant_artist(pool) -> "tuple[set, str, int, int]":
+        """只给了歌名时的**静默共识**：候选里出现最多的演唱者。
+
+        同一位歌手的多种写法（"周杰伦" / "周杰伦 Jay Chou" / "周杰伦、方文山"）按
+        **包含关系**归并，免得被平台命名差异拆散。
+
+        返回 ``(成员 id 集合, 展示名, 该组候选数, 有歌手的候选总数)``。
+        """
+        groups: "list[list]" = []          # [[归一化代表串, [Track, ...]], ...]
+        for track in pool:
+            name = (track.artist or "").strip()
+            if not name:
+                continue
+            key = (clean_text(name) or name).casefold()
+            for group in groups:
+                rep = group[0]
+                if key == rep or key in rep or rep in key:
+                    group[1].append(track)
+                    break
+            else:
+                groups.append([key, [track]])
+        if not groups:
+            return set(), "", 0, 0
+        groups.sort(key=lambda g: len(g[1]), reverse=True)
+        members = groups[0][1]
+        raw = [t.artist.strip() for t in members]
+        # 展示名必须**确定性**：票数并列时用 (最常见的 → 最短的 → 字典序) 兜底。
+        # 曾经写成 max(set(raw), key=raw.count) —— 并列时依赖 set 的迭代顺序，
+        # 而 Python 的字符串哈希每进程随机化，同一个输入会时对时错。
+        display = sorted(set(raw), key=lambda nm: (-raw.count(nm), len(nm), nm))[0]
+        return ({id(t) for t in members}, display, len(members),
+                sum(len(g[1]) for g in groups))
+
+    def _prefer_dominant_artist(self, pool) -> None:
+        """只给了歌名时，把"候选里出现最多的演唱者"排到前面（静默、只排序）。
+
+        **只调顺序，不删任何候选**：多数不一致时（例如三种写法各一个），它就等价于
+        "分数最高的那个仍在前面"，不会凭空制造偏好；最终下载谁仍要过时长核验。
+        """
+        ids, display, n, total = self._dominant_artist(pool)
+        if not ids:
+            return
+        pool.sort(key=lambda t: id(t) not in ids)
+        self._log(f"  · 只给了歌名：按候选里最多的演唱者「{display}」优先"
+                  f"（{n}/{total} 个候选，静默共识；不排除其它演唱者）")
+
+    @staticmethod
+    def _seed_from_name(seed: str) -> "tuple[list, str, set]":
+        """把一个名字（文件名，或搜索框里的「歌手 - 歌名」）解析成
+        ``(读法候选, 查询串, 点名版本标记)`` —— 与备用链路共用同一套解析。
+
+        先做**序号/符号清洗**（:func:`match.sanitize_query_text`）：点播清单粘过来的
+        ``1. 夜曲``／``2、发如雪`` 既污染发给音源的检索词、又过不了歌名 0.60 硬门槛
+        （实测 ``1. 夜曲`` vs ``夜曲`` 只有 0.57）。清洗只动序号与装饰符号，
+        **版本标记（Live / 伴奏…）原样保留**；清洗前的原读法作为额外读法保留 —— 只增不减。
+        """
+        cleaned, hint = sanitize_query(seed)
+        readings = list(parse_song_filename_candidates(cleaned)) if cleaned else []
+        if cleaned != (seed or "").strip():
+            # 清洗前的原读法作为"安全网"保留（只增不减）—— 但有个漏口必须堵上：
+            # 单段原文会给出**不含歌手**的读法（如「周杰伦·发如雪」→ ("周杰伦·发如雪","")），
+            # 它能靠"候选标题里含歌手名"过标题门槛，而歌手门槛因为读法没歌手直接放行
+            # （实测下到过「稳重的牧牛铃 - 周杰伦 - 发如雪」这种垃圾）。
+            # 所以：清洗后**已经**有带歌手的读法时，就不再放回无歌手的宽松读法。
+            cleaned_has_artist = any(a.strip() for _t, a in readings)
+            for extra in parse_song_filename_candidates(seed):
+                if extra in readings:
+                    continue
+                if cleaned_has_artist and not (extra[1] or "").strip():
+                    continue
+                readings.append(extra)
+        if hint:
+            # 「原唱：周杰伦」「歌手: 周杰伦」里抠出来的歌手 —— 补成读法，让歌手硬门槛有参照
+            for title, _artist in list(readings) or [(cleaned or seed, "")]:
+                if title and title != hint and (title, hint) not in readings:
+                    readings.append((title, hint))
+        if not readings:
+            readings = [(cleaned or seed, "")]
+        # 版本标记按**清洗后**的文本判定：`试听：夜曲` 里的「试听」是说明前缀，
+        # 不该被当成"用户点名要试听版"（那会关掉伴奏/改编过滤）。
+        return readings, (filename_query(cleaned) or cleaned or seed), \
+            version_markers(cleaned or seed)
+
+    @classmethod
+    def _seed_for(cls, name: str, artist: str = "") -> "tuple[str, list, str, set]":
+        """用户填的「歌名 / 歌手」→ 与文件名模式同构的 seed（两种读法都会被尝试）。"""
+        name = (name or "").strip()
+        artist = (artist or "").strip()
+        seed = f"{artist} - {name}" if (artist and name) else (name or artist)
+        readings, query, requested = cls._seed_from_name(seed)
+        if name and not artist:
+            # 手动搜索框里「夜曲 周杰伦」这种空格写法很自然：补两种读法（只增不减，
+            # 让歌手硬门槛有东西可比对，而不会把原本能过的匹配弄失败）。
+            for extra in space_split_readings(sanitize_query_text(name)):
+                if extra not in readings:
+                    readings.append(extra)
+        return seed, readings, query, requested
+
+    def search_candidates(self, name: str, *, artist: str = "") -> "list[Track]":
+        """**只检索、不下载**：返回已通过歌名/歌手硬门槛与版本过滤的候选（按匹配度排序）。
+
+        给「以名找歌」的人工挑选用。硬门槛一个都不放松 —— 用户只在**已经过门槛**的
+        候选里选，所以人工挑选不会削弱「歌名 + 歌手双重校验」这条红线。
+        """
+        seed, readings, query, requested = self._seed_for(name, artist)
+        return self._collect_pool(seed, readings, query, requested,
+                                  consensus=self._nameless_artist(readings))
+
+    def acquire(self, name: str, *, artist: str = "", chosen: "Track | None" = None,
+                note: str = "") -> JobResult:
+        """以名取资源：不依赖任何输入文件，走与备用链路**完全相同**的选源逻辑。
+
+        ``chosen=None`` → 自动选最优（一键）；给定 ``chosen`` 时锁定该候选，
+        仍要过时长核验与完整度门禁，失败如实报错（绝不偷偷换成别的版本）。
+        """
+        seed, readings, query, requested = self._seed_for(name, artist)
+        self._log(f"🔎 以名找歌：{query}"
+                  + (f"（指定歌手：{artist}）" if artist else ""))
+        consensus = self._nameless_artist(readings)
+        pool = self._collect_pool(seed, readings, query, requested, consensus=consensus)
+        label = f"{artist} - {name}" if (artist and name) else (name or artist)
+        return self._take_from_pool(pool, src=None, digest="", note=note, label=label,
+                                    chosen=chosen, exclusive=chosen is not None,
+                                    consensus=consensus)
+
+    def acquire_many(self, items) -> "list[JobResult]":
+        """批量以名找歌。``items`` 可以是 "歌名"、"歌手 - 歌名" 或 ``(歌名, 歌手)``。"""
+        items = list(items)
+        total = len(items)
+        results: "list[JobResult]" = []
+        for i, item in enumerate(items):
+            if self._cancel:
+                self._log("⛔ 已取消", level="result")
+                break
+            name, artist = item if isinstance(item, (tuple, list)) else (str(item), "")
+            label = f"{artist} - {name}" if (artist and name) else (name or artist)
+            # 筛选：清洗后没有歌名（只有序号/说明前缀，如「1.」「求：」「点播」）的行直接跳过，
+            # 不白跑一轮音源检索；结果里如实标注，便于核对。
+            usable, cleaned = looks_like_song_query(name)
+            if not usable:
+                res = JobResult(f"{SEARCH_PREFIX}{label}", label, "skipped",
+                                message="已跳过（清洗后没有歌名，只剩序号/说明前缀）")
+                results.append(res)
+                self._on_file(res)
+                self._progress(i + 1, total)
+                continue
+            try:
+                res = self.acquire(name, artist=artist)
+            except CancelledError:
+                self._log("⛔ 已取消", level="result")
+                break
+            except MusicDecryptorError as exc:
+                res = JobResult(f"{SEARCH_PREFIX}{label}", label, "failed",
+                                message=exc.message, detail=exc.detail)
+            except Exception as exc:  # noqa: BLE001 - 一条失败不拖垮整批
+                res = JobResult(f"{SEARCH_PREFIX}{label}", label, "failed",
+                                message="未预期的错误", detail=str(exc))
+            results.append(res)
+            self._on_file(res)
+            self._progress(i + 1, total)
+        return results
+
+    def _collect_pool(self, seed: str, readings, query: str, requested,
+                      *, consensus: bool = False) -> "list[Track]":
+        """检索 + 三道硬门槛 + 华语/无损排序 → 干净的候选池（按匹配度排序）。
+
+        **不下载、不探测**；文件名模式与「以名找歌」共用这一个池子。"""
         # 华语歌预匹配（静默、自动）：决定本次备用链路的信源顺序，不打扰用户
-        chinese = is_chinese_likely(src.stem, *[f"{t} {a}" for t, a in readings])
+        chinese = is_chinese_likely(seed, *[f"{t} {a}" for t, a in readings])
         search_order = self._search_order(chinese)
         if chinese and any(s.name == _CJK_FIRST_SOURCE or s.name in _CJK_DEFER_SOURCES
                            for s in search_order):
@@ -555,7 +780,7 @@ class Pipeline:
                       " / ".join(f"歌名「{t}」歌手「{a}」" for t, a in readings))
 
         # 文件名自带版本标记 -> 用户主动点名要该版本：不过滤，但必须警告
-        requested = version_markers(src.stem)
+        requested = version_markers(seed)
         if requested:
             self._log("  · ⚠ 文件名包含版本标记「" + "、".join(sorted(requested)) +
                       "」，本次将保留该版本；若你要的是原曲，请把文件名改干净后重试")
@@ -618,13 +843,41 @@ class Pipeline:
 
         # 跨音源择优：不再"第一个能用的音源就算"，而是所有音源一起比，分高者先下
         pool.sort(key=lambda t: t.score, reverse=True)
+        if consensus:
+            self._prefer_dominant_artist(pool)
+        return pool
+
+    def _take_from_pool(self, pool, *, src, digest, note, label,
+                        chosen: "Track | None" = None, exclusive: bool = False,
+                        consensus: bool = False) -> JobResult:
+        """候选池 → 跨平台时长核验 → 下载 → 校验/完整度门禁 → 落盘（两种模式共用）。"""
+        adapters = self._adapters
+        index = self.index
+        consensus_ids = self._dominant_artist(pool)[0] if consensus else set()
+        # 查询里**给了歌手**时，"群星/未知"这类占位候选不算可信证据：既不拿它当参考时长，
+        # 也让位给"有明确歌手"的候选。一个明确歌手的候选都没有时才原样使用（不硬删）。
+        placeholder_ids = ({id(t) for t in pool if _placeholder_credit(t)}
+                           if not consensus else set())
+
+        def _credited(tracks) -> "list[Track]":
+            """丢掉占位歌手候选（仅当查询给了歌手、且还有其它候选可依据时）。"""
+            items = list(tracks)
+            if not placeholder_ids:
+                return items
+            kept = [t for t in items if id(t) not in placeholder_ids]
+            return kept or items
+        # 注：入参 `note`（文件名模式传进来的“需联网”原因）在此处被下面的
+        # 时长核验结论覆盖 —— 这是**历史行为**，本次重构原样保留，
+        # 以免改动既有结果文案。
+
 
         # ---- 时长核验（静默、跨平台）-------------------------------------- #
         # 参考时长绝不能只信"正在提供文件的这个平台"：实测同一首歌在不同平台的标注
         # 可能一个是被截短的（周杰伦《最长的电影》：酷我 2:22 / 酷狗 3:55，后者才对）。
         # 因此跨平台取"最完整且不离群"的标注作为参考，全程自动、不打扰用户。
-        declared = ([t.duration for t in pool if t.duration and t.score >= EARLY_STOP_SCORE]
-                    or [t.duration for t in pool if t.duration])
+        strong = [t for t in pool if t.duration and t.score >= EARLY_STOP_SCORE]
+        declared = [t.duration for t in _credited(strong or
+                                                 [t for t in pool if t.duration])]
         reference = _plausible_max(declared)
         tolerance = max(TOL_ABS, TOL_REL * reference) if reference else TOL_ABS
         if reference:
@@ -658,7 +911,8 @@ class Pipeline:
             self._log("  · 已降权 " + " + ".join(bits)
                       + "：先测其它来源/正片，仍未测到可用候选才回头补测；"
                         "全程只降权、不做硬性排除")
-        measured = [t.actual_duration for t in candidates if t.actual_duration]
+        measured = [t.actual_duration
+                    for t in _credited([t for t in candidates if t.actual_duration])]
         if len(measured) >= 2:
             # 有两个以上真实文件测出了时长 —— 这是"原曲原时长"最硬的一手证据，
             # 直接以它为准，平台标注只作旁证（标注本身可能就是被剪短版本的）。
@@ -709,12 +963,17 @@ class Pipeline:
         # 但用户明确要无损时，把"唯一能给真无损"的源排到最前 —— 否则前面的源
         # 只会给 128k mp3，等于把"选 FLAC"变成空承诺。两者都只在该候选**已通过
         # 全部硬门槛与时长核验**之后再排，不影响正确性。
+        # 只给了歌名时，"多数演唱者"先于其它演唱者（仍然全部要过时长核验）
         if self._want_lossless():
-            verified.sort(key=lambda t: (t.source != _LOSSLESS_FIRST_SOURCE, -t.score,
+            verified.sort(key=lambda t: (id(t) in placeholder_ids,
+                                         id(t) not in consensus_ids,
+                                         t.source != _LOSSLESS_FIRST_SOURCE, -t.score,
                                          t.short_asset,
                                          t.source in _LAST_RESORT_SOURCES))
         else:
-            verified.sort(key=lambda t: (-t.score, t.short_asset,
+            verified.sort(key=lambda t: (id(t) in placeholder_ids,
+                                         id(t) not in consensus_ids, -t.score,
+                                         t.short_asset,
                                          t.source in _LAST_RESORT_SOURCES))
         unverified = [t for t in candidates if not t.actual_duration]
         # 「开放库例外」：只在**没有任何"偏短/偏长/短资源"证据**时才启用
@@ -773,6 +1032,22 @@ class Pipeline:
         if flagged and flagged == len(order):
             self._log("  · ⚠ 所有候选匹配度都偏低，结果可能不准确")
 
+        # 「以名找歌」的人工挑选：只在**已经过全部硬门槛与时长核验**的候选里锁定，
+        # 门槛一个都不放松；用户点名的那条若没通过核验，就如实报错，不偷偷换别的版本。
+        if chosen is not None:
+            # 人工挑选的候选来自**另一次**检索（对象是新造的、音源名一致）→ 必须按
+            # 「同一音源 + 同一资源指纹」重新定位；用对象身份比对会永远匹配不上。
+            key = (chosen.source, dedupe_key(chosen))
+            picked = [t for t in order
+                      if t is chosen or (t.source, dedupe_key(t)) == key]
+            if not picked:
+                raise SearchNoResultError(
+                    "你选择的候选未通过时长核验（实测时长与参考不符），本次不下载",
+                    detail=f"{chosen.source} “{chosen.title}”（{chosen.artist}）")
+            self._log(f"  · 已锁定你选择的候选：{chosen.source} “{chosen.title}”"
+                      f"（{chosen.artist}）")
+            order = picked if exclusive else picked + [t for t in order if t is not chosen]
+
         def _remember(track: Track, ok: bool) -> None:
             """把这次资源结果写进台账（失败也记，便于下次不再白试）。"""
             index.note_resource(dedupe_key(track), track.source, track.url or "",
@@ -823,18 +1098,20 @@ class Pipeline:
                 self._log(f"  · 择优采用：{track.source} “{track.title}”({track.artist}) "
                           f"{track.score:.2f} 优于 次选 {runner.source} “{runner.title}” {runner.score:.2f}")
             _remember(track, ok=True)
-            return self._write_downloaded(src, track, data, v, digest, note=note)
+            return self._write_downloaded(src, track, data, v, digest, note=note, label=label)
 
         raise SearchNoResultError(
             "候选音源均不可用（无版权/校验失败/反爬），请更换关键词或手动补全直链",
             detail=note)
-
-    def _write_downloaded(self, src: Path, track: Track, data: bytes, v, digest: str,
-                          *, note: str = "") -> JobResult:
-        data, out_ext, fmt_note = self._final_format(data, v.ext, src.name)
+    def _write_downloaded(self, src: "Path | None", track: Track, data: bytes, v,
+                          digest: str, *, note: str = "", label: str = "") -> JobResult:
+        """落盘。``src=None`` 即「以名找歌」：没有源文件可依附，也不删任何东西。"""
+        display = label or (src.name if src is not None else "")
+        data, out_ext, fmt_note = self._final_format(data, v.ext, display)
         note = "；".join(x for x in (note, fmt_note) if x)
         out_dir = self._out_dir_for(src)
-        base = self._safe_name(track.artist, track.title or src.stem)
+        base = self._safe_name(track.artist,
+                               track.title or (src.stem if src is not None else display))
         out_path = self._unique(out_dir, base, out_ext)
         _atomic_write(out_path, data)
 
@@ -852,7 +1129,7 @@ class Pipeline:
 
         if digest and self.settings.remember_hashes:
             self.cache.add(digest, out_path=str(out_path), mode="fallback", fmt=out_ext, source=track.source)
-        if not self.settings.keep_original:
+        if src is not None and not self.settings.keep_original:
             try:
                 src.unlink()
             except OSError:
@@ -860,9 +1137,11 @@ class Pipeline:
 
         br = f"，{v.bitrate}kbps" if (v.bitrate and out_ext == v.ext) else ""
         dur = f"，时长 {format_seconds(track.actual_duration)}" if track.actual_duration else ""
-        self._log(f"✅ 备用下载完成：{src.name} → {out_path.name}  [{out_ext.upper()}{br}{dur}] "
+        tag = "备用下载" if src is not None else "以名找歌"
+        self._log(f"✅ {tag}完成：{display} → {out_path.name}  [{out_ext.upper()}{br}{dur}] "
                   f"来源：{track.source}" + (f"  ⚠ {note}" if note else ""), level="result")
-        return JobResult(str(src), src.name, "downloaded", mode="fallback", out_path=str(out_path),
+        return JobResult(str(src) if src is not None else f"{SEARCH_PREFIX}{display}",
+                         display, "downloaded", mode="fallback", out_path=str(out_path),
                          fmt=out_ext, bitrate=v.bitrate, source=track.source,
                          message="完成" if not note else f"完成（{note}）")
 
