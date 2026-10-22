@@ -1,14 +1,17 @@
 """Song-name normalisation and best-match ranking."""
 from __future__ import annotations
 
+import functools
 import re
 import unicodedata
 from difflib import SequenceMatcher
 from typing import Sequence
 
+from . import jp
 from .model import Track
 
 __all__ = ["ARTIST_UNKNOWN", "artist_match_score", "best_reading_match",
+           "cross_similarity",
            "sanitize_query", "sanitize_query_text", "looks_like_song_query",
            "space_split_readings",
            "title_gate_ok",
@@ -123,13 +126,14 @@ def version_markers(text: str) -> "set[str]":
     return hits
 
 
-def original_markers(text: str) -> "set[str]":
-    """明确的原曲/录音室标记。"""
+@functools.lru_cache(maxsize=4096)
+def original_markers(text: str) -> "frozenset[str]":
+    """明确的原曲/录音室标记（结果只读，记忆化以省下重复归一化开销）。"""
     norm = normalize_for_version(text)
     if not norm:
-        return set()
+        return frozenset()
     tokens = set(norm.split())
-    return {w for w in _ORIGINAL_WORDS if w in tokens or w in norm}
+    return frozenset(w for w in _ORIGINAL_WORDS if w in tokens or w in norm)
 
 
 def has_extra_qualifier(wanted: str, candidate: str) -> bool:
@@ -473,8 +477,38 @@ def similarity(a: str, b: str) -> float:
     return ratio
 
 
+def _ascii_ish(text: str) -> bool:
+    t = (text or "").strip()
+    return bool(t) and all(ord(ch) < 128 for ch in t) and any(ch.isalpha() for ch in t)
+
+
+@functools.lru_cache(maxsize=8192)
+def cross_similarity(a: str, b: str) -> float:
+    """原文相似度的加强版：任一侧呈日语形态时，追加**确定性读音形态**再取最大。
+
+    只做确定性转换（假名/罗马音/内置表读音）：查不到读音的一侧不参与，
+    因此不会凭空放大相似度。中文对中文等场景与 :func:`similarity` 完全一致。
+    """
+    base = similarity(a, b)
+    if not (jp.has_kana(a) or jp.has_kana(b) or _ascii_ish(a) or _ascii_ish(b)):
+        return base
+    try:
+        fa, fb = jp.match_forms(a), jp.match_forms(b)
+    except Exception:                                    # noqa: BLE001 - 比对绝不能炸
+        return base
+    if not fa or not fb:
+        return base
+    best = base
+    for x in fa:
+        for y in fb:
+            value = similarity(x, y)
+            if value > best:
+                best = value
+    return best
+
+
 def _score_one(title: str, artist: str, track: Track, duration: int, prefer_ext: str) -> float:
-    score = 0.72 * similarity(title, track.title) + 0.28 * similarity(artist, track.artist)
+    score = 0.72 * cross_similarity(title, track.title) + 0.28 * cross_similarity(artist, track.artist)
     if duration and track.duration:
         delta = abs(duration - track.duration)
         score += 0.12 * max(0.0, 1.0 - delta / 15.0)          # <=15s counts as a match
@@ -515,7 +549,7 @@ def title_match_score(readings: "Sequence[tuple[str, str]]", track: Track) -> fl
         elif wanted in norm_title:
             best = max(best, 0.85)
         else:
-            best = max(best, similarity(want, track.title))
+            best = max(best, cross_similarity(want, track.title))
     return best
 
 
@@ -601,7 +635,7 @@ def artist_match_score(readings: "Sequence[tuple[str, str]]", track: Track) -> f
         elif _artist_contains(cand_norm, want) or _artist_contains(want, cand_norm):
             best = max(best, 0.85)
         else:
-            best = max(best, similarity(artist, track.artist))
+            best = max(best, cross_similarity(artist, track.artist))
     return best
 
 
@@ -623,14 +657,61 @@ def title_gate_ok(want_title: str, want_artist: str, track: Track) -> bool:
     if norm_want == norm_cand:
         return True
     if norm_want not in norm_cand:
-        return False
+        return _jp_title_gate_ok(want_title, track.title, want_artist, track.artist)
     leftover = [tok for tok in norm_cand.replace(norm_want, " ").split() if tok]
     if not leftover:
         return True
     artist_tokens = _artist_tokens(want_artist) if (want_artist or "").strip() else set()
-    if not artist_tokens:
+    if artist_tokens and all(any(tok in a or a in tok for a in artist_tokens) for tok in leftover):
+        return True
+    return _jp_title_gate_ok(want_title, track.title, want_artist, track.artist)
+
+
+#: 跨书写系统「就是这首歌」的高相似兜底阈值（读音形态、空格/长音折叠后比对）。
+#: 定在 0.92：足以容忍连浊「千本桜=せんぼんざくら vs senbonsakura」这类单点差异，
+#: 又拦得住「同歌手另一首歌」——而且它只是**追加**通道，原硬门槛一字未放松。
+_JP_STRICT_SIMILARITY = 0.92
+
+
+def _jp_title_gate_ok(want_title: str, cand_title: str, want_artist: str,
+                      cand_artist: str) -> bool:
+    """日语跨书写系统的歌名强判定（读音形态上的「相等/包含」，再加高相似兜底）。
+
+    适用前提：至少一侧含假名、或至少一侧是纯拉丁（罗马音输入）。
+    一侧读不出读音（表里没有的汉字）时不参与 —— 不猜。
+    """
+    if not (jp.has_kana(want_title) or jp.has_kana(cand_title)
+            or _ascii_ish(want_title) or _ascii_ish(cand_title)):
         return False
-    return all(any(tok in a or a in tok for a in artist_tokens) for tok in leftover)
+    try:
+        fa, fb = jp.match_forms(want_title), jp.match_forms(cand_title)
+    except Exception:                                    # noqa: BLE001
+        return False
+    if not fa or not fb:
+        return False
+    arts: "set[str]" = set()
+    for value in (want_artist, cand_artist):
+        if (value or "").strip():
+            try:
+                arts.update(jp.match_forms(value))
+            except Exception:                            # noqa: BLE001
+                pass
+            arts.add(value.strip().casefold())
+    best = 0.0
+    for x in fa:
+        for y in fb:
+            if x == y:
+                return True
+            if x and x in y:
+                leftover = [tok for tok in y.replace(x, " ").split() if tok]
+                if not leftover:
+                    return True
+                if arts and all(any(tok in art for art in arts) for tok in leftover):
+                    return True
+            value = similarity(x, y)
+            if value > best:
+                best = value
+    return best >= _JP_STRICT_SIMILARITY
 
 
 def best_reading_match(readings: "Sequence[tuple[str, str]]", track: Track, *,

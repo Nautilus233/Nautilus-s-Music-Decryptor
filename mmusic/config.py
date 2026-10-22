@@ -104,6 +104,11 @@ class Settings:
     qqmusic_key: str = ""
     # 拖入/添加文件后自动开始处理（同事最省事；可在 设置→行为 关闭）
     auto_start: bool = True
+    #: 极速模式（用户 2026-10-22 明确要求，默认关）：首个可用音源命中即收工，
+    #: 跳过其余音源的**跨平台时长交叉核验** —— 速度与精确度由使用者显式取舍。
+    #: 注意：只减少"多源交叉核验"，歌名+歌手硬门槛、实测时长下限、完整度门禁
+    #: 与下载校验**全部照常执行**（正文见 DESIGN §3.9.2）。
+    fast_mode: bool = False
 
     def to_dict(self) -> dict:
         return asdict(self)

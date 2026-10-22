@@ -1497,6 +1497,143 @@ def test_migu_source() -> None:
     check("migu: no-free tracks raise a readable error", ok)
 
 
+def test_jp_romaji() -> None:
+    """日语罗马音适配：确定性转换、检索变体、跨书写系统比对与硬门槛。"""
+    print("\n[jp romaji/kana adaptation]")
+    from mmusic import jp
+    from mmusic.match import cross_similarity, title_gate_ok
+    from mmusic.model import Track
+
+    check("jp: romaji->kana (hepburn)", jp.romaji_to_kana("yorushika") == "よるしか")
+    check("jp: alternative spellings si/ti/tu/hu/zi",
+          jp.romaji_to_kana("sikaku") == "しかく"
+          and jp.romaji_to_kana("tune") == "つね"
+          and jp.romaji_to_kana("huzi") == "ふじ")
+    check("jp: sokuon/youon/moraic-n",
+          jp.romaji_to_kana("kitto") == "きっと"
+          and jp.romaji_to_kana("matcha") == "まっちゃ"
+          and jp.romaji_to_kana("shinjuku") == "しんじゅく")
+    check("jp: kana->romaji",
+          jp.kana_to_romaji("ありがとう") == "arigatou"
+          and jp.kana_to_romaji("テーゼ") == "teeze")
+    check("jp: non-romaji ASCII is left alone", jp.romaji_to_kana("hotel california") is None)
+
+    sv = jp.search_variants("yorushika")
+    check("jp: romaji query gains katakana", bool(sv) and sv[0][0] == "ヨルシカ", str(sv))
+    sv2 = jp.search_variants("よるしか")
+    check("jp: hiragana query gains katakana + romaji",
+          bool(sv2) and sv2[0][0] == "ヨルシカ" and any(t == "yorushika" for t, _r in sv2),
+          str(sv2))
+    check("jp: pure kanji gets no variant (could be Chinese)",
+          jp.search_variants("夜曲") == [])
+
+    check("jp: cross-script similarity",
+          cross_similarity("arigatou", "ありがとう") >= 0.99
+          and cross_similarity("zankoku na tenshi no teze", "残酷な天使のテーゼ") >= 0.90,
+          f"{cross_similarity('arigatou', 'ありがとう'):.2f} / "
+          f"{cross_similarity('zankoku na tenshi no teze', '残酷な天使のテーゼ'):.2f}")
+
+    real = Track("s", "残酷な天使のテーゼ", "高橋洋子")
+    check("jp: strict title gate passes across scripts",
+          title_gate_ok("Zankoku na Tenshi no Teze", "高橋洋子", real))
+    other = Track("s", "魂のルフラン", "高橋洋子")
+    check("jp: a different song is still rejected",
+          not title_gate_ok("Zankoku na Tenshi no Teze", "高橋洋子", other))
+
+
+def test_jp_tables() -> None:
+    """内置日语表：热门曲/歌手读音反查（罗马音 → 片假名检索变体）。"""
+    print("\n[jp built-in tables]")
+    from mmusic import jp
+
+    sv = jp.search_variants("senbonzakura")
+    check("jp tables: senbonzakura -> センボンザクラ", bool(sv) and sv[0][0] == "センボンザクラ",
+          str(sv))
+    sv2 = jp.search_variants("gurenge")
+    check("jp tables: gurenge -> グレンゲ", bool(sv2) and sv2[0][0] == "グレンゲ", str(sv2))
+    cat = jp.artist_katakana("kenshi yonezu")
+    check("jp tables: artist reading for romaji input",
+          cat in ("ヨネヅ ケンシ", "ヨネズ ケンシ"), str(cat))
+    known = jp.known_kind("ヨルシカ")
+    check("jp tables: known artist detected for variant ordering", known == "artist", str(known))
+
+
+def test_fuzzy_input() -> None:
+    """模糊输入纠错：中文混淆字/拉丁错字 —— 只改「搜什么」，门槛写法不动。"""
+    print("\n[fuzzy input correction]")
+    from mmusic.fuzzy import corrected_readings, corrections_for
+    from mmusic.match import best_reading_match
+    from mmusic.model import Track
+    from mmusic.pipeline import MIN_ARTIST_SIMILARITY, MIN_TITLE_SIMILARITY
+
+    got = corrections_for("睛天", limit=2)
+    check("fuzzy: 睛天 -> 晴天 first", got[:1] == ["晴天"], str(got))
+    got2 = corrections_for("夜取", limit=2)
+    check("fuzzy: 夜取 -> 夜曲 first", got2[:1] == ["夜曲"], str(got2))
+    got3 = corrections_for("yroushika", limit=2)
+    check("fuzzy: latin transposition", "yorushika" in got3, str(got3))
+    check("fuzzy: capped output", len(corrections_for("睛天", limit=2)) <= 2)
+
+    good = Track("s", "晴天", "周杰伦")
+    typo_readings = [("睛天", "周杰伦")]
+    ok_raw = best_reading_match(typo_readings, good, min_title=MIN_TITLE_SIMILARITY,
+                                min_artist=MIN_ARTIST_SIMILARITY)[0]
+    check("fuzzy: the raw typo alone does not pass the gate", not ok_raw)
+    alt = corrected_readings(typo_readings)
+    ok_fixed = best_reading_match(alt, good, min_title=MIN_TITLE_SIMILARITY,
+                                  min_artist=MIN_ARTIST_SIMILARITY)[0]
+    check("fuzzy: the corrected reading passes", ok_fixed)
+    bad = Track("s", "晴天", "林俊杰")
+    ok_bad = best_reading_match(alt, bad, min_title=MIN_TITLE_SIMILARITY,
+                                min_artist=MIN_ARTIST_SIMILARITY)[0]
+    check("fuzzy: correction never bypasses the artist gate", not ok_bad)
+
+
+def test_fuzzy_e2e() -> None:
+    """模糊输入端到端：文件名里带错别字（睛天）也能下到正确歌曲。"""
+    print("\n[fuzzy input: end-to-end]")
+    PAYLOAD = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\xcd" * 40000
+
+    class TypoSource(SearchSource):
+        def __init__(self, path):
+            super().__init__(None, {})
+            self.name = self.label = "typo"
+            self.calls: list[str] = []
+            self._path = str(path)
+
+        def search(self, query, *, quality="mp3", limit=10):
+            self.calls.append(query)
+            # 只认正确的写法：逼出「首轮/次轮无果 → 第三轮纠错候选」的完整路径
+            if "晴天" not in query:
+                return []
+            return [Track(self.name, "晴天", "周杰伦", ext="mp3", raw={"path": self._path})]
+
+        def resolve(self, track, *, quality="mp3"):
+            track.url = Path(track.raw["path"]).resolve().as_uri()
+            track.ext = "mp3"
+            return track
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        p = tmp / "a.mp3"
+        p.write_bytes(PAYLOAD)
+        src = tmp / "周杰伦 - 睛天.mgg"
+        src.write_bytes(os.urandom(8188) + b"STag")
+        source = TypoSource(p)
+        logs: list[str] = []
+        pipe = Pipeline(Settings(output_dir=str(tmp / "out"), enable_fallback=True,
+                                 write_metadata=False, fetch_cover=False,
+                                 remember_hashes=False),
+                        cache_path=tmp / "c.json", on_log=logs.append, sources=[source])
+        res = pipe.process_file(src)
+        got = Path(res.out_path).read_bytes() if res.out_path else b""
+        check("fuzzy e2e: the corrected phrasing is searched (later sweep)",
+              any("晴天" in c for c in source.calls), str(source.calls))
+        check("fuzzy e2e: file downloaded", got == PAYLOAD, " | ".join(logs[-3:]))
+        check("fuzzy e2e: log names the correction",
+              any(("纠错读法" in m) or ("纠错候选" in m) for m in logs), " | ".join(logs[-8:]))
+
+
 def test_language_prefilter() -> None:
     """华语预匹配（静默）：汉字检测 + 内置歌手名单；只影响排序，不参与校验。"""
     print("\n[language prefilter: chinese-likely detection]")
@@ -1515,6 +1652,11 @@ def test_language_prefilter() -> None:
           not is_chinese_likely("Hotel California", "Eagles")
           and not is_chinese_likely("Shape of You", "Ed Sheeran")
           and not is_chinese_likely("Yesterday Once More", "Carpenters"), "")
+    check("lang: kana text also counts (J-pop -> same ordering)",
+          is_chinese_likely("ありがとう") and is_chinese_likely("ヨルシカ ただ君に晴れ"), "")
+    check("lang: convertible romaji counts too (skips slow CC/PD first)",
+          is_chinese_likely("yorushika tada kimi ni hare")
+          and is_chinese_likely("zankoku na tenshi no teze"), "")
 
 
 def test_cjk_order_e2e() -> None:
@@ -2737,6 +2879,55 @@ def test_input_audit() -> None:
     check(f"audit: fuzz 畸形输入不抛异常（{len(junk)} 例）", not boom, "; ".join(boom[:3]))
 
 
+def test_fast_mode_e2e() -> None:
+    """极速模式：首个可用音源命中即收工；关闭时照旧多源遍历（跨平台核验）。"""
+    print("\n[fast mode: stop at the first usable source]")
+    PAYLOAD = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\xcd" * 40000
+
+    class HitSource(SearchSource):
+        def __init__(self, path, name):
+            super().__init__(None, {})
+            self.name = self.label = name
+            self.calls = 0
+            self._path = str(path)
+
+        def search(self, query, *, quality="mp3", limit=10):
+            self.calls += 1
+            return [Track(self.name, "晴天", "周杰伦", ext="mp3", raw={"path": self._path})]
+
+        def resolve(self, track, *, quality="mp3"):
+            track.url = Path(track.raw["path"]).resolve().as_uri()
+            track.ext = "mp3"
+            return track
+
+    def _run(fast: bool):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            payload = tmp / "a.mp3"
+            payload.write_bytes(PAYLOAD)
+            src = tmp / "周杰伦 - 晴天.mgg"
+            src.write_bytes(os.urandom(8188) + b"STag")
+            first, second = HitSource(payload, "src1"), HitSource(payload, "src2")
+            logs: list[str] = []
+            pipe = Pipeline(Settings(output_dir=str(tmp / "out"), enable_fallback=True,
+                                     write_metadata=False, fetch_cover=False,
+                                     remember_hashes=False, fast_mode=fast),
+                            cache_path=tmp / "c.json", on_log=logs.append,
+                            sources=[first, second])
+            res = pipe.process_file(src)
+            got = Path(res.out_path).read_bytes() if res.out_path else b""
+            return first, second, got, logs
+
+    _s1, s2, got, logs = _run(True)
+    check("fast: the first usable source is downloaded", got == PAYLOAD, " | ".join(logs[-3:]))
+    check("fast: remaining sources are not consulted", s2.calls == 0, f"src2 calls={s2.calls}")
+    check("fast: the log explains the trade-off", any("极速模式" in m for m in logs),
+          " | ".join(logs[-6:]))
+    _s1b, s2b, got2, _logs2 = _run(False)
+    check("fast: default (off) keeps cross-source verification",
+          s2b.calls >= 1 and got2 == PAYLOAD, f"src2 calls={s2b.calls}")
+
+
 def test_search_output_dir() -> None:
     """以名找歌的输出目录：专用 → 主 → 默认（按需按优），且与解密模式互不影响。"""
     print("\n[search output dir: 按需按优]")
@@ -2780,11 +2971,14 @@ def test_settings_roundtrip() -> None:
     """设置项往返：凭证 / 自动开始 / 目标音质等字段不丢、类型正确。"""
     print("\n[settings: round-trip]")
     from mmusic.config import Settings
-    s = Settings(quality="flac", qqmusic_uin="1", qqmusic_key="K", auto_start=False)
+    s = Settings(quality="flac", qqmusic_uin="1", qqmusic_key="K", auto_start=False,
+                 fast_mode=True)
     back = Settings.from_dict(s.to_dict())
     check("settings: new fields round-trip (creds / auto-start / quality)",
           back.qqmusic_uin == "1" and back.qqmusic_key == "K"
           and back.auto_start is False and back.quality == "flac")
+    check("settings: fast mode round-trips and defaults off",
+          back.fast_mode is True and Settings().fast_mode is False)
 
 
 def test_lossless_first_source() -> None:
@@ -3469,6 +3663,11 @@ def main() -> int:
     test_query_sanitize()
     test_placeholder_artist()
     test_input_audit()
+    test_jp_romaji()
+    test_jp_tables()
+    test_fuzzy_input()
+    test_fuzzy_e2e()
+    test_fast_mode_e2e()
     test_search_output_dir()
     test_settings_roundtrip()
     test_portable_config_dir()

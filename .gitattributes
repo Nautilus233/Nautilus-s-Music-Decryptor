@@ -4,6 +4,8 @@
 *.md    text eol=lf
 *.json  text eol=lf
 *.ps1   text eol=crlf
+# 内置数据表：按二进制处理，保证字节稳定（加载器同时兼容 CRLF，双保险）
+mmusic/data/** binary
 *.ico   binary
 *.png   binary
 *.docx  binary

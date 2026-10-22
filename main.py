@@ -66,6 +66,8 @@ def run_cli(paths, args) -> int:
         config.settings.enable_fallback = False
     if getattr(args, "search_output", None):
         config.settings.search_output_dir = args.search_output
+    if getattr(args, "fast", False):
+        config.settings.fast_mode = True
     links: list[str] = []
     if args.links:
         links += [x for x in re.split(r"[,\n;]+", args.links) if x.strip()]
@@ -138,12 +140,16 @@ def main(argv=None) -> int:
     parser.add_argument("--check-ui", action="store_true", help="自检：校验主窗口与设置弹窗的屏幕自适应")
     parser.add_argument("--check-transcode", action="store_true",
                         help="自检：转码引擎（FFmpeg 库）能在冻结产物里加载并转出文件")
+    parser.add_argument("--check-jp", action="store_true",
+                        help="自检：日语表能在冻结产物里加载（假名/罗马音/读音/纠错）")
     parser.add_argument("--check-worker", action="store_true",
                         help="自检：跑一次后台任务后正常退出（验证 QThread 生命周期）")
     parser.add_argument("--query", action="append",
                         help="以名找歌：歌名（可重复该参数；也支持逗号/分号/换行分隔多条，无需输入文件）")
     parser.add_argument("--query-file", help="以名找歌：从文本文件读取歌名（每行一条）")
     parser.add_argument("--search-output", help="以名找歌专用输出目录（不填则跟随 --output / 默认目录）")
+    parser.add_argument("--fast", action="store_true",
+                        help="极速模式：首个可用音源命中即收工（跳过跨平台时长核验）")
     parser.add_argument("--links", help="手动补链：直链或本地路径（逗号/换行分隔），优先于自动音源")
     parser.add_argument("--links-file", help="从文本文件读取补链（每行一条）")
     parser.add_argument("--sources-report", action="store_true",
@@ -222,6 +228,28 @@ def main(argv=None) -> int:
         print(f"转码引擎 OK：{transcode.engine_info()} → {len(data)} 字节 .{out_ext}")
         return 0 if ok else 1
 
+    if args.check_jp:
+        _ensure_utf8_console()
+        from mmusic import fuzzy, jp
+
+        checks: "list[tuple[str, bool, str]]" = []
+
+        def _ck(name: str, cond, extra: str = "") -> None:
+            checks.append((name, bool(cond), extra))
+
+        _ck("romaji->kana", jp.romaji_to_kana("yorushika") == "\u3088\u308b\u3057\u304b")
+        _ck("kana->romaji", jp.kana_to_romaji("\u3042\u308a\u304c\u3068\u3046") == "arigatou")
+        _ck("katakana variant", jp.search_variants("yorushika")[:1] == [("\u30e8\u30eb\u30b7\u30ab", "\u65e5\u6587\u7247\u5047\u540d\u8bfb\u97f3")],
+            str(jp.search_variants("yorushika")))
+        forms = jp.match_forms("\u6b8b\u9177\u306a\u5929\u4f7f\u306e\u30c6\u30fc\u30bc")
+        _ck("reading table loaded", any(f == "zankokunatenshinoteze" for f in forms), str(forms))
+        corrections = fuzzy.corrections_for("\u775b\u5929", limit=2)
+        _ck("cjk correction table", corrections[:1] == ["\u6674\u5929"], str(corrections))
+        failed = [name for name, good, _extra in checks if not good]
+        for name, good, extra in checks:
+            print(("OK  " if good else "FAIL") + f" {name}" + (f"  {extra}" if extra and not good else ""))
+        print("jp checks: " + ("OK" if not failed else "FAILED: " + ", ".join(failed)))
+        return 1 if failed else 0
     if args.sources_report:
         _ensure_utf8_console()
         from mmusic.config import AppConfig, default_config_dir

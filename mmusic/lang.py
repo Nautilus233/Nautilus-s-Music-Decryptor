@@ -1,11 +1,12 @@
-"""华语歌预匹配（零依赖，纯启发式）。
+"""亚洲语歌预匹配（零依赖，纯启发式）。
 
 用于备用链路的**静默**排序决策：命中（任一即算）时，本次按
 “咪咕优先 + 维基共享/互联网档案馆垫底且按需检索”执行；
 未命中则维持用户已配置的音源顺序，不做任何额外动作。
 
 规则：
-1. 任意文本里含汉字（CJK 统一表意文字）；
+1. 任意文本里含汉字（CJK 统一表意文字）**或假名**（日语歌适用同一排序：
+   实测咪咕对 J-pop 覆盖不错，而 CC/PD 库几乎只有西语/古典）；
 2. 歌手文本命中内置的常见华语歌手名单（含常用英文/拼音写法）。
 
 只做“倾向”判断、不求完备：判错的代价只是源顺序微调或省/多一次
@@ -14,6 +15,8 @@
 from __future__ import annotations
 
 import re
+
+from . import jp
 
 __all__ = ["POPULAR_ARTISTS", "contains_han", "is_chinese_likely"]
 
@@ -49,7 +52,9 @@ def is_chinese_likely(*texts: str) -> bool:
     joined = " ".join(t for t in texts if t)
     if not joined:
         return False
-    if _HAN.search(joined):
+    # 汉字、假名、以及「可完整罗马音化」的输入（yorushika / zankoku na tenshi no teze）
+    # 都按亚洲语处理：咪咕优先、CC/PD 垫底 —— 少打扰两个慢速开放库，实测更省时。
+    if _HAN.search(joined) or jp.looks_japanese(joined):
         return True
     norm = joined.casefold()
     return any(artist in norm for artist in POPULAR_ARTISTS)

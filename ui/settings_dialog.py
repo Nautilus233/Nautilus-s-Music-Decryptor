@@ -142,8 +142,12 @@ class SettingsDialog(QDialog):
         self.chk_keep = QCheckBox("保留原始加密文件")
         self.chk_cache = QCheckBox("启用哈希去重缓存（避免重复解密/下载）")
         self.chk_auto = QCheckBox("拖入文件后自动开始处理（同事最省事）")
+        self.chk_fast = QCheckBox("极速模式：首个可用音源命中即收工（更快，跳过跨平台时长核验）")
+        self.chk_fast.setToolTip("开启后取歌更快，但不再用其它平台的时长互相印证；\n"
+                                 "默认关闭 = 精确优先。歌名/歌手门槛与下载校验不受影响。")
         for cb in (self.chk_fallback, self.chk_meta, self.chk_cover,
-                   self.chk_overwrite, self.chk_keep, self.chk_cache, self.chk_auto):
+                   self.chk_overwrite, self.chk_keep, self.chk_cache, self.chk_auto,
+                   self.chk_fast):
             bv.addWidget(cb)
         body.addWidget(gb_beh)
 
@@ -195,6 +199,7 @@ class SettingsDialog(QDialog):
         self.qq_key.setText(s.qqmusic_key or "")
         self.gb_ekey.setChecked(bool(s.qqmusic_key))   # 已配置则展开，便于管理员查看
         self.chk_auto.setChecked(bool(getattr(s, "auto_start", True)))
+        self.chk_fast.setChecked(bool(getattr(s, "fast_mode", False)))
         self.local_list.addItems(list(s.local_dirs or []))
         self.chk_fallback.setChecked(s.enable_fallback)
         self.chk_meta.setChecked(s.write_metadata)
@@ -247,6 +252,7 @@ class SettingsDialog(QDialog):
         settings.qqmusic_uin = self.qq_uin.text().strip()
         settings.qqmusic_key = self.qq_key.text().strip()
         settings.auto_start = self.chk_auto.isChecked()
+        settings.fast_mode = self.chk_fast.isChecked()
         settings.local_dirs = [self.local_list.item(i).text() for i in range(self.local_list.count())]
         settings.enable_fallback = self.chk_fallback.isChecked()
         settings.write_metadata = self.chk_meta.isChecked()

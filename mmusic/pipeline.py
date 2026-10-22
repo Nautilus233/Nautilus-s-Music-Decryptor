@@ -34,6 +34,7 @@ from .errors import (CancelledError, DecryptionFailedError, MusicDecryptorError,
                      NeedsOnlineError, NetworkError, SearchNoResultError,
                      UnsupportedFormatError)
 from .hashcache import HashCache
+from . import fuzzy, jp
 from .lang import is_chinese_likely
 from .match import (ARTIST_UNKNOWN, best_reading_match, clean_text, filename_query,
                     parse_song_filename_candidates, rank_tracks_multi, reading_scores,
@@ -61,6 +62,19 @@ MIN_TRACK_SECONDS = 45.0     # 实测时长下限：低于此秒数视为试听�
 EARLY_STOP_SCORE = 0.95    # 已拿到高置信度原曲（歌名+歌手几乎完全一致）就不再打扰其它音源
 MAX_DOWNLOADS = 6          # 单文件最多尝试的下载次数（按分数从高到低顺延）
 #: 华语歌预匹配（mmusic/lang.py）：备用链路的动态排序与按需检索
+def _add_reversed_reading(readings, name):
+    """日语输入补一条反序读法（«歌手 歌名» 语序很常见）。只增不减、纯文本。"""
+    if not jp.looks_japanese(name):
+        return readings
+    parts = [p for p in re.split(r"\s+", sanitize_query_text(name)) if p.strip()]
+    if len(parts) < 2:
+        return readings
+    pair = (" ".join(parts[1:]), parts[0])
+    if pair[0] and pair[1] and pair not in readings:
+        return list(readings) + [pair]
+    return readings
+
+
 _CJK_FIRST_SOURCE = "migu"                      # 华语场景：提到联网源最前
 _CJK_DEFER_SOURCES = frozenset({"wikimedia", "internet_archive"})  # …垫底，有候选时不检索
 #: 目标无损（FLAC/WAV）时优先的源：实测 2026-10-20 —— **全链唯一能真给无损**的通道
@@ -690,6 +704,8 @@ class Pipeline:
                 readings = with_artist
         if not readings:
             readings = [(cleaned or seed, "")]
+        # 日语空格语序补充（文件名里没写「-」分隔符时的「歌手 歌名」写法）
+        readings = _add_reversed_reading(readings, cleaned or seed)
         # 版本标记按**清洗后**的文本判定：`试听：夜曲` 里的「试听」是说明前缀，
         # 不该被当成"用户点名要试听版"（那会关掉伴奏/改编过滤）。
         return readings, (filename_query(cleaned) or cleaned or seed), \
@@ -708,6 +724,9 @@ class Pipeline:
             for extra in space_split_readings(sanitize_query_text(name)):
                 if extra not in readings:
                     readings.append(extra)
+            # 日语罗马音/假名输入常按「歌手 歌名」语序（yorushika tada kimi ni hare）：
+            # 补一条反序读法，让"歌手目录型"检索拿回的候选有字段可比对。
+            readings = _add_reversed_reading(readings, name)
         return seed, readings, query, requested
 
     def search_candidates(self, name: str, *, artist: str = "") -> "list[Track]":
@@ -904,44 +923,70 @@ class Pipeline:
         dropped_total = 0
         dropped_artist = 0
 
-        # P3：查询扩展 —— 同一首歌多试几种写法，冷门/名字怪异的曲子命中率明显更高
+        # P3/P4：查询扩展 —— 同一首歌多试几种写法，冷门/名字怪异的曲子命中率明显更高。
+        # 变体分两轮消费：首轮每源 ≤2 个；**只有全源首轮无果**时才启用第二轮（≤2 个，
+        # 日语读音形与纠错候选都在这里垫后）。请求数上限仍是每源 2+2、失败路径才多花。
         variants = expand_query(query, readings)
         if len(variants) > 1:
             self._log("  · 检索变体：" + " / ".join(f"{v.reason}「{v.text}」" for v in variants))
+        alt_readings = fuzzy.corrected_readings(readings)
+        # 分层 sweep（2026-10-22 收紧）：首轮每源 ≤2 个；**仅当首轮全源零命中**才
+        # 追加第二轮（再 ≤2 个）。失败路径每源封顶 4 个请求（原为 6），成功路径仍是
+        # ≤2 个。变体表已按价值排序：日语读音形紧跟原样；纠错候选只在“疑似错字”时
+        # 提前，干净查询不再掺入 —— 既省请求，又不牺牲「睛天→晴天」这类召回。
+        sweeps = [(0, MAX_VARIANTS_PER_SOURCE)]
+        if len(variants) > MAX_VARIANTS_PER_SOURCE:
+            sweeps.append((MAX_VARIANTS_PER_SOURCE, MAX_VARIANTS_PER_SOURCE * 2))
 
         found_any = False   # 是否已有通过门槛的候选：华语场景下决定 CC/PD 源是否检索
-        for source in search_order:
-            if self._cancel:
-                raise CancelledError("已取消")
-            if chinese and source.name in _CJK_DEFER_SOURCES and found_any:
-                self._log(f"  · [{source.label}] 已跳过（华语歌：已有其他候选，"
-                          "避免在低命中源上耗时）")
-                continue
-            kept: "list[Track]" = []
-            for variant in variants[:MAX_VARIANTS_PER_SOURCE]:
-                kept, off_title_n, off_artist_n, dropped_ver = self._search_and_gate(
-                    source, variant, readings, requested)
-                dropped_total += dropped_ver
-                dropped_artist += off_artist_n
-                if kept:
-                    if variant is not variants[0]:
-                        self._log(f"  · [{source.label}] ✅ 命中于检索变体「{variant.reason}」")
-                    break
-            if not kept:
-                continue
-            tracks = kept
-            found_any = True
+        for sweep_idx, (start, stop) in enumerate(sweeps):
+            if sweep_idx and found_any:
+                break
+            batch = variants[start:stop]
+            if not batch:
+                break
+            if sweep_idx:
+                self._log(f"  · 此前全部无果：启用第{'二三四'[min(sweep_idx, 2)]}轮变体重试 —— "
+                          + " / ".join(f"{v.reason}「{v.text}」" for v in batch))
+            for source in search_order:
+                if self._cancel:
+                    raise CancelledError("已取消")
+                if chinese and source.name in _CJK_DEFER_SOURCES and found_any:
+                    self._log(f"  · [{source.label}] 已跳过（华语歌：已有其他候选，"
+                              "避免在低命中源上耗时）")
+                    continue
+                kept: "list[Track]" = []
+                for variant in batch:
+                    kept, off_title_n, off_artist_n, dropped_ver = self._search_and_gate(
+                        source, variant, readings, requested, alt_readings=alt_readings)
+                    dropped_total += dropped_ver
+                    dropped_artist += off_artist_n
+                    if kept:
+                        if variant is not variants[0]:
+                            self._log(f"  · [{source.label}] ✅ 命中于检索变体「{variant.reason}」")
+                        break
+                if not kept:
+                    continue
+                tracks = kept
+                found_any = True
 
-            rank_tracks_multi(readings, tracks, prefer_ext=self.settings.quality)
-            best_t, best_a = reading_scores(readings, tracks[0],
-                                            prefer_ext=self.settings.quality)[0][1]
-            self._log(f"  · [{source.label}] {len(tracks)} 个原曲候选，最佳“{tracks[0].title}”"
-                      f"({tracks[0].artist}) 匹配度 {tracks[0].score:.2f}"
-                      f"（采用读法：歌名「{best_t}」/ 歌手「{best_a}」）")
-            # 人工补链是用户的显式选择：连"匹配分门槛"也一并跳过
-            # （文件名/标题当然不会与查询相似，但下载校验照旧）。
-            threshold = 0.0 if getattr(source, "trusted_links", False) else MIN_ACCEPT
-            pool.extend(t for t in tracks[:3] if t.score >= threshold)
+                rank_tracks_multi(readings, tracks, prefer_ext=self.settings.quality)
+                best_t, best_a = reading_scores(readings, tracks[0],
+                                                prefer_ext=self.settings.quality)[0][1]
+                self._log(f"  · [{source.label}] {len(tracks)} 个原曲候选，最佳“{tracks[0].title}”"
+                          f"({tracks[0].artist}) 匹配度 {tracks[0].score:.2f}"
+                          f"（采用读法：歌名「{best_t}」/ 歌手「{best_a}」）")
+                # 人工补链是用户的显式选择：连"匹配分门槛"也一并跳过
+                # （文件名/标题当然不会与查询相似，但下载校验照旧）。
+                threshold = 0.0 if getattr(source, "trusted_links", False) else MIN_ACCEPT
+                pool.extend(t for t in tracks[:3] if t.score >= threshold)
+
+                if getattr(self.settings, "fast_mode", False):
+                    # 极速模式（用户显式开启）：命中即收工，跳过其它音源的多源交叉核验。
+                    # 门槛/时长下限/完整度门禁/下载校验全部照常 —— 只省"多源印证"。
+                    self._log(f"  · ⚡ 极速模式：已在 [{source.label}] 命中，跳过其余音源"
+                              "（不做跨平台时长核验；可在 设置→行为 关闭）")
+                    break
 
         if not pool:
             if dropped_artist:
@@ -1324,11 +1369,14 @@ class Pipeline:
             self._log(f"❌ {name}：{exc}", level="result")
             return JobResult(str(src), name, "failed", message=exc.message, detail=exc.detail)
 
-    def _search_and_gate(self, source, variant, readings, requested):
+    def _search_and_gate(self, source, variant, readings, requested, alt_readings=()):
         """检索一个源的一个查询变体，并跑完三道门槛。
 
         返回 ``(可用候选, 歌名淘汰数, 歌手淘汰数, 版本淘汰数)``；
         出错 / 无结果 / 全被淘汰时返回空列表，由调用方决定是否换下一个变体。
+
+        ``alt_readings``：模糊输入纠错后的「备用读法」。只对原读法**没通过**的
+        候选再判一次（不放松任何门槛写法），静默、低成本。
         """
         index = self.index
         text = variant.text
@@ -1373,17 +1421,30 @@ class Pipeline:
         kept: "list[Track]" = []
         off_artist: "list[Track]" = []
         off_title: "list[Track]" = []
+        fuzzy_hits = 0
         for cand in tracks:
             ok, _reading, ts, as_ = best_reading_match(
                 readings, cand, min_title=MIN_TITLE_SIMILARITY,
                 min_artist=MIN_ARTIST_SIMILARITY,
                 strict_title=not requested)
+            if not ok and alt_readings:
+                # 模糊输入的第二机会：只改「搜什么」（纠错读法），不改门槛写法
+                ok2, _r2, ts2, as2 = best_reading_match(
+                    alt_readings, cand, min_title=MIN_TITLE_SIMILARITY,
+                    min_artist=MIN_ARTIST_SIMILARITY,
+                    strict_title=not requested)
+                if ok2:
+                    ok, ts, as_ = ok2, ts2, as2
+                    fuzzy_hits += 1
             if ok:
                 kept.append(cand)
             elif ts >= MIN_TITLE_SIMILARITY and as_ < MIN_ARTIST_SIMILARITY:
                 off_artist.append(cand)
             else:
                 off_title.append(cand)
+        if fuzzy_hits:
+            self._log(f"  · [{source.label}] 其中 {fuzzy_hits} 个候选由**纠错读法**命中"
+                      "（原读法未过；门槛未放松）")
         if off_artist:
             self._log(f"  · [{source.label}] 已排除 {len(off_artist)} 个歌手不符的结果："
                       + "、".join(f"“{c.artist}”《{c.title}》" for c in off_artist[:3]))

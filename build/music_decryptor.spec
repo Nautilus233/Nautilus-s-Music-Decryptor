@@ -14,6 +14,8 @@ _build_dir = os.path.abspath(_build_dir)
 ROOT = os.path.dirname(_build_dir)
 
 ICON = os.path.join(ROOT, "assets", "icon.ico")
+#: 日语/中文内置表（构建脚本 tools/build_jp_tables.py 生成，运行时不联网）
+DATA = os.path.join(ROOT, "mmusic", "data")
 
 # --- 可选转码引擎：PySide6 自带的 FFmpeg 库（LGPL，动态链接） ------------------
 # 只打包音频编解码需要的四个库（名字带 FFmpeg 主版本号，用 glob 匹配以免升级后失效）。
@@ -53,7 +55,7 @@ a = Analysis(
     [os.path.join(ROOT, "main.py")],
     pathex=[ROOT],
     binaries=_MEDIA_DLLS,
-    datas=[(ICON, "assets")],
+    datas=[(ICON, "assets"), (DATA, "mmusic/data")],
     hiddenimports=[
         "mutagen", "mutagen.id3", "mutagen.flac", "mutagen.mp4",
         "mutagen.oggvorbis", "mutagen.ogg", "mutagen.easyid3",
