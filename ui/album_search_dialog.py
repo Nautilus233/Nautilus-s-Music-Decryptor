@@ -62,17 +62,17 @@ class AlbumSearchDialog(QDialog):
         self._log_lines: "list[tuple[str, str]]" = []
         self._hidden_details = 0
 
-        self.setWindowTitle("按专辑找歌 · 备用音源")
+        self.setWindowTitle("专辑下载")
         self.setMinimumSize(*MIN_SIZE)
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 12, 14, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(14, 10, 14, 10)
+        root.setSpacing(6)
 
-        tip = QLabel(
-            "按专辑检索（可加歌手双重限定；支持日文假名/罗马音）→ **单击专辑行即自动加载曲目**"
-            "（可随时换选）→ 勾选下载，或一键下载整张。\n"
-            "曲目表由**多来源并集**装配（同一版本内不丢曲目）；下载走与「开始解密」相同的校验与完整度门禁，"
-            "封面与曲序一并写入；某个通道取不到时自动换下一条，全部失败才如实提示。")
+        title = QLabel("专辑下载")
+        title.setProperty("role", "title")
+        root.addWidget(title)
+        tip = QLabel("输入专辑名 → 选择专辑 → 下载整张或勾选歌曲"
+                     f"  ·  {self.settings.quality.upper()}（在主窗口调整）")
         tip.setWordWrap(True)
         tip.setProperty("role", "muted")
         root.addWidget(tip)
@@ -83,27 +83,31 @@ class AlbumSearchDialog(QDialog):
         self.name.setPlaceholderText("十一月的萧邦 / Lemon / 残酷な天使のテーゼ…")
         form.addRow("专辑名", self.name)
         self.artist = QLineEdit()
-        self.artist.setPlaceholderText("可选；填了会过滤掉演唱者不符的专辑（双重限定）")
+        self.artist.setPlaceholderText("选填，例如：周杰伦 / Yorushika")
         form.addRow("歌手", self.artist)
         root.addLayout(form)
 
         opts = QHBoxLayout()
-        self.btn_search = QPushButton("检索专辑")
+        self.btn_search = QPushButton("搜索专辑")
         self.btn_search.setProperty("role", "primary")
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setEnabled(False)
         opts.addWidget(self.btn_search)
         opts.addWidget(self.btn_stop)
         opts.addStretch(1)
-        self.btn_out_dir = QPushButton("输出目录…")
-        self.btn_out_dir.setToolTip("给「以名/按专辑找歌」单独指定一个目录（与「开始解密」互不影响）")
-        self.btn_follow_main = QPushButton("跟随主设置")
-        self.btn_follow_main.setToolTip("清掉专用目录，改回：主输出目录 → 默认目录（按需按优）")
-        self.btn_open_out = QPushButton("打开输出目录")
-        opts.addWidget(self.btn_out_dir)
-        opts.addWidget(self.btn_follow_main)
-        opts.addWidget(self.btn_open_out)
         root.addLayout(opts)
+        save_row = QHBoxLayout()
+        save_row.addWidget(QLabel("保存位置"))
+        save_row.addStretch(1)
+        self.btn_out_dir = QPushButton("更改位置…")
+        self.btn_out_dir.setToolTip("单曲和专辑下载共用此保存位置，不影响本地文件的保存设置。")
+        self.btn_follow_main = QPushButton("使用默认位置")
+        self.btn_follow_main.setToolTip("清掉专用目录，改回：主输出目录 → 默认目录（按需按优）")
+        self.btn_open_out = QPushButton("打开文件夹")
+        save_row.addWidget(self.btn_out_dir)
+        save_row.addWidget(self.btn_follow_main)
+        save_row.addWidget(self.btn_open_out)
+        root.addLayout(save_row)
 
         self.out_hint = QLabel("")
         self.out_hint.setProperty("role", "muted")
@@ -111,10 +115,10 @@ class AlbumSearchDialog(QDialog):
         root.addWidget(self.out_hint)
 
         head_a = QHBoxLayout()
-        head_a.addWidget(QLabel("专辑（单击选中即自动加载曲目）"))
+        head_a.addWidget(QLabel("搜索结果 · 点击专辑查看歌曲"))
         head_a.addStretch(1)
-        self.btn_fetch = QPushButton("获取曲目")
-        self.btn_fetch.setToolTip("单击专辑行即自动加载；此按钮用于**强制重新获取**当前专辑")
+        self.btn_fetch = QPushButton("刷新曲目")
+        self.btn_fetch.setToolTip("点选专辑会自动加载歌曲；点这里重新加载当前专辑。")
         self.btn_fetch.setEnabled(False)
         head_a.addWidget(self.btn_fetch)
         root.addLayout(head_a)
@@ -125,17 +129,18 @@ class AlbumSearchDialog(QDialog):
         self.album_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.album_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.album_table.verticalHeader().setVisible(False)
-        self.album_table.setMinimumHeight(88)     # 小屏(768p)可压缩；大屏由布局自动放大
+        self.album_table.setMinimumHeight(75)
         root.addWidget(self.album_table, 1)
 
         head_t = QHBoxLayout()
-        self.track_header = QLabel("曲目（搜索后选专辑，单击即自动加载）")
+        self.track_header = QLabel("专辑歌曲 · 先从上方选择一张专辑")
+        self.track_header.setWordWrap(True)
         head_t.addWidget(self.track_header)
         head_t.addStretch(1)
         self.btn_all = QPushButton("全选")
         self.btn_none = QPushButton("全不选")
         self.btn_dl = QPushButton("下载选中")
-        self.btn_dl_all = QPushButton("下载全部")
+        self.btn_dl_all = QPushButton("下载整张专辑")
         self.btn_dl.setProperty("role", "primary")
         for b in (self.btn_all, self.btn_none, self.btn_dl, self.btn_dl_all):
             b.setEnabled(False)
@@ -147,12 +152,12 @@ class AlbumSearchDialog(QDialog):
         self.track_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.track_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.track_table.verticalHeader().setVisible(False)
-        self.track_table.setMinimumHeight(120)
+        self.track_table.setMinimumHeight(100)
         root.addWidget(self.track_table, 1)
 
         log_row = QHBoxLayout()
-        log_row.addWidget(QLabel("运行日志"))
-        self.chk_detail = QCheckBox("显示详细信息")
+        log_row.addWidget(QLabel("下载结果"))
+        self.chk_detail = QCheckBox("查看处理详情")
         log_row.addWidget(self.chk_detail)
         log_row.addStretch(1)
         self.log_hint = QLabel("")
@@ -161,7 +166,7 @@ class AlbumSearchDialog(QDialog):
         root.addLayout(log_row)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        self.log.setFixedHeight(86)
+        self.log.setFixedHeight(66)
         root.addWidget(self.log)
 
         footer = QHBoxLayout()
@@ -170,6 +175,7 @@ class AlbumSearchDialog(QDialog):
         footer.addWidget(self.status)
         footer.addStretch(1)
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        box.button(QDialogButtonBox.StandardButton.Close).setText("返回主窗口")
         box.rejected.connect(self.reject)
         box.clicked.connect(lambda *_: self.reject())
         footer.addWidget(box)
@@ -247,11 +253,11 @@ class AlbumSearchDialog(QDialog):
         configured = (self.settings.output_dir or "").strip()
         target = self.effective_out_dir()
         if search_dir:
-            self.out_hint.setText(f"输出目录（本模式专用）：{target}")
+            self.out_hint.setText(f"保存到：{target}（下载专用）")
         elif configured:
-            self.out_hint.setText(f"输出目录：跟随主输出目录 {target}（想分开就点「输出目录…」）")
+            self.out_hint.setText(f"保存到：{target}（使用主窗口位置）")
         else:
-            self.out_hint.setText(f"输出目录（默认）：{target}（可在上方按钮里改成专用目录）")
+            self.out_hint.setText(f"保存到：{target}（默认）")
 
     def _pick_out_dir(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "选择输出目录",
@@ -411,7 +417,7 @@ class AlbumSearchDialog(QDialog):
         self._loaded_row = -1
         self.album_table.setRowCount(0)
         self.track_table.setRowCount(0)
-        self.track_header.setText("曲目（搜索后选专辑，单击即自动加载）")
+        self.track_header.setText("专辑歌曲 · 先从上方选择一张专辑")
         self._log("=" * 46, "detail")
         self._log(f"▶ 检索专辑：{query}" + (f"（歌手：{self.artist.text().strip()}）" if self.artist.text().strip() else ""))
         self._start_worker(AlbumSearchWorker(self.settings, cache_path=self.config.cache_path,

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import functools
+import math
 import re
 import unicodedata
 from difflib import SequenceMatcher
@@ -32,6 +33,20 @@ _NOISE_WORDS = re.compile(
     r"explicit|clean|official|mv|lyric)\b", re.IGNORECASE)
 _SEP = re.compile(r"\s*[-–—_|/]\s*")
 _PUNCT = re.compile(r"[^\w\u4e00-\u9fff]+")
+
+# Only a complete soundtrack credit is descriptive metadata, not a version.
+# Never strip arbitrary brackets here: (R&B), (Live), etc. remain hard gates.
+_SOUNDTRACK_CREDIT = re.compile(
+    r'(?:电影|电视剧|影视剧|网剧|动画片|动画|动漫|纪录片|游戏)?\s*'
+    r'《[^《》\r\n]+》\s*(?:主题曲|插曲|片头曲|片尾曲|推广曲|宣传曲)')
+
+
+def _title_without_soundtrack_credit(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text or "")
+    result = _BRACKET_NOISE.sub(
+        lambda m: " " if _SOUNDTRACK_CREDIT.fullmatch(m.group()[1:-1].strip())
+        else m.group(), text)
+    return result.strip() if result.strip() else text
 
 
 def clean_text(text: str) -> str:
@@ -116,8 +131,8 @@ def normalize_for_version(text: str) -> str:
 
 
 def version_markers(text: str) -> "set[str]":
-    """返回 `text` 中命中的伴奏/改编标记（作用于原始串，不剥离括号内容）。"""
-    norm = normalize_for_version(text)
+    """返回伴奏/改编标记；只忽略完整影视出处说明，其余括号保留。"""
+    norm = normalize_for_version(_title_without_soundtrack_credit(text))
     if not norm:
         return set()
     tokens = set(norm.split())
@@ -143,6 +158,8 @@ def has_extra_qualifier(wanted: str, candidate: str) -> bool:
     于是「夜曲 (电台版)」和「夜曲」的相似度都是 1.0 —— 只看相似度根本无法区分。
     因此这里显式判定"多出来的部分"，让干净标题永远排在前面。
     """
+    wanted = _title_without_soundtrack_credit(wanted)
+    candidate = _title_without_soundtrack_credit(candidate)
     if not candidate:
         return False
     if _BRACKET.search(candidate):
@@ -539,10 +556,10 @@ def title_match_score(readings: "Sequence[tuple[str, str]]", track: Track) -> fl
     verbatim inside a longer one (e.g. "晴天" inside "晴天 - 周杰伦", or a
     medley that really does contain it), otherwise the difflib similarity.
     """
-    norm_title = normalize_for_version(track.title)
+    norm_title = normalize_for_version(_title_without_soundtrack_credit(track.title))
     best = 0.0
     for want, _artist in readings:
-        wanted = normalize_for_version(want)
+        wanted = normalize_for_version(_title_without_soundtrack_credit(want))
         if not wanted:
             continue
         if wanted == norm_title:
@@ -644,6 +661,7 @@ def title_gate_ok(want_title: str, want_artist: str, track: Track) -> bool:
     """歌名是否**就是这首歌**（强约束）。
 
     * 完全一致 -> 通过；
+    * 完整的影视出处括号（如「电影《头文字D》主题曲」）不视为版本；
     * **包含**：只允许多出来的词元都能用歌手名解释（平台常把标题写成
       「晴天 - 周杰伦」）；多出来的是别的修饰（例如「黑色毛衣(R&B)」里的
       r b）就判为**另一个版本**，直接淘汰；
@@ -651,8 +669,8 @@ def title_gate_ok(want_title: str, want_artist: str, track: Track) -> bool:
 
     以前包含关系一律按 0.85 通过，于是一个歌名带 (R&B) 的改编版靠「包含」就过关。
     """
-    norm_want = normalize_for_version(want_title)
-    norm_cand = normalize_for_version(track.title)
+    norm_want = normalize_for_version(_title_without_soundtrack_credit(want_title))
+    norm_cand = normalize_for_version(_title_without_soundtrack_credit(track.title))
     if not norm_want or not norm_cand:
         return False
     if norm_want == norm_cand:
@@ -716,7 +734,8 @@ def _jp_title_gate_ok(want_title: str, cand_title: str, want_artist: str,
 
 
 def best_reading_match(readings: "Sequence[tuple[str, str]]", track: Track, *,
-                       min_title: float, min_artist: float, strict_title: bool = True
+                       min_title: float, min_artist: float, strict_title: bool = True,
+                       expected_album: str = "", reference_duration: float = 0
                        ) -> "tuple[bool, tuple[str, str], float, float]":
     """歌名与歌手**必须由同一个读法**同时达标。
 
@@ -740,6 +759,9 @@ def best_reading_match(readings: "Sequence[tuple[str, str]]", track: Track, *,
         pair = ((want_t, want_a), ts, as_)
         title_ok = (title_gate_ok(want_t, want_a, track) if strict_title
                     else ts >= min_title)      # 用户主动点名版本时放宽歌名规则
+        if not title_ok and strict_title and expected_album:
+            title_ok = _album_supported_title(want_t, want_a, track,
+                                             expected_album, reference_duration)
         if title_ok and as_ >= min_artist:
             if ts + as_ > best_ok_sum:
                 best_ok, best_ok_sum = pair, ts + as_
@@ -750,6 +772,39 @@ def best_reading_match(readings: "Sequence[tuple[str, str]]", track: Track, *,
         return True, reading, ts, as_
     reading, ts, as_ = best_any
     return False, reading, ts, as_
+
+
+def _album_supported_title(title: str, artist: str, track: Track,
+                           album: str, duration: float) -> bool:
+    """Bounded typo tolerance with independent album, artist and duration evidence.
+
+    Candidate metadata is inspected before any output-tag rewrite. Missing
+    evidence does not qualify; ordinary exact matching remains available.
+    """
+    norm = normalize_for_version
+    if (not artist or not album or not track.artist or not track.album
+            or norm(artist) in ARTIST_UNKNOWN or norm(track.artist) in ARTIST_UNKNOWN
+            or norm(artist) != norm(track.artist) or norm(album) != norm(track.album)):
+        return False
+    if (duration <= 0 or track.duration <= 0
+            or not math.isfinite(duration) or not math.isfinite(track.duration)
+            or abs(duration - track.duration) > 2
+            or track_version_markers(track) or version_markers(title)):
+        return False
+    left = _title_without_soundtrack_credit(title)
+    right = _title_without_soundtrack_credit(track.title)
+    # Do not hide unknown qualifiers such as (R&B), featured artists, or editions.
+    if _BRACKET.search(left) or _BRACKET.search(right):
+        return False
+    left, right = norm(left), norm(right)
+    if min(len(left), len(right)) < 8:
+        return False
+    if re.findall(r"\d+", left) != re.findall(r"\d+", right):
+        return False
+    matcher = SequenceMatcher(None, left, right, autojunk=False)
+    edits = sum(max(i2 - i1, j2 - j1) for op, i1, i2, j1, j2 in matcher.get_opcodes()
+                if op != "equal")
+    return edits == 1 and matcher.ratio() >= .94
 
 
 def reading_scores(readings: Sequence[tuple[str, str]], track: Track,

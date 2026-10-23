@@ -24,12 +24,14 @@ def run_gui(initial, auto: bool) -> int:
     from PySide6.QtWidgets import QApplication
 
     import ui.theme as theme
+    from mmusic import __version__
     from mmusic.config import AppConfig
     from mmusic.paths import resource_path
     from ui.main_window import MainWindow
 
     app = QApplication(sys.argv)
     app.setApplicationName("MusicDecryptor")
+    app.setApplicationVersion(__version__)
     app.setApplicationDisplayName("音乐解密工具")
     theme.apply(app)
     icon = resource_path("assets", "icon.ico")

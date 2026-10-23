@@ -9,12 +9,12 @@ from __future__ import annotations
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog,
-                               QDialogButtonBox, QDoubleSpinBox, QFileDialog,
+                               QComboBox, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QFrame, QGroupBox, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget, QPushButton,
-                               QScrollArea, QSpinBox, QVBoxLayout, QWidget)
+                               QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
-from . import geometry
+from . import geometry, theme
 
 from mmusic.search.pack import all_specs, load_pack   # 源列表由清单驱动，新增源自动可见
 
@@ -49,13 +49,25 @@ class SettingsDialog(QDialog):
         body.setContentsMargins(14, 12, 14, 12)
         body.setSpacing(10)
 
+        heading = QLabel("设置")
+        heading.setProperty("role", "title")
+        body.addWidget(heading)
+        appearance = QGroupBox("外观")
+        appearance_form = QFormLayout(appearance)
+        self.appearance = QComboBox()
+        for label, value in theme.MODES:
+            self.appearance.addItem(label, value)
+        self.appearance.setToolTip("跟随系统：Windows 切换深浅色时，界面自动同步；点击保存后生效。")
+        appearance_form.addRow("界面颜色", self.appearance)
+        body.addWidget(appearance)
+
         # -- sources ---------------------------------------------------
-        gb_src = QGroupBox("备用音源（按顺序尝试）")
+        gb_src = QGroupBox("搜索来源")
         v = QVBoxLayout(gb_src)
         self.source_boxes: "dict[str, QCheckBox]" = {}
         self.specs = all_specs(self.settings.to_dict())
         for spec in self.specs:
-            cb = QCheckBox(f"{spec.label}  ·  {spec.kind}")
+            cb = QCheckBox(spec.label)
             if spec.license_note:
                 cb.setToolTip(spec.license_note)
             self.source_boxes[spec.id] = cb
@@ -63,7 +75,7 @@ class SettingsDialog(QDialog):
         body.addWidget(gb_src)
 
         # -- network / generic ----------------------------------------
-        gb_net = QGroupBox("网络与通用")
+        gb_net = QGroupBox("网络与接口（通常无需修改）")
         form = QFormLayout(gb_net)
         self.timeout = QDoubleSpinBox()
         self.timeout.setRange(3, 120)
@@ -83,7 +95,7 @@ class SettingsDialog(QDialog):
         body.addWidget(gb_net)
 
         # -- QQ 凭证（按需静默获取 ekey）--------------------------------
-        gb_ekey = QGroupBox("QQ 音乐凭证（管理员一次配置 ─ 点标题展开即可编辑）")
+        gb_ekey = QGroupBox("QQ 音乐账号配置")
         gb_ekey.setCheckable(True)          # 折叠：同事默认看不到内容，也不会误改
         gb_ekey.setChecked(False)
         self.gb_ekey = gb_ekey
@@ -133,16 +145,16 @@ class SettingsDialog(QDialog):
         body.addWidget(gb_local)
 
         # -- behaviour -------------------------------------------------
-        gb_beh = QGroupBox("行为")
+        gb_beh = QGroupBox("日常使用")
         bv = QVBoxLayout(gb_beh)
-        self.chk_fallback = QCheckBox("解密失败时自动搜索下载备用音源")
-        self.chk_meta = QCheckBox("写入元数据（标题/艺术家/专辑/封面）")
+        self.chk_fallback = QCheckBox("本地文件无法转换时，自动查找同一首歌")
+        self.chk_meta = QCheckBox("保存歌名、歌手、专辑和封面信息")
         self.chk_cover = QCheckBox("在线补齐封面")
         self.chk_overwrite = QCheckBox("同名文件直接覆盖（否则自动加序号）")
         self.chk_keep = QCheckBox("保留原始加密文件")
-        self.chk_cache = QCheckBox("启用哈希去重缓存（避免重复解密/下载）")
-        self.chk_auto = QCheckBox("拖入文件后自动开始处理（同事最省事）")
-        self.chk_fast = QCheckBox("极速模式：首个可用音源命中即收工（更快，跳过跨平台时长核验）")
+        self.chk_cache = QCheckBox("跳过已经处理过的文件")
+        self.chk_auto = QCheckBox("添加文件后自动开始")
+        self.chk_fast = QCheckBox("极速模式（更快，减少多来源交叉核对）")
         self.chk_fast.setToolTip("开启后取歌更快，但不再用其它平台的时长互相印证；\n"
                                  "默认关闭 = 精确优先。歌名/歌手门槛与下载校验不受影响。")
         for cb in (self.chk_fallback, self.chk_meta, self.chk_cover,
@@ -151,9 +163,33 @@ class SettingsDialog(QDialog):
             bv.addWidget(cb)
         body.addWidget(gb_beh)
 
+        # Move existing controls into pages; their values and save callbacks stay intact.
+        for group in (gb_src, gb_net, gb_ekey, gb_local, gb_beh):
+            body.removeWidget(group)
+        body.addWidget(gb_beh)
         body.addStretch(1)
         scroll.setWidget(content)
-        root.addWidget(scroll, 1)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(scroll, "常用设置")
+        for title, groups in (("账号配置", (gb_ekey,)),
+                              ("高级设置", (gb_src, gb_net, gb_local))):
+            page = QWidget()
+            layout = QVBoxLayout(page)
+            layout.setContentsMargins(14, 12, 14, 12)
+            if title == "账号配置":
+                help_text = QLabel("仅管理员需要配置。已有登录信息可继续使用，无需重复填写。")
+                help_text.setWordWrap(True)
+                help_text.setProperty("role", "muted")
+                layout.addWidget(help_text)
+            for group in groups:
+                layout.addWidget(group)
+            layout.addStretch(1)
+            area = QScrollArea()
+            area.setWidgetResizable(True)
+            area.setFrameShape(QFrame.Shape.NoFrame)
+            area.setWidget(page)
+            self.tabs.addTab(area, title)
+        root.addWidget(self.tabs, 1)
 
         # ---- pinned footer (always visible) --------------------------
         footer = QWidget()
@@ -168,6 +204,9 @@ class SettingsDialog(QDialog):
                                    | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("保存设置")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setProperty("role", "primary")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         fv.addWidget(buttons)
         root.addWidget(footer, 0)
 
@@ -186,6 +225,7 @@ class SettingsDialog(QDialog):
     # ------------------------------------------------------------------ #
     def _fill(self) -> None:
         s = self.settings
+        self.appearance.setCurrentIndex(self.appearance.findData(theme.preference()))
         # 勾选状态直接反映"当前实际生效的源"（含清单默认开关）
         active = {spec.id for spec in load_pack(s.to_dict())}
         for name, cb in self.source_boxes.items():

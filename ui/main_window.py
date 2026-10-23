@@ -7,17 +7,18 @@ from PySide6.QtCore import QRect, QSettings, Qt, QTimer, QUrl
 from PySide6.QtGui import (QColor, QDesktopServices, QDragEnterEvent,
                            QDropEvent, QIcon)
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
-                               QFileDialog, QFrame, QHBoxLayout, QHeaderView,
+                               QApplication, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
                                QLabel, QLineEdit, QMainWindow, QMessageBox,
                                QPlainTextEdit, QProgressBar, QPushButton,
                                QTableWidget, QTableWidgetItem, QVBoxLayout,
                                QWidget)
 
+from mmusic import __version__
 from mmusic.config import AppConfig
 from mmusic.constants import QMC_ALL_EXTS
 from mmusic.paths import resource_path
 
-from . import geometry
+from . import geometry, theme
 from .manual_links_dialog import ManualLinksDialog
 from .settings_dialog import SettingsDialog
 from .worker import DecryptWorker
@@ -26,9 +27,9 @@ SUPPORTED_EXT = ({".ncm"} | {"." + e for e in QMC_ALL_EXTS}
                  | {".mp3", ".flac", ".ogg", ".m4a", ".wav", ".aac", ".ape", ".wma", ".dff", ".opus"})
 
 _STATUS = {
-    "decoded":    ("已解密", "#36c07a"),
-    "downloaded": ("备用下载", "#5b9bff"),
-    "copied":     ("已复制", "#36c07a"),
+    "decoded":    ("已解密", "#238054"),
+    "downloaded": ("备用下载", "#397ac2"),
+    "copied":     ("已复制", "#238054"),
     "skipped":    ("已跳过", "#8b93a7"),
     "failed":     ("失败", "#ef5350"),
     "pending":    ("等待", "#8b93a7"),
@@ -50,7 +51,7 @@ class MainWindow(QMainWindow):
         #: 否则 Python GC 掉 C++ 对象会触发原生崩溃（见 _retire_worker）。
         self._retired: "list" = []
 
-        self.setWindowTitle("音乐解密工具 · Music Decryptor")
+        self.setWindowTitle(f"音乐解密工具 · Music Decryptor v{__version__}")
         icon = resource_path("assets", "icon.ico")
         if icon.is_file():
             self.setWindowIcon(QIcon(str(icon)))
@@ -61,7 +62,6 @@ class MainWindow(QMainWindow):
         self._geometry_ready = False
         self.setAcceptDrops(True)
 
-        self.resize(1020, 700)          # pre-show size, corrected by showEvent
         self._build_ui()
         self._load_settings_into_ui()
         if initial_paths:
@@ -72,19 +72,54 @@ class MainWindow(QMainWindow):
         root = QWidget()
         self.setCentralWidget(root)
         outer = QVBoxLayout(root)
-        outer.setContentsMargins(14, 12, 14, 12)
-        outer.setSpacing(10)
+        outer.setContentsMargins(16, 12, 16, 12)
+        outer.setSpacing(6)
 
         # header
+        header = QHBoxLayout()
         head = QVBoxLayout()
         head.setSpacing(2)
-        title = QLabel("音乐解密工具")
+        title = QLabel("音乐工作台")
         title.setProperty("role", "title")
-        subtitle = QLabel("本地优先 · 离线解密 NCM / QMC / MGG，失败自动切换备用音源搜索下载")
+        subtitle = QLabel("转换已有文件，或按歌名、专辑获取音乐。")
         subtitle.setProperty("role", "subtitle")
         head.addWidget(title)
         head.addWidget(subtitle)
-        outer.addLayout(head)
+        header.addLayout(head, 1)
+        self.btn_manual = QPushButton("提供音频链接…")
+        self.btn_manual.setToolTip("高级操作：使用自己提供的链接或本地路径，优先于自动搜索")
+        self.btn_settings = QPushButton("设置")
+        header.addWidget(self.btn_manual)
+        header.addWidget(self.btn_settings)
+        outer.addLayout(header)
+
+        navigation = QHBoxLayout()
+        current = QPushButton("本地文件\n转换电脑里的音频或加密文件")
+        current.setProperty("role", "current")
+        current.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        current.clicked.connect(self._focus_file_list)
+        self.btn_name_search = QPushButton("单曲下载\n输入歌名，自动查找音乐")
+        self.btn_album_search = QPushButton("专辑下载\n选择专辑，整张或按曲下载")
+        for button in (self.btn_name_search, self.btn_album_search):
+            button.setProperty("role", "navigation")
+        for button in (current, self.btn_name_search, self.btn_album_search):
+            navigation.addWidget(button, 1)
+        outer.addLayout(navigation)
+
+        options = QHBoxLayout()
+        options.addWidget(QLabel("输出格式"))
+        self.quality = QComboBox()
+        self.quality.addItem("MP3 · 通用播放", "mp3")
+        self.quality.addItem("FLAC · 优先无损", "flac")
+        self.quality.addItem("WAV · 优先无损", "wav")
+        self.quality.setMinimumContentsLength(15)
+        self.quality.setToolTip("找不到无损源时保留有损格式，不进行无效升格；三个模式共用此选项。")
+        options.addWidget(self.quality)
+        options.addStretch(1)
+        output_note = QLabel("格式选择也适用于单曲和专辑下载")
+        output_note.setProperty("role", "muted")
+        options.addWidget(output_note)
+        outer.addLayout(options)
 
         # toolbar
         bar = QHBoxLayout()
@@ -97,41 +132,24 @@ class MainWindow(QMainWindow):
             bar.addWidget(b)
         bar.addStretch(1)
 
-        bar.addWidget(QLabel("目标音质"))
-        self.quality = QComboBox()
-        self.quality.addItem("MP3（默认）", "mp3")
-        self.quality.addItem("FLAC", "flac")
-        self.quality.addItem("WAV（有则取，无则降级）", "wav")
-        self.quality.setFixedWidth(190)
-        bar.addWidget(self.quality)
         outer.addLayout(bar)
 
-        # output dir
+        # Saving controls are separate from the three task entry points.
         out_row = QHBoxLayout()
         out_row.setSpacing(8)
-        out_row.addWidget(QLabel("输出目录"))
+        out_row.addWidget(QLabel("保存到"))
         self.out_dir = QLineEdit()
-        self.out_dir.setPlaceholderText("默认：源文件所在目录")
+        self.out_dir.setPlaceholderText("原文件所在文件夹（默认）")
         out_row.addWidget(self.out_dir, 1)
-        self.btn_out_dir = QPushButton("选择…")
+        self.btn_out_dir = QPushButton("更改位置…")
+        self.btn_open_out = QPushButton("打开文件夹")
+        self.btn_open_out.setToolTip("打开上次输出或设置的文件夹")
         out_row.addWidget(self.btn_out_dir)
-        self.btn_open_out = QPushButton("打开输出目录")
-        self.btn_open_out.setToolTip("在文件管理器中打开上次输出/设置的目录")
         out_row.addWidget(self.btn_open_out)
-        self.btn_name_search = QPushButton("以名找歌…")
-        self.btn_name_search.setToolTip(
-            "不需要加密文件：直接按歌名搜索备用音源并下载（与解密后的备用链路同一套选源逻辑）")
-        out_row.addWidget(self.btn_name_search)
-        self.btn_album_search = QPushButton("按专辑找歌…")
-        self.btn_album_search.setToolTip(
-            "按专辑检索（可加歌手限定）：取曲目清单后，勾选下载或一键下载整张")
-        out_row.addWidget(self.btn_album_search)
-        self.btn_manual = QPushButton("手动补链…")
-        self.btn_manual.setToolTip("所有音源都找不到时，粘贴直链或本地路径，优先使用")
-        out_row.addWidget(self.btn_manual)
-        self.btn_settings = QPushButton("设置…")
-        out_row.addWidget(self.btn_settings)
         outer.addLayout(out_row)
+        queue_title = QLabel("文件列表 · 可直接把文件或文件夹拖到这里")
+        queue_title.setProperty("role", "section")
+        outer.addWidget(queue_title)
 
         # table
         self.table = QTableWidget(0, 5)
@@ -148,7 +166,7 @@ class MainWindow(QMainWindow):
         hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
         self.table.setColumnWidth(1, 80)
         self.table.setColumnWidth(2, 60)
-        self.table.setMinimumHeight(110)
+        self.table.setMinimumHeight(100)
         outer.addWidget(self.table, 3)
 
         # progress
@@ -156,7 +174,7 @@ class MainWindow(QMainWindow):
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.status_label = QLabel("就绪 · 把加密歌曲拖进窗口（或点「添加文件」）")
+        self.status_label = QLabel("等待添加文件")
         self.status_label.setProperty("role", "muted")
         prog_row.addWidget(self.progress, 1)
         prog_row.addWidget(self.status_label)
@@ -164,8 +182,8 @@ class MainWindow(QMainWindow):
 
         # log（默认只显示"结论"，明细收进「显示详细信息」）
         log_row = QHBoxLayout()
-        log_row.addWidget(QLabel("运行日志"))
-        self.chk_detail = QCheckBox("显示详细信息")
+        log_row.addWidget(QLabel("处理结果"))
+        self.chk_detail = QCheckBox("查看处理详情")
         self.chk_detail.setToolTip("展开每个音源的排除统计、时长探测、降权说明等过程明细")
         self.chk_detail.toggled.connect(self._on_detail_toggled)
         log_row.addWidget(self.chk_detail)
@@ -178,8 +196,8 @@ class MainWindow(QMainWindow):
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(4000)
-        self.log.setPlaceholderText("运行日志…")
-        self.log.setMinimumHeight(80)
+        self.log.setPlaceholderText("每个文件的处理结果会显示在这里。")
+        self.log.setMinimumHeight(60)
         outer.addWidget(self.log, 2)
 
         # actions
@@ -188,7 +206,7 @@ class MainWindow(QMainWindow):
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setProperty("role", "danger")
         self.btn_stop.setEnabled(False)
-        self.btn_start = QPushButton("开始解密")
+        self.btn_start = QPushButton("开始处理")
         self.btn_start.setProperty("role", "primary")
         self.btn_start.setMinimumWidth(150)
         act.addWidget(self.btn_stop)
@@ -256,6 +274,9 @@ class MainWindow(QMainWindow):
             self._geometry_ready = True
             if not self._restore_geometry():
                 self._fit_to_screen()
+
+    def _focus_file_list(self) -> None:
+        self.table.setFocus()
 
     def closeEvent(self, event) -> None:  # noqa: N802
         try:
@@ -360,6 +381,7 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self.settings, self)
         if dlg.exec():
             dlg.apply_to(self.settings)
+            theme.save_preference(QApplication.instance(), dlg.appearance.currentData())
             self.config.save()
             self._load_settings_into_ui()
             self._log("⚙ 设置已保存")
@@ -372,7 +394,7 @@ class MainWindow(QMainWindow):
         self.config.save()
         n = len(self.settings.manual_links)
         if n:
-            self._log(f"🔗 已保存 {n} 条补链；下次「开始解密」时会**优先**用它们"
+            self._log(f"🔗 已保存 {n} 条补链；下次「开始处理」时会**优先**用它们"
                       f"（跳过歌名/歌手门槛，其余校验照旧）")
         else:
             self._log("🔗 已清空补链列表")
@@ -498,7 +520,7 @@ class MainWindow(QMainWindow):
                       if self.table.item(r, 1) is not None
                       and self.table.item(r, 1).text() == "等待")
         if waiting:
-            self._log(f"⏳ 列表里还有 {waiting} 个待处理文件：点「开始解密」即可继续")
+            self._log(f"⏳ 列表里还有 {waiting} 个待处理文件：点「开始处理」即可继续")
         self._retire_worker(self._worker)
 
     def _on_failed(self, message: str) -> None:

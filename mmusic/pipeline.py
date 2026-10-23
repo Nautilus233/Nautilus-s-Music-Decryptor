@@ -39,7 +39,7 @@ from . import fuzzy, jp
 from .lang import is_chinese_likely
 from .match import (ARTIST_UNKNOWN, best_reading_match, clean_text, filename_query,
                     parse_song_filename_candidates, rank_tracks_multi, reading_scores,
-                    looks_like_song_query, sanitize_query, sanitize_query_text,
+                    looks_like_song_query, normalize_for_version, sanitize_query, sanitize_query_text,
                     space_split_readings, split_originals, version_markers)
 from .metadata import read_source_meta, write_tags
 from .model import AudioResult, Track
@@ -882,7 +882,8 @@ class Pipeline:
 
         MP3 目标沿用原生通道先下、失败再重匹配。FLAC/WAV 目标则先解析原通道，
         若不是无损，在同曲候选中优先查无损（允许同一来源的其它专辑条目）；
-        验证失败/预算耗尽后回到有损路径。歌名/歌手/版本/完整度门槛不放松。
+        验证失败/预算耗尽后回到有损路径。版本/完整度门槛不放松；同专辑、
+        同歌手且标注时长吻合时，歌名允许受限的单字差异。
         中间失败只写**明细**日志（避免提前宣告某来源不可用）；全部失败时抛出
         「所有来源均无法获取，建议自行获取」，由界面统一提示。
         """
@@ -1023,8 +1024,8 @@ class Pipeline:
     def _rematch_album_track(self, track: Track, *, lossless_first: bool = False):
         """强门槛重匹配：普通逐源 1 条，无损目标逐源至多 2 条并允许原来源。
 
-        门槛与单曲链路完全一致：歌名+歌手必须**同一读法**同时达标
-        （`best_reading_match`），版本过滤照常；日语输入追加一次读音变体检索
+        歌名+歌手必须**同一读法**同时达标；独立的同专辑、同歌手与时长证据
+        可支持受限的长歌名差异。版本过滤照常；日语输入追加一次读音变体检索
         （仅首轮无结果时，只改"搜什么"、不改门槛写法）。
         """
         native = track.source
@@ -1059,22 +1060,30 @@ class Pipeline:
             except Exception as exc:  # noqa: BLE001
                 self._log(f"  · [{name}] 重匹配检索异常：{str(exc)[:100]}", level="detail")
                 continue
-            best = self._pick_rematch_candidate(tracks, readings, alt_readings, requested)
+            context = dict(expected_album=track.album, reference_duration=track.duration)
+            best = self._pick_rematch_candidate(tracks, readings, alt_readings, requested, **context)
             if best is None and alt_readings:
                 alt_query = " ".join(x for x in (alt_readings[0][0], alt_readings[0][1]) if x).strip()
                 if alt_query and alt_query != query:
                     try:
                         tracks = adapter.search(alt_query, quality=self.settings.quality, limit=8)
-                        best = self._pick_rematch_candidate(tracks, readings, alt_readings, requested)
+                        best = self._pick_rematch_candidate(tracks, readings, alt_readings, requested, **context)
                         if best is not None:
                             self._log(f"  · [{name}] 命中于读音变体检索", level="detail")
                     except Exception:  # noqa: BLE001
                         pass
             if best is not None:
+                if all(not best_reading_match(group, best,
+                                              min_title=MIN_TITLE_SIMILARITY,
+                                              min_artist=MIN_ARTIST_SIMILARITY,
+                                              strict_title=not requested)[0]
+                       for group in (readings, alt_readings) if group):
+                    self._log("  · 歌名轻微差异已由歌手、专辑及标注时长共同支持；"
+                              "下载后仍核验真实时长与完整度", level="detail")
                 if lossless_first:
                     # The same provider may expose the lossless copy under a
                     # single/compilation rather than this album's resource id.
-                    pool = self._rank_rematch_candidates(tracks, readings, alt_readings, requested)
+                    pool = self._rank_rematch_candidates(tracks, readings, alt_readings, requested, **context)
                     pool.sort(key=lambda t: (t.short_asset,
                               t.ext.lower() not in ("flac", "wav", "ape", "dff"), -t.score))
                     for candidate in pool[:2]:
@@ -1083,19 +1092,21 @@ class Pipeline:
                     yield best
 
     @staticmethod
-    def _pick_rematch_candidate(tracks, readings, alt_readings, requested) -> "Track | None":
+    def _pick_rematch_candidate(tracks, readings, alt_readings, requested, **context) -> "Track | None":
         """重匹配候选的强门槛过滤 + 排序：取最佳（疑似短资源让位，绝不提前下载）。"""
-        kept = Pipeline._rank_rematch_candidates(tracks, readings, alt_readings, requested)
+        kept = Pipeline._rank_rematch_candidates(tracks, readings, alt_readings, requested, **context)
         return next((t for t in kept if not t.short_asset), kept[0] if kept else None)
 
     @staticmethod
-    def _rank_rematch_candidates(tracks, readings, alt_readings, requested) -> "list[Track]":
+    def _rank_rematch_candidates(tracks, readings, alt_readings, requested, *,
+                                expected_album: str = "", reference_duration: float = 0) -> "list[Track]":
         """Use the existing song/artist/version gates before any metadata rewrite."""
         pool = [t for t in (tracks or []) if (t.title or t.url)]
         if not requested:
             originals, _dropped = split_originals(pool)
             pool = originals
         kept: "list[Track]" = []
+        supported: "list[Track]" = []
         for cand in pool:
             ok = best_reading_match(readings, cand,
                                     min_title=MIN_TITLE_SIMILARITY,
@@ -1108,6 +1119,17 @@ class Pipeline:
                                         strict_title=not requested)[0]
             if ok:
                 kept.append(cand)
+            elif expected_album and not requested:
+                # Never infer the target album from the candidate itself.
+                if best_reading_match(readings, cand,
+                                      min_title=MIN_TITLE_SIMILARITY,
+                                      min_artist=MIN_ARTIST_SIMILARITY,
+                                      expected_album=expected_album,
+                                      reference_duration=reference_duration)[0]:
+                    supported.append(cand)
+        # Multiple distinct approximate titles are ambiguous; retain exact hits.
+        if len({normalize_for_version(t.title) for t in supported}) <= 1:
+            kept.extend(supported)
         if not kept:
             return []
         rank_tracks_multi(readings, kept, prefer_ext="")

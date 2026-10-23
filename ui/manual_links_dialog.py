@@ -26,13 +26,11 @@ class ManualLinksDialog(QDialog):
     def __init__(self, existing: "list[str] | None" = None, parent=None) -> None:
         super().__init__(parent)
         self._fitted = False
-        self.setWindowTitle("手动补链")
+        self.setWindowTitle("提供音频链接")
         self.setMinimumSize(*MIN_SIZE)
         root = QVBoxLayout(self)
-        tip = QLabel(
-            "粘贴直链（http/https）或本地文件路径，每行一条。\n"
-            "这些链接会**优先于**自动音源使用，并跳过歌名/歌手门槛（你既然指定了就用它）；\n"
-            "下载后仍会做完整校验（文件头 / 码率 / 时长）。请只补你自己合法持有的资源。")
+        tip = QLabel("粘贴你自己的音频链接或本地文件路径，每行一条。\n"
+                     "处理文件时会优先使用这些资源，不核对歌名和歌手；文件及完整度校验仍会执行。")
         tip.setWordWrap(True)
         tip.setProperty("role", "muted")
         root.addWidget(tip)
@@ -44,6 +42,8 @@ class ManualLinksDialog(QDialog):
                                    | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("保存链接")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         root.addWidget(buttons)
 
     def showEvent(self, event) -> None:  # noqa: N802

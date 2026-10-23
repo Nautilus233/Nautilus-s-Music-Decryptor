@@ -1,6 +1,6 @@
 """「以名找歌」对话框：不需要任何输入文件，直接按歌名/歌手走备用音源链路。
 
-用的是**和「开始解密」完全相同**的那条选源链：同样的歌名 + 歌手硬门槛、
+用的是**和「开始处理」完全相同**的那条选源链：同样的歌名 + 歌手硬门槛、
 伴奏/改编版本过滤、华语预匹配、跨平台时长核验、下载校验与完整度门禁 ——
 区别只在于入口不需要一个加密文件。用来替代"去资源站手动搜了再下"的日常动作。
 
@@ -55,16 +55,17 @@ class NameSearchDialog(QDialog):
         self._log_lines: "list[tuple[str, str]]" = []
         self._hidden_details = 0
 
-        self.setWindowTitle("以名找歌 · 备用音源")
+        self.setWindowTitle("单曲下载")
         self.setMinimumSize(*MIN_SIZE)
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 12, 14, 12)
-        root.setSpacing(10)
+        root.setContentsMargins(14, 10, 14, 10)
+        root.setSpacing(6)
 
-        tip = QLabel(
-            "不需要加密文件：直接填歌名（一行一首＝批量），走与「开始解密」**相同**的备用音源链路。\n"
-            "列出的候选都**已经过歌名/歌手硬门槛与版本过滤，并且解析出了直链** —— "
-            "下不了（无免费直链）或直链形态就是试听片段的候选不会出现在这里。")
+        title = QLabel("单曲下载")
+        title.setProperty("role", "title")
+        root.addWidget(title)
+        tip = QLabel("输入歌名即可下载。每行一首，可一次粘贴多首。"
+                     f"  输出格式：{self.settings.quality.upper()}（在主窗口调整）")
         tip.setWordWrap(True)
         tip.setProperty("role", "muted")
         root.addWidget(tip)
@@ -76,25 +77,32 @@ class NameSearchDialog(QDialog):
         self.names.setFixedHeight(76)
         form.addRow("歌名", self.names)
         self.artist = QLineEdit()
-        self.artist.setPlaceholderText("可选；填了就对每一行都用这个歌手（更准）")
+        self.artist.setPlaceholderText("选填；批量下载时用于上面所有歌曲")
         form.addRow("歌手", self.artist)
         root.addLayout(form)
 
         opts = QHBoxLayout()
-        self.chk_auto = QCheckBox("自动挑选最优（取消勾选＝先列出候选让我挑）")
-        self.chk_auto.setToolTip("列出候选时只检索不下载；点「下载选中」直接下你选的那一条")
+        self.chk_auto = QCheckBox("自动选择并下载")
+        self.chk_auto.setToolTip("取消勾选后，先搜索第一首歌的可用结果，由你选一条下载。")
         self.chk_auto.setChecked(True)
         opts.addWidget(self.chk_auto)
         opts.addStretch(1)
-        self.btn_out_dir = QPushButton("输出目录…")
-        self.btn_out_dir.setToolTip("给「以名找歌」单独指定一个目录（与「开始解密」的输出目录互不影响）")
-        self.btn_open_out = QPushButton("打开输出目录")
-        self.btn_follow_main = QPushButton("跟随主设置")
-        self.btn_follow_main.setToolTip("清掉专用目录，改回：主输出目录 → 默认目录（按需按优）")
-        opts.addWidget(self.btn_out_dir)
-        opts.addWidget(self.btn_follow_main)
-        opts.addWidget(self.btn_open_out)
+        mode_help = QLabel("取消勾选可先搜索，再手动选择")
+        mode_help.setProperty("role", "muted")
+        opts.addWidget(mode_help)
         root.addLayout(opts)
+        save_row = QHBoxLayout()
+        save_row.addWidget(QLabel("保存位置"))
+        save_row.addStretch(1)
+        self.btn_out_dir = QPushButton("更改位置…")
+        self.btn_out_dir.setToolTip("单曲和专辑下载共用此保存位置，不影响本地文件的保存设置。")
+        self.btn_open_out = QPushButton("打开文件夹")
+        self.btn_follow_main = QPushButton("使用默认位置")
+        self.btn_follow_main.setToolTip("清掉专用目录，改回：主输出目录 → 默认目录（按需按优）")
+        save_row.addWidget(self.btn_out_dir)
+        save_row.addWidget(self.btn_follow_main)
+        save_row.addWidget(self.btn_open_out)
+        root.addLayout(save_row)
 
         self.out_hint = QLabel("")
         self.out_hint.setProperty("role", "muted")
@@ -111,7 +119,7 @@ class NameSearchDialog(QDialog):
         root.addWidget(self.table, 3)
 
         act = QHBoxLayout()
-        self.btn_start = QPushButton("开始")
+        self.btn_start = QPushButton("搜索并下载")
         self.btn_start.setProperty("role", "primary")
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setEnabled(False)
@@ -128,8 +136,8 @@ class NameSearchDialog(QDialog):
         root.addLayout(act)
 
         log_row = QHBoxLayout()
-        log_row.addWidget(QLabel("运行日志"))
-        self.chk_detail = QCheckBox("显示详细信息")
+        log_row.addWidget(QLabel("下载结果"))
+        self.chk_detail = QCheckBox("查看处理详情")
         log_row.addWidget(self.chk_detail)
         log_row.addStretch(1)
         self.log_hint = QLabel("")
@@ -138,10 +146,11 @@ class NameSearchDialog(QDialog):
         root.addLayout(log_row)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        self.log.setFixedHeight(96)
+        self.log.setFixedHeight(72)
         root.addWidget(self.log)
 
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
+        box.button(QDialogButtonBox.StandardButton.Close).setText("返回主窗口")
         box.rejected.connect(self.reject)
         box.clicked.connect(lambda *_: self.reject())
         root.addWidget(box)
@@ -214,19 +223,19 @@ class NameSearchDialog(QDialog):
         configured = (self.settings.output_dir or "").strip()
         target = self.effective_out_dir()
         if search_dir:
-            self.out_hint.setText(f"输出目录（本模式专用）：{target}")
+            self.out_hint.setText(f"保存到：{target}（下载专用）")
         elif configured:
-            self.out_hint.setText(f"输出目录：跟随主输出目录 {target}"
-                                  "（想分开就点「输出目录…」）")
+            self.out_hint.setText(f"保存到：{target}（使用主窗口位置）"
+                                  "（可单独更改）")
         else:
-            self.out_hint.setText(f"输出目录（默认）：{target}"
-                                  "（可在上方按钮里改成专用目录）")
+            self.out_hint.setText(f"保存到：{target}（默认）"
+                                  "（可更改）")
 
     def _pick_out_dir(self) -> None:
         start = str(self.effective_out_dir())
         chosen = QFileDialog.getExistingDirectory(self, "选择「以名找歌」的输出目录", start)
         if chosen:
-            # 只写**本模式专用**的目录，不动「开始解密」的输出目录
+            # 只写**本模式专用**的目录，不动「开始处理」的输出目录
             self.settings.search_output_dir = chosen
             try:
                 self.config.save()
@@ -254,6 +263,7 @@ class NameSearchDialog(QDialog):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
     def _on_mode_toggled(self, auto: bool) -> None:
+        self.btn_start.setText("搜索并下载" if auto else "搜索歌曲")
         self.btn_pick.setEnabled(not auto and bool(self._candidates))
         if not auto:
             self._log("· 已切换为「先列出候选」：会逐条解析直链（不下载音频），"

@@ -5,91 +5,64 @@ on:
     branches: [main]
     tags: ['*']
   release:
-    types: [published, edited, deleted]
+    types: [published, edited, deleted, released, prereleased]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to sync; leave empty to sync all published releases'
+        required: false
+        type: string
 
 permissions:
   contents: read
 
+# Serialize runs: uploading/replacing attachments must not overlap.
+concurrency:
+  group: sync-gitee
+  cancel-in-progress: false
+
 env:
   GITEE_REPO: wu-mengze233/Nautilus-s-Music-Decryptor
+  GITEE_USER: wu-mengze233
 
 jobs:
   sync:
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
-      - name: Checkout repository
+      - name: Checkout trusted sync scripts
         uses: actions/checkout@v4
         with:
+          ref: main
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Mirror branches and tags
+      - name: Sync main and tags
         env:
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        shell: bash
         run: |
+          set -euo pipefail
           test -n "$GITEE_TOKEN" || { echo "Missing GITEE_TOKEN secret"; exit 1; }
-          git remote add gitee "https://oauth2:${GITEE_TOKEN}@gitee.com/${GITEE_REPO}.git"
-          git push gitee --all --force
-          git push gitee --tags --force
+          askpass="$RUNNER_TEMP/gitee-askpass.sh"
+          trap 'rm -f "$askpass"' EXIT
+          cat > "$askpass" <<'SH'
+          #!/bin/sh
+          case "$1" in
+            *Username*) printf '%s\n' "$GITEE_USER" ;;
+            *) printf '%s\n' "$GITEE_TOKEN" ;;
+          esac
+          SH
+          chmod 700 "$askpass"
+          export GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0
+          git remote add gitee "https://gitee.com/${GITEE_REPO}.git"
+          git push gitee refs/remotes/origin/main:refs/heads/main
+          git push gitee --tags
 
-      - name: Sync release metadata
-        if: github.event_name == 'release'
+      - name: Sync releases and attachments
+        if: github.event_name == 'release' || github.event_name == 'workflow_dispatch'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
-          RELEASE_ACTION: ${{ github.event.action }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
-          RELEASE_NAME: ${{ github.event.release.name }}
-          RELEASE_BODY: ${{ github.event.release.body }}
-          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
-        run: |
-          python - <<'PY'
-          import json
-          import os
-          import urllib.error
-          import urllib.parse
-          import urllib.request
-
-          base = "https://gitee.com/api/v5"
-          repo = os.environ["GITEE_REPO"]
-          token = os.environ["GITEE_TOKEN"]
-          tag = os.environ.get("RELEASE_TAG", "")
-          action = os.environ.get("RELEASE_ACTION", "")
-
-          def request(method, path, payload=None):
-              query = urllib.parse.urlencode({"access_token": token})
-              data = None
-              headers = {"Accept": "application/json"}
-              if payload is not None:
-                  data = urllib.parse.urlencode(payload).encode()
-                  headers["Content-Type"] = "application/x-www-form-urlencoded"
-              req = urllib.request.Request(f"{base}{path}?{query}", data=data, headers=headers, method=method)
-              try:
-                  with urllib.request.urlopen(req) as response:
-                      return response.status, json.loads(response.read() or b"{}")
-              except urllib.error.HTTPError as exc:
-                  if exc.code == 404:
-                      return 404, {}
-                  raise
-
-          if action == "deleted":
-              status, release = request("GET", f"/repos/{repo}/releases/tags/{urllib.parse.quote(tag, safe='')}" )
-              if status != 404 and release.get("id"):
-                  request("DELETE", f"/repos/{repo}/releases/{release['id']}")
-              print(f"Deleted Gitee release for {tag}")
-              raise SystemExit(0)
-
-          payload = {
-              "tag_name": tag,
-              "name": os.environ.get("RELEASE_NAME") or tag,
-              "body": os.environ.get("RELEASE_BODY") or "",
-              "prerelease": "true" if os.environ.get("RELEASE_PRERELEASE") == "true" else "false",
-          }
-          status, existing = request("GET", f"/repos/{repo}/releases/tags/{urllib.parse.quote(tag, safe='')}" )
-          if status == 404:
-              request("POST", f"/repos/{repo}/releases", payload)
-              print(f"Created Gitee release for {tag}")
-          else:
-              request("PATCH", f"/repos/{repo}/releases/{existing['id']}", payload)
-              print(f"Updated Gitee release for {tag}")
-          PY
+          SYNC_TAG: ${{ inputs.tag }}
+        run: python tools/sync_gitee.py

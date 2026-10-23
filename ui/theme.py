@@ -1,86 +1,128 @@
-"""Dark QSS theme."""
+"""Light/dark widget themes, following the OS through Qt style hints."""
 from __future__ import annotations
 
-ACCENT = "#2f6bff"
-ACCENT_HOVER = "#4d81ff"
-MUTED = "#8b93a7"
+import weakref
 
-QSS = f"""
-* {{ font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI", sans-serif; font-size: 13px; }}
-QWidget {{ background: #151824; color: #e6e9f2; }}
-QMainWindow, QDialog {{ background: #10131d; }}
+from PySide6.QtCore import QSettings, Qt
+from PySide6.QtGui import QPalette, QColor
 
-QLabel[role="title"] {{ font-size: 20px; font-weight: 700; color: #ffffff; }}
-QLabel[role="subtitle"] {{ color: {MUTED}; }}
-QLabel[role="muted"] {{ color: {MUTED}; }}
-
-QFrame[role="card"] {{
-    background: #1b1f2e; border: 1px solid #262b3d; border-radius: 12px;
-}}
-
-QPushButton {{
-    background: #232838; border: 1px solid #313848; border-radius: 8px;
-    padding: 7px 14px; color: #dfe3ee;
-}}
-QPushButton:hover {{ background: #2a3145; border-color: #3d4557; }}
-QPushButton:pressed {{ background: #202634; }}
-QPushButton:disabled {{ color: #5b6274; background: #1a1e2b; border-color: #242a38; }}
-QPushButton[role="primary"] {{
-    background: {ACCENT}; border: 1px solid {ACCENT}; color: #ffffff; font-weight: 600;
-}}
-QPushButton[role="primary"]:hover {{ background: {ACCENT_HOVER}; border-color: {ACCENT_HOVER}; }}
-QPushButton[role="danger"] {{ background: #3a2130; border-color: #5a2b3c; color: #ffb3c0; }}
-
-QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {{
-    background: #1b2030; border: 1px solid #2c3344; border-radius: 8px;
-    padding: 6px 9px; color: #e6e9f2; selection-background-color: {ACCENT};
-}}
-QComboBox:focus, QLineEdit:focus {{ border-color: {ACCENT}; }}
-QComboBox::drop-down {{ border: none; width: 20px; }}
-QComboBox QAbstractItemView {{
-    background: #1b2030; border: 1px solid #2c3344; selection-background-color: {ACCENT};
-    outline: none;
-}}
-
-QTableWidget {{
-    background: #171b28; border: 1px solid #262b3d; border-radius: 10px;
-    gridline-color: #222738; alternate-background-color: #1a1f2d;
-    selection-background-color: #22305c; selection-color: #ffffff;
-}}
-QHeaderView::section {{
-    background: #1c2130; color: {MUTED}; padding: 8px; border: none;
-    border-right: 1px solid #242a38; border-bottom: 1px solid #262b3d; font-weight: 600;
-}}
-QTableWidget::item {{ padding: 5px 8px; }}
-
-QProgressBar {{
-    background: #1b2030; border: 1px solid #262b3d; border-radius: 8px;
-    height: 16px; text-align: center; color: #cfd5e4;
-}}
-QProgressBar::chunk {{ background: {ACCENT}; border-radius: 7px; }}
-
-QPlainTextEdit {{
-    background: #0d1017; border: 1px solid #242a38; border-radius: 10px;
-    color: #c9d1e4; font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px;
-}}
-
-QCheckBox {{ spacing: 7px; }}
-QCheckBox::indicator {{
-    width: 16px; height: 16px; border-radius: 4px;
-    border: 1px solid #3a4256; background: #1b2030;
-}}
-QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
-
-QScrollBar:vertical {{ background: transparent; width: 10px; margin: 2px; }}
-QScrollBar::handle:vertical {{ background: #333b4e; border-radius: 5px; min-height: 30px; }}
-QScrollBar::handle:vertical:hover {{ background: #404a63; }}
-QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
-QScrollBar:horizontal {{ background: transparent; height: 10px; }}
-QScrollBar::handle:horizontal {{ background: #333b4e; border-radius: 5px; min-width: 30px; }}
-
-QToolTip {{ background: #232838; color: #e6e9f2; border: 1px solid #333b4e; }}
-"""
+MODES = (("浅色", "light"), ("深色", "dark"), ("跟随系统", "system"))
 
 
-def apply(app) -> None:
-    app.setStyleSheet(QSS)
+def preference() -> str:
+    value = QSettings("MusicDecryptor", "MusicDecryptor").value("appearance", "system")
+    return value if value in ("light", "dark", "system") else "system"
+
+
+def save_preference(app, mode: str) -> None:
+    mode = mode if mode in ("light", "dark", "system") else "system"
+    QSettings("MusicDecryptor", "MusicDecryptor").setValue("appearance", mode)
+    apply(app, mode)
+
+
+def _colors(dark: bool) -> dict:
+    if dark:
+        return dict(bg="#151b26", surface="#1d2532", field="#17202d", text="#e6edf7",
+                    muted="#a4b1c4", border="#354155", hover="#293649", alt="#222d3e",
+                    selected="#29456b", accent="#8cbbff", button="#2872c9", disabled="#7b8799",
+                    danger="#ffabb4", danger_bg="#442a35")
+    return dict(bg="#f3f5f8", surface="#ffffff", field="#ffffff", text="#202c3d",
+                muted="#59697c", border="#d6dee9", hover="#eaf1fb", alt="#f7f9fc",
+                selected="#dbeafe", accent="#185da5", button="#2467b3", disabled="#7a8798",
+                danger="#a8263a", danger_bg="#fff0f1")
+
+
+def stylesheet(dark: bool) -> str:
+    c = _colors(dark)
+    return """
+* { font-family: "Microsoft YaHei", "SimSun"; font-size: 13px; }
+QWidget { background: %(bg)s; color: %(text)s; }
+QLabel { background: transparent; }
+QLabel[role="title"] { font-size: 22px; font-weight: 700; }
+QLabel[role="subtitle"], QLabel[role="muted"] { color: %(muted)s; }
+QLabel[role="section"] { font-weight: 600; font-size: 14px; }
+QFrame[role="card"] { background: %(surface)s; border: 1px solid %(border)s; border-radius: 10px; }
+QPushButton { background: %(surface)s; border: 1px solid %(border)s; border-radius: 6px;
+              padding: 7px 12px; min-height: 18px; }
+QPushButton:hover { background: %(hover)s; border-color: %(accent)s; }
+QPushButton:pressed { background: %(selected)s; }
+QPushButton:focus { border: 2px solid %(accent)s; padding: 6px 11px; }
+QPushButton:disabled { color: %(disabled)s; background: %(bg)s; border-color: %(border)s; }
+QPushButton[role="primary"] { background: %(button)s; border-color: %(button)s; color: white; font-weight: 600; }
+QPushButton[role="primary"]:hover { background: #185a9c; }
+QPushButton[role="primary"]:disabled { background: %(border)s; border-color: %(border)s; color: %(disabled)s; }
+QPushButton[role="navigation"] { text-align: left; padding: 12px 16px; font-weight: 600; }
+QPushButton[role="current"] { text-align: left; padding: 12px 16px; font-weight: 600;
+                              background: %(selected)s; color: %(accent)s; border-color: %(accent)s; }
+QPushButton[role="danger"] { background: %(danger_bg)s; color: %(danger)s; }
+QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox { background: %(field)s; border: 1px solid %(border)s;
+    border-radius: 6px; padding: 6px 8px; selection-background-color: %(selected)s; selection-color: %(text)s; }
+QComboBox:focus, QLineEdit:focus, QPlainTextEdit:focus { border-color: %(accent)s; }
+QComboBox QAbstractItemView { background: %(surface)s; color: %(text)s;
+    selection-background-color: %(selected)s; selection-color: %(text)s; }
+QTableWidget, QListWidget { background: %(surface)s; border: 1px solid %(border)s;
+    border-radius: 7px; gridline-color: %(border)s; alternate-background-color: %(alt)s;
+    selection-background-color: %(selected)s; selection-color: %(text)s; }
+QHeaderView::section { background: %(alt)s; color: %(muted)s; padding: 7px 8px;
+    border: none; border-bottom: 1px solid %(border)s; font-weight: 600; }
+QTableWidget::item { padding: 4px 8px; }
+QProgressBar { background: %(surface)s; border: 1px solid %(border)s; border-radius: 5px;
+    min-height: 15px; text-align: center; }
+QProgressBar::chunk { background: %(button)s; border-radius: 4px; }
+QPlainTextEdit { background: %(field)s; border: 1px solid %(border)s; border-radius: 7px; padding: 5px;
+    selection-background-color: %(selected)s; selection-color: %(text)s; }
+QCheckBox { spacing: 7px; background: transparent; }
+QCheckBox:disabled { color: %(disabled)s; }
+QPushButton[role="danger"]:disabled { color: %(disabled)s; background: %(bg)s; }
+QGroupBox { background: %(surface)s; border: 1px solid %(border)s; border-radius: 8px;
+    margin-top: 12px; padding: 14px 10px 8px; }
+QGroupBox::title { subcontrol-origin: margin; left: 12px; padding: 0 5px; color: %(muted)s; }
+QTabWidget::pane { border: none; }
+QTabBar::tab { background: %(bg)s; color: %(muted)s; padding: 9px 16px; border-bottom: 2px solid transparent; }
+QTabBar::tab:selected { color: %(accent)s; border-bottom-color: %(accent)s; font-weight: 600; }
+QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }
+QScrollBar::handle:vertical { background: %(border)s; border-radius: 4px; min-height: 24px; }
+QScrollBar::add-line, QScrollBar::sub-line { height: 0; width: 0; }
+QScrollBar:horizontal { background: transparent; height: 10px; }
+QScrollBar::handle:horizontal { background: %(border)s; border-radius: 4px; min-width: 24px; }
+QToolTip { background: %(surface)s; color: %(text)s; border: 1px solid %(border)s; padding: 4px; }
+""" % c
+
+
+def apply(app, mode: str | None = None) -> None:
+    if app is None:
+        return
+    if mode is not None or not hasattr(app, "_music_theme_mode"):
+        app._music_theme_mode = mode if mode in ("light", "dark", "system") else preference()
+    if not getattr(app, "_music_theme_connected", False):
+        app._music_theme_connected = True
+        try:
+            target = weakref.ref(app)
+
+            def refresh(*_):
+                current = target()
+                if current is not None:
+                    apply(current)
+
+            app.styleHints().colorSchemeChanged.connect(refresh)
+        except AttributeError:
+            pass  # Older Qt: initial palette still provides a compatible fallback.
+        app._music_initial_dark = app.palette().color(QPalette.ColorRole.Window).lightness() < 128
+    active = app._music_theme_mode
+    system_dark = getattr(app, "_music_initial_dark", False)
+    try:
+        scheme = app.styleHints().colorScheme()
+        if scheme != Qt.ColorScheme.Unknown:
+            system_dark = scheme == Qt.ColorScheme.Dark
+    except AttributeError:
+        pass
+    dark = active == "dark" or (active == "system" and system_dark)
+    colors = _colors(dark)
+    palette = QPalette(app.palette())
+    for role, key in ((QPalette.ColorRole.Window, "bg"), (QPalette.ColorRole.Base, "surface"),
+                      (QPalette.ColorRole.Text, "text"), (QPalette.ColorRole.WindowText, "text"),
+                      (QPalette.ColorRole.Button, "surface"), (QPalette.ColorRole.ButtonText, "text"),
+                      (QPalette.ColorRole.Highlight, "selected"), (QPalette.ColorRole.HighlightedText, "text")):
+        palette.setColor(role, QColor(colors[key]))
+    app.setPalette(palette)
+    app.setStyleSheet(stylesheet(dark))
