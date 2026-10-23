@@ -239,8 +239,17 @@ def main(argv=None) -> int:
 
         _ck("romaji->kana", jp.romaji_to_kana("yorushika") == "\u3088\u308b\u3057\u304b")
         _ck("kana->romaji", jp.kana_to_romaji("\u3042\u308a\u304c\u3068\u3046") == "arigatou")
-        _ck("katakana variant", jp.search_variants("yorushika")[:1] == [("\u30e8\u30eb\u30b7\u30ab", "\u65e5\u6587\u7247\u5047\u540d\u8bfb\u97f3")],
-            str(jp.search_variants("yorushika")))
+        variants = jp.search_variants("yorushika")
+        _ck("known-table written form", bool(variants) and variants[0][0] == "\u30e8\u30eb\u30b7\u30ab",
+            str(variants))
+        # 2026-10-23 用户实测缺陷固化：罗马音必须给出**书写形**（读音形四平台都检索不到）
+        written = jp.known_titles("dakarabokuha ongakuwo yameta")
+        _ck("romaji -> written title", written == ["\u3060\u304b\u3089\u50d5\u306f\u97f3\u697d\u3092\u8f9e\u3081\u305f"],
+            str(written))
+        spaced = jp.search_variants("dakara boku ha ongaku wo yameta")
+        _ck("spaced romaji -> same written title",
+            bool(spaced) and spaced[0] == ("\u3060\u304b\u3089\u50d5\u306f\u97f3\u697d\u3092\u8f9e\u3081\u305f", "\u8868\u5185\u539f\u540d"),
+            str(spaced))
         forms = jp.match_forms("\u6b8b\u9177\u306a\u5929\u4f7f\u306e\u30c6\u30fc\u30bc")
         _ck("reading table loaded", any(f == "zankokunatenshinoteze" for f in forms), str(forms))
         corrections = fuzzy.corrections_for("\u775b\u5929", limit=2)

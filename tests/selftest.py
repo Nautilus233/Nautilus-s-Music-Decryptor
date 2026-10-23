@@ -1547,10 +1547,12 @@ def test_jp_tables() -> None:
     from mmusic import jp
 
     sv = jp.search_variants("senbonzakura")
-    check("jp tables: senbonzakura -> センボンザクラ", bool(sv) and sv[0][0] == "センボンザクラ",
+    check("jp tables: senbonzakura -> 表内书写形 千本桜（读音形垫后）",
+          bool(sv) and sv[0][0] == "千本桜" and any(t == "センボンザクラ" for t, _r in sv),
           str(sv))
     sv2 = jp.search_variants("gurenge")
-    check("jp tables: gurenge -> グレンゲ", bool(sv2) and sv2[0][0] == "グレンゲ", str(sv2))
+    check("jp tables: gurenge -> 表内书写形 紅蓮華（读音形垫后）",
+          bool(sv2) and sv2[0][0] == "紅蓮華" and any(t == "グレンゲ" for t, _r in sv2), str(sv2))
     cat = jp.artist_katakana("kenshi yonezu")
     check("jp tables: artist reading for romaji input",
           cat in ("ヨネヅ ケンシ", "ヨネズ ケンシ"), str(cat))
@@ -2928,6 +2930,381 @@ def test_fast_mode_e2e() -> None:
           s2b.calls >= 1 and got2 == PAYLOAD, f"src2 calls={s2b.calls}")
 
 
+def test_album_search() -> None:
+    """按专辑找歌：四源检索解析 + **多源并集装配**（不丢曲目 / 不膨胀 / 版本聚类 / 去重）。"""
+    print("\n[album search: parsing + multi-source union]")
+    import json
+    import urllib.parse
+    from mmusic.config import Settings
+    from mmusic.model import Track
+    from mmusic.search.album import (AlbumHit, _clean, _display_count, _query_texts,
+                                     _source_best, _text_forms, _track_key,
+                                     album_tracks, group_albums, group_tracks,
+                                     search_albums)
+
+    class FakeHttp:
+        def __init__(self, routes):
+            self.routes = routes
+
+        def _payload(self, url):
+            for match, payload in self.routes:
+                try:
+                    hit = match(url) if callable(match) else (match in url)
+                except Exception:  # noqa: BLE001
+                    hit = False
+                if hit:
+                    return payload
+            return {}
+
+        def get_json(self, url, headers=None, timeout=None):
+            return self._payload(url)
+
+        def request(self, method, url, headers=None, timeout=None):
+            payload = self._payload(url)
+            if isinstance(payload, bytes):
+                body = payload
+            elif isinstance(payload, str):
+                body = payload.encode("utf-8")      # 酷我伪 JSON：文本原样返回
+            else:
+                body = json.dumps(payload).encode("utf-8")
+            return 200, body, {}
+
+    def has(url, *parts):
+        return all(part in url for part in parts)
+
+    def migu_album(aid, name, artist, year="2005"):
+        return {"albumResultData": {"result": [
+            {"id": aid, "name": name, "singer": artist, "publishDate": year}]}}
+
+    def migu_songs(items):
+        return {"songResultData": {"result": [
+            {"name": t, "contentId": cid, "singers": [{"name": a}],
+             "albums": [{"id": aid, "name": "x"}]} for (t, a, aid, cid) in items]}}
+
+    def kugou_albums(items):
+        return {"status": 1, "data": {"info": [
+            {"albumid": aid, "albumname": n, "singername": a, "songcount": c,
+             "publishtime": "2005-11-01 00:00:00"} for (aid, n, a, c) in items]}}
+
+    def kugou_songs(items):
+        return {"status": 1, "data": {"info": [
+            {"filename": f"{a} - {t}", "duration": d, "hash": f"H{i}"}
+            for i, (t, a, d) in enumerate(items)]}}
+
+    def kuwo_albums(items):
+        rows = "".join("{'albumid':'%s','name':'%s','artist':'%s','musiccnt':'%s'},"
+                       % (aid, n, a, c) for (aid, n, a, c) in items)
+        return "{'albumlist':[%s],'SHOW':'1'}" % rows
+
+    def kuwo_songs(items):
+        rows = "".join("{'musicrid':'%d','name':'%s','artist':'%s','duration':'%d',"
+                       "'MINFO':'level:h,bitrate:128,format:mp3,size:1.5Mb'},"
+                       % (i + 1, t, a, d) for i, (t, a, d) in enumerate(items))
+        return "{'musiclist':[%s]}" % rows
+
+    JJ = [("就是我", "林俊杰", 194), ("会读书", "林俊杰", 208), ("翅膀", "林俊杰", 221),
+          ("星球", "林俊杰", 225), ("冻结", "林俊杰", 289)]
+
+    # ---- 一、四源检索解析（字段 + raw 映射） ----
+    fake = FakeHttp([
+        (lambda u: has(u, "search/album?"), kugou_albums([(958909, "十一月的萧邦", "周杰伦", 12),
+                                                           (7001, "十一月的萧邦", "周婕纶", 12)])),
+        (lambda u: has(u, "album/song?"), kugou_songs([("夜曲", "周杰伦", 226),
+                                                        ("珊瑚海", "周杰伦", 255)])),
+        (lambda u: has(u, "ft=album"), kuwo_albums([(14466, "十一月的萧邦", "周杰伦", 12)])),
+        (lambda u: has(u, "stype=albuminfo"), kuwo_songs([("夜曲", "周杰伦", 226)])),
+        (lambda u: has(u, "search_all.do", "album%22%3A+1"),
+         migu_album("8591", "十一月的萧邦", "周杰伦")),
+        (lambda u: has(u, "search_all.do", "song%22%3A+1"),
+         migu_songs([("夜曲", "周杰伦", "8591", "C1")])),
+        (lambda u: has(u, "resourceinfo.do"), {"resource": [{"totalCount": 2}]}),
+        (lambda u: has(u, "types=search"),
+         [{"id": "1", "name": "夜曲", "artist": ["周杰伦"], "album": "十一月的萧邦",
+           "pic_id": "P1"}]),
+    ])
+    notes: "list[str]" = []
+    hits = search_albums(fake, "十一月的萧邦", artist="周杰伦",
+                         sources={"migu", "kugou", "kuwo", "aggregator"},
+                         settings=Settings(), log=notes.append)
+    by_src = {h.source: h for h in hits}
+    check("album: 四个来源都出了专辑实体",
+          {"migu", "kugou", "kuwo", "aggregator"} <= set(by_src), str(list(by_src)))
+    check("album: 酷狗专辑字段（id/曲目数/年份）",
+          by_src.get("kugou") and by_src["kugou"].album_id == "958909"
+          and by_src["kugou"].track_count == 12 and by_src["kugou"].year == "2005")
+    kg = album_tracks(fake, by_src["kugou"])
+    check("album: 酷狗单源曲目映射（raw 键齐全）",
+          len(kg) == 2 and kg[0].title == "夜曲" and kg[0].raw.get("FileHash") == "H0")
+    kw = album_tracks(fake, by_src["kuwo"])
+    check("album: 酷我单源曲目映射（MUSICRID 前缀补齐 + 码率）",
+          len(kw) == 1 and kw[0].raw.get("MUSICRID") == "MUSIC_1" and kw[0].bitrate == 128)
+    mg = album_tracks(fake, by_src["migu"])
+    check("album: 咪咕单源推导（按 albums[].id 归集）", len(mg) == 1 and mg[0].title == "夜曲")
+
+    # ---- 二、单源最佳实体 + 展示计数（不再"取众数并列取小"） ----
+    mixed = [
+        AlbumHit(source="migu", album_id="A", name="盗作", artist="ヨルシカ", track_count=11),
+        AlbumHit(source="migu", album_id="B", name="盗作", artist="ヨルシカ", track_count=1),
+        AlbumHit(source="kugou", album_id="C", name="盗作", artist="ヨルシカ", track_count=14),
+        AlbumHit(source="kuwo", album_id="D", name="盗作", artist="ヨルシカ", track_count=1),
+        AlbumHit(source="aggregator", album_id="盗作", name="盗作", artist="ヨルシカ", track_count=14),
+    ]
+    best = _source_best(mixed)
+    check("album-best: 同源多实体取曲目更多者（歌级 1 首被压掉）",
+          best["migu"].track_count == 11 and best["kugou"].track_count == 14
+          and best["kuwo"].track_count == 1, str({k: v.track_count for k, v in best.items()}))
+    check("album-best: 展示计数 = 目录最完整值（聚合归集数不作准）",
+          _display_count(mixed) == 14, str(_display_count(mixed)))
+    check("album-best: 只有聚合时退回归集数（界面标注「归集」）",
+          _display_count([AlbumHit(source="aggregator", album_id="x", name="x",
+                                   artist="y", track_count=18)]) == 18)
+
+    # ---- 三、多源并集：不丢曲目 + 去重（括号说明） ----
+    union_hits = [
+        AlbumHit(source="migu", album_id="8346", name="乐行者", artist="林俊杰", track_count=1),
+        AlbumHit(source="kugou", album_id="951", name="乐行者", artist="林俊杰", track_count=4),
+        AlbumHit(source="kuwo", album_id="574", name="乐行者", artist="林俊杰", track_count=5),
+    ]
+    fake3 = FakeHttp([
+        (lambda u: has(u, "search_all.do", "song%22%3A+1"),
+         migu_songs([("就是我", "林俊杰", "8346", "C0")])),
+        (lambda u: has(u, "search_all.do", "album%22%3A+1"), migu_album("8346", "乐行者", "林俊杰")),
+        (lambda u: has(u, "resourceinfo.do"), {"resource": [{"totalCount": 1}]}),
+        (lambda u: has(u, "album/song?"), kugou_songs(JJ[:4])),
+        # 酷我多一首「冻结」，且「翅膀」带译文括号 —— 去重后应与 kugou 的「翅膀」同键
+        (lambda u: has(u, "stype=albuminfo"),
+         kuwo_songs([("就是我", "林俊杰", 194), ("会读书", "林俊杰", 208),
+                     ("翅膀 (羽翼)", "林俊杰", 221), ("星球", "林俊杰", 225),
+                     ("冻结", "林俊杰", 289)])),
+    ])
+    notes3: "list[str]" = []
+    g3 = group_albums(union_hits, query="乐行者", artist="林俊杰")[0]
+    tr3 = group_tracks(fake3, g3, settings=Settings(), log=notes3.append)
+    titles3 = [t.title for t in tr3]
+    check("album-union: 并集不丢曲目（列表 ⊇ 每个通过校验的来源）",
+          len(tr3) == 5 and "星球" in titles3 and "冻结" in titles3, str(titles3))
+    check("album-union: 括号说明的同一首被去重（「翅膀 (羽翼)」不与「翅膀」并列）",
+          len([t for t in titles3 if t.startswith("翅膀")]) == 1, str(titles3))
+    check("album-union: 展示计数 = 实际列表长度",
+          g3.track_count == len(tr3) == 5, f"{g3.track_count}/{len(tr3)}")
+    check("album-union: 明细写明每来源曲目数与并集结果",
+          any("kugou" in m and "曲目表" in m for m in notes3)
+          and any("并集装配" in m for m in notes3), " | ".join(notes3[-3:]))
+
+    # ---- 四、版本聚类：不同版本不相混（《盗作》复刻：咪咕 11 首英文版 vs 官版 14 首） ----
+    EN = [("Plagiarism", "ヨルシカ", 200), ("Escape", "ヨルシカ", 200), ("Replicant", "ヨルシカ", 200)]
+    JP = [(f"曲{i}", "ヨルシカ", 200) for i in range(1, 15)]
+    version_hits = [
+        AlbumHit(source="migu", album_id="M1", name="盗作", artist="ヨルシカ", track_count=11),
+        AlbumHit(source="kugou", album_id="K1", name="盗作", artist="ヨルシカ", track_count=14),
+        AlbumHit(source="kuwo", album_id="W1", name="盗作", artist="ヨルシカ", track_count=14),
+    ]
+    fake4 = FakeHttp([
+        (lambda u: has(u, "search_all.do", "song%22%3A+1"), migu_songs(
+            [(t, a, "M1", f"M{i}") for i, (t, a, _d) in enumerate(EN)])),
+        (lambda u: has(u, "search_all.do", "album%22%3A+1"), migu_album("M1", "盗作", "ヨルシカ")),
+        (lambda u: has(u, "resourceinfo.do"), {"resource": [{"totalCount": 11}]}),
+        (lambda u: has(u, "album/song?"), kugou_songs(JP)),
+        (lambda u: has(u, "stype=albuminfo"), kuwo_songs(JP)),
+    ])
+    notes4: "list[str]" = []
+    g4 = group_albums(version_hits, query="盗作", artist="ヨルシカ")[0]
+    tr4 = group_tracks(fake4, g4, settings=Settings(), log=notes4.append)
+    titles4 = [t.title for t in tr4]
+    check("album-version: 只保留占优版本（14 首官版），语译版 11 首不混入",
+          len(tr4) == 14 and all(t.startswith("曲") for t in titles4), str(titles4[:4]))
+    check("album-version: 被忽略的版本在明细里如实写明",
+          any("已忽略另一版本" in m for m in notes4), " | ".join(notes4[-2:]))
+
+    # ---- 五、去重键与偏大孤例 ----
+    check("album-key: 说明性括号/变音符/HTML 实体折叠为同一首",
+          _track_key("昼鳶 (白日窃贼)") == _track_key("昼鳶")
+          and _track_key("DE AQUÍ NO SALES (Cap.4: Disputa)") == _track_key("De Aqui No Sales (Cap 4 Disputa)")
+          and _track_key(_clean("Don&apos;t You Remember")) == _track_key("Don't You Remember"))
+    check("album-key: feat/version 是另一条录音（不许误并）",
+          _track_key("ON") != _track_key("ON (Feat. Sia)"))
+    outlier_hits = [
+        AlbumHit(source="migu", album_id="A", name="Abbey Road", artist="The Beatles", track_count=34),
+        AlbumHit(source="kugou", album_id="B", name="Abbey Road", artist="The Beatles", track_count=16),
+        AlbumHit(source="kuwo", album_id="C", name="Abbey Road (2019 Mix)", artist="The Beatles",
+                 track_count=17),
+    ]
+    fake5 = FakeHttp([
+        (lambda u: has(u, "search_all.do", "song%22%3A+1"), migu_songs(
+            [("Come And Get It (Studio Demo)", "The Beatles", "A", "a1"),
+             ("You Never Give Me Your Money (2019 Mix)", "The Beatles", "A", "a2")])),
+        (lambda u: has(u, "search_all.do", "album%22%3A+1"), migu_album("A", "Abbey Road", "The Beatles")),
+        (lambda u: has(u, "resourceinfo.do"), {"resource": [{"totalCount": 34}]}),
+        (lambda u: has(u, "album/song?"), kugou_songs(
+            [("Come Together (Remastered 2009)", "The Beatles", 259),
+             ("Something (Remastered 2009)", "The Beatles", 182),
+             ("You Never Give Me Your Money (Remastered 2009)", "The Beatles", 238)])),
+        (lambda u: has(u, "stype=albuminfo"), kuwo_songs(
+            [("Come Together (2019 Mix)", "The Beatles", 259),
+             ("Something (2019 Mix)", "The Beatles", 182),
+             ("You Never Give Me Your Money (2019 Mix)", "The Beatles", 238)])),
+    ])
+    notes5: "list[str]" = []
+    g5 = group_albums(outlier_hits, query="Abbey Road", artist="The Beatles")[0]
+    tr5 = group_tracks(fake5, g5, settings=Settings(), log=notes5.append)
+    check("album-outlier: 明显偏大的孤例被排除（上中位数参照），并集仍在 3 首",
+          len(tr5) == 3 and not any("Studio Demo" in t.title for t in tr5),
+          str([t.title for t in tr5]))
+
+    # ---- 六、日语书写形（与单曲链路同源） ----
+    check("album-jp: 罗马音查询生成**书写形**变体（读音形平台检索不到）",
+          _query_texts("tada kimi ni hare") == ["tada kimi ni hare", "ただ君に晴れ"],
+          str(_query_texts("tada kimi ni hare")))
+    check("album-jp: 罗马音专辑生成书写形检索文本；混合书写形只按歌手名补形态",
+          _text_forms("tada kimi ni hare", "yorushika")
+          == ["tada kimi ni hare yorushika", "ただ君に晴れ yorushika"]
+          and _text_forms("ただ君に晴れ", "ヨルシカ")
+          == ["ただ君に晴れ ヨルシカ", "yorushika ただ君に晴れ"],
+          f"{_text_forms('tada kimi ni hare', 'yorushika')} / "
+          f"{_text_forms('ただ君に晴れ', 'ヨルシカ')}")
+    MIGU_JP = {"albumResultData": {"result": [
+        {"id": "JP1", "name": "ただ君に晴れ", "singer": "ヨルシカ", "publishDate": "2018-05-01"}]}}
+    fake6 = FakeHttp([
+        (lambda u: has(u, "search_all.do", "album%22%3A+1",
+                       urllib.parse.quote_plus("ただ君に晴れ")), MIGU_JP),
+    ])
+    jp_notes: "list[str]" = []
+    jp_hits = search_albums(fake6, "tada kimi ni hare", artist="yorushika",
+                            sources={"migu"}, settings=Settings(), log=jp_notes.append)
+    check("album-jp: 变体检索命中假名专辑 + 罗马音歌手过滤不漏（cross_similarity）",
+          len(jp_hits) == 1 and jp_hits[0].name == "ただ君に晴れ"
+          and jp_hits[0].artist == "ヨルシカ", str([(h.name, h.artist) for h in jp_hits]))
+    check("album-jp: 明细日志写明命中于哪个变体",
+          any("检索变体" in m for m in jp_notes), " | ".join(jp_notes[-2:]))
+
+
+def test_album_download_e2e() -> None:
+    """按专辑找歌端到端（离线）：统一唱片集/封面/曲序 + 逐级重匹配 + 全失败提示。"""
+    print("\n[album: end-to-end download (batch discipline)]")
+    from mmusic.errors import MusicDecryptorError, NetworkError
+    from mmusic.model import Track
+    from mmusic.pipeline import Pipeline
+    from mmusic.config import Settings
+
+    PAYLOAD = b"ID3\x03\x00\x00\x00\x00\x00\x00" + b"\xee" * 40000
+    COVER = b"\xff\xd8\xff\xe0" + b"\xaa" * 300            # 假 jpeg（头合法）
+
+    class FileSource(SearchSource):
+        """解析到本地文件；fail_resolve=True 时每次解析都失败（模拟无免费直链）。"""
+
+        def __init__(self, name, *, path=None, results=None, fail_resolve=False):
+            super().__init__(None, {})
+            self.name = self.label = name
+            self._path = str(path) if path else ""
+            self._results = list(results or [])
+            self.fail_resolve = fail_resolve
+
+        def search(self, query, *, quality="mp3", limit=10):
+            out = []
+            for t in self._results:
+                out.append(Track(source=self.name, title=t.title, artist=t.artist,
+                                 duration=t.duration, raw=dict(t.raw)))
+            return out
+
+        def resolve(self, track, *, quality="mp3"):
+            if self.fail_resolve:
+                raise NetworkError("该曲目无免费直链", detail="fake")
+            track.url = Path(self._path).resolve().as_uri()
+            track.ext = "mp3"
+            return track
+
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        payload = tmp / "src.mp3"
+        payload.write_bytes(PAYLOAD)
+        settings = Settings(output_dir=str(tmp / "out"),
+                            search_output_dir=str(tmp / "songs"),
+                            write_metadata=True, fetch_cover=False, remember_hashes=False)
+
+        # ---- ① 原生通道直接成功：统一唱片集 + 封面 + 曲序写入 ----
+        logs: "list[tuple[str, str]]" = []
+        pipe = Pipeline(settings, cache_path=tmp / "c.json",
+                        on_log=lambda m, lv: logs.append((m, lv)),
+                        sources=[FileSource("migu", path=payload)])
+        try:
+            track = Track(source="migu", title="珊瑚海", artist="周杰伦",
+                          album="别的专辑（异名）", duration=0,
+                          raw={"path": str(payload), "_album_note": "补位"})
+            res = pipe.download_album_track(track, album="十一月的萧邦",
+                                            cover=COVER, track_no=5)
+            check("album e2e: 原生通道直接下载成功且落盘到搜索输出目录",
+                  res.status == "downloaded" and Path(res.out_path).parent == tmp / "songs"
+                  and Path(res.out_path).name == "周杰伦 - 珊瑚海.mp3",
+                  f"{res.status} {res.out_path}")
+            info: dict = {}
+            try:
+                from mutagen.id3 import ID3
+                id3 = ID3(res.out_path)
+                info = {"album": str(id3.get("TALB") or ""), "title": str(id3.get("TIT2") or ""),
+                        "artist": str(id3.get("TPE1") or ""), "trck": str(id3.get("TRCK") or ""),
+                        "apic": [bytes(a.data) for a in id3.getall("APIC")]}
+            except Exception as exc:  # noqa: BLE001 - 读取失败也要如实报出
+                info = {"err": str(exc)}
+            check("album e2e: 唱片集元数据被强制统一（覆盖原文件的异名专辑）",
+                  info.get("album") == "十一月的萧邦" and info.get("title") == "珊瑚海"
+                  and info.get("artist") == "周杰伦", str(info))
+            check("album e2e: 曲序（TRCK=5）与专辑封面（APIC）已写入",
+                  str(info.get("trck", "")).startswith("5")
+                  and info.get("apic") == [COVER],
+                  f"TRCK={info.get('trck')} APIC={len(info.get('apic') or [])}")
+            result_lines = [m for m, lv in logs if lv == "result"]
+            detail_lines = [m for m, lv in logs if lv != "result"]
+            check("album e2e: 完成行不展示下载来源（来源只在明细里）",
+                  any(m.startswith("\u2705") and "来源" not in m for m in result_lines)
+                  and any("来源：migu" in m for m in detail_lines),
+                  f"result={result_lines[-1:]!r}")
+        finally:
+            pipe.close()
+
+        # ---- ② 原生通道失败 → 其它音源强门槛重匹配成功（中间失败只进明细） ----
+        logs2: "list[tuple[str, str]]" = []
+        dead = FileSource("migu", fail_resolve=True)
+        kugou = FileSource("kugou", path=payload,
+                           results=[Track(source="kugou", title="夜曲", artist="周杰伦",
+                                          duration=0, raw={"FileHash": "H2"})])
+        pipe2 = Pipeline(settings, cache_path=tmp / "c2.json",
+                         on_log=lambda m, lv: logs2.append((m, lv)),
+                         sources=[dead, kugou])
+        try:
+            track2 = Track(source="migu", title="夜曲", artist="周杰伦",
+                           album="十一月的萧邦", duration=0, raw={"path": str(payload)})
+            res2 = pipe2.download_album_track(track2, album="十一月的萧邦")
+            check("album e2e: 原生通道失败 → 其它音源强门槛重匹配成功",
+                  res2.status == "downloaded" and res2.source == "kugou"
+                  and Path(res2.out_path).name == "周杰伦 - 夜曲.mp3",
+                  f"{res2.status} {res2.source} {res2.message}")
+            lines2 = [m for m, lv in logs2 if lv == "result"]
+            detail2 = [m for m, lv in logs2 if lv != "result"]
+            check("album e2e: 中间失败只进明细，结果级不提前宣告某来源不可用",
+                  not any("无免费直链" in m for m in lines2)
+                  and any("无免费直链" in m for m in detail2),
+                  " | ".join(lines2[-2:]))
+        finally:
+            pipe2.close()
+
+        # ---- ③ 全部通道失败 → 诚实提示并建议自行获取 ----
+        pipe3 = Pipeline(settings, cache_path=tmp / "c3.json",
+                         sources=[FileSource("migu", fail_resolve=True),
+                                  FileSource("kugou")])
+        try:
+            track3 = Track(source="migu", title="珊瑚海", artist="周杰伦",
+                           album="十一月的萧邦", duration=0, raw={"path": str(payload)})
+            raised = ""
+            try:
+                pipe3.download_album_track(track3, album="十一月的萧邦")
+            except MusicDecryptorError as exc:
+                raised = exc.message
+            check("album e2e: 全部通道失败 → 诚实提示并建议自行获取",
+                  "所有来源均无法获取" in raised and "建议自行获取" in raised, raised)
+        finally:
+            pipe3.close()
+
+
 def test_search_output_dir() -> None:
     """以名找歌的输出目录：专用 → 主 → 默认（按需按优），且与解密模式互不影响。"""
     print("\n[search output dir: 按需按优]")
@@ -3668,6 +4045,8 @@ def main() -> int:
     test_fuzzy_input()
     test_fuzzy_e2e()
     test_fast_mode_e2e()
+    test_album_search()
+    test_album_download_e2e()
     test_search_output_dir()
     test_settings_roundtrip()
     test_portable_config_dir()

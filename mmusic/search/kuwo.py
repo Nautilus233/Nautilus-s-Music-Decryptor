@@ -39,13 +39,14 @@ def _unescape(value: str) -> str:
     return _UNESC.sub(lambda m: chr(int(m.group(1), 16)), value)
 
 
-def _split_items(text: str) -> list[str]:
-    """Return the top-level ``{...}`` objects of the ``abslist`` array.
+def _split_items(text: str, key: str = "abslist") -> list[str]:
+    """Return the top-level ``{...}`` objects of a pseudo-JSON array.
 
-    Kuwo items contain *nested* objects, so a naive ``\\{[^{}]*\\}`` grabs the
-    wrong level; walk the text with a depth counter instead, skipping
-    anything inside single-quoted strings."""
-    start = text.find("abslist")
+    ``key`` 默认 ``abslist``（歌曲搜索）；专辑检索复用同一套解析（``albumlist`` /
+    ``musiclist``），保证酷我的“伪 JSON”只有一处解析实现。
+    """
+    # 原注释保留在下（行为完全一致）
+    start = text.find(key)
     if start < 0:
         return []
     i = text.find("[", start)

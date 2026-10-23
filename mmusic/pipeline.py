@@ -810,7 +810,8 @@ class Pipeline:
                                     consensus=consensus)
 
     def download_chosen(self, track: Track, *, reference: "float | None" = None,
-                        label: str = "", note: str = "") -> JobResult:
+                        label: str = "", note: str = "", cover: bytes = b"",
+                        track_no: int = 0, quiet_source: bool = False) -> JobResult:
         """下载**用户点名的那一条**：不再检索、不再重新比对跨平台时长。
 
         为什么这样设计（2026-10-21 用户反馈）：候选列表已经过全部硬门槛，用户点
@@ -853,7 +854,147 @@ class Pipeline:
                                       detail=f"{track.source} “{track.title}”")
         if got_secs:
             track.actual_duration = track.actual_duration or got_secs
-        return self._write_downloaded(None, track, data, v, "", note=note, label=display)
+        return self._write_downloaded(None, track, data, v, "", note=note, label=display,
+                                      cover=cover, track_no=track_no,
+                                      quiet_source=quiet_source)
+
+    #: 「专辑批量下载」重匹配纪律（用户 2026-10-23：稳定与速度优先）——
+    #: 原生通道失败后只试这些通道（本地/补链最先，然后四个平台源）；
+    #: CC/PD 库不参与（专辑场景命中率极低，失败路径不为它拖时间）。
+    _ALBUM_REMATCH_SOURCES = ("local", "manual", "migu", "kugou", "kuwo", "aggregator")
+    #: 重匹配最多真正尝试下载的候选数（原生通道之外）
+    _ALBUM_REMATCH_ATTEMPTS = 2
+
+    def download_album_track(self, track: Track, *, album: str = "", cover: bytes = b"",
+                             track_no: int = 0, reference: "float | None" = None) -> JobResult:
+        """专辑批量下载的单曲入口：原生通道 → 其它音源重匹配，**仅当全部失败才报错**。
+
+        曲目/歌手/时长来自已选专辑的曲目表（用户已点名整张），所以不重新检索原生
+        来源，而是先按原生通道下载；失败后在其它音源做一次**强门槛重匹配**
+        （歌名+歌手硬门槛一个不放松），逐候选尝试（数量封顶）。
+        中间失败只写**明细**日志（避免提前宣告某来源不可用）；全部失败时抛出
+        「所有来源均无法获取，建议自行获取」，由界面统一提示。
+        """
+        if album:
+            track.album = album
+        label = f"{track.artist} - {track.title}".strip(" -")
+        ref = reference if reference is not None else (float(track.duration) if track.duration else None)
+        problems: "list[str]" = []
+        try:
+            return self.download_chosen(track, reference=ref, cover=cover, track_no=track_no,
+                                        quiet_source=True)
+        except CancelledError:
+            raise
+        except MusicDecryptorError as exc:
+            problems.append(f"{track.source}: {exc.message}")
+            self._log(f"  · 原通道未取到「{track.title}」：{exc.message}", level="detail")
+        except Exception as exc:  # noqa: BLE001 - 一首失败不拖垮整批
+            problems.append(f"{track.source}: {exc}")
+            self._log(f"  · 原通道异常：{str(exc)[:120]}", level="detail")
+        tried = 0
+        for cand in self._rematch_album_track(track):
+            if tried >= self._ALBUM_REMATCH_ATTEMPTS:
+                break
+            tried += 1
+            # 元数据统一：曲名/歌手/唱片集一律以**专辑曲目表**为准（重匹配只换资源本身）
+            cand.title = track.title or cand.title
+            cand.artist = track.artist or cand.artist
+            if album:
+                cand.album = album
+            try:
+                res = self.download_chosen(cand, reference=ref, cover=cover, track_no=track_no,
+                                           label=label, quiet_source=True)
+                self._log(f"  · 已自动改用其它通道获取「{track.title}」（重匹配通过强门槛）",
+                          level="detail")
+                return res
+            except CancelledError:
+                raise
+            except MusicDecryptorError as exc:
+                problems.append(f"{cand.source}: {exc.message}")
+                self._log(f"  · 重匹配候选未通过：{exc.message}", level="detail")
+            except Exception as exc:  # noqa: BLE001
+                problems.append(f"{cand.source}: {exc}")
+                self._log(f"  · 重匹配候选异常：{str(exc)[:120]}", level="detail")
+        raise SearchNoResultError("所有来源均无法获取，建议自行获取",
+                                  detail="；".join(problems) or "无可用通道")
+
+    def _rematch_album_track(self, track: Track):
+        """为失败曲目在其它音源做一次**强门槛**重匹配（生成器；逐源 1 个最佳候选）。
+
+        门槛与单曲链路完全一致：歌名+歌手必须**同一读法**同时达标
+        （`best_reading_match`），版本过滤照常；日语输入追加一次读音变体检索
+        （仅首轮无结果时，只改"搜什么"、不改门槛写法）。
+        """
+        native = track.source
+        order = [n for n in self._ALBUM_REMATCH_SOURCES
+                 if n in self._adapters and n != native]
+        readings = [(track.title, track.artist)]
+        alt_readings: "list[tuple[str, str]]" = []
+        try:
+            for value, _reason in jp.search_variants(track.title)[:1]:
+                alt_readings.append((value, track.artist))
+            if not alt_readings:
+                for value, _reason in jp.search_variants(track.artist)[:1]:
+                    alt_readings.append((track.title, value))
+        except Exception:  # noqa: BLE001
+            alt_readings = []
+        requested = version_markers(track.title or "")
+        for name in order:
+            if self._cancel:
+                raise CancelledError("已取消")
+            adapter = self._adapters.get(name)
+            if adapter is None:
+                continue
+            query = f"{track.title} {track.artist}".strip()
+            try:
+                tracks = adapter.search(query, quality=self.settings.quality, limit=8)
+            except MusicDecryptorError as exc:
+                self._log(f"  · [{name}] 重匹配检索不可用：{exc.message}", level="detail")
+                continue
+            except Exception as exc:  # noqa: BLE001
+                self._log(f"  · [{name}] 重匹配检索异常：{str(exc)[:100]}", level="detail")
+                continue
+            best = self._pick_rematch_candidate(tracks, readings, alt_readings, requested)
+            if best is None and alt_readings:
+                alt_query = " ".join(x for x in (alt_readings[0][0], alt_readings[0][1]) if x).strip()
+                if alt_query and alt_query != query:
+                    try:
+                        tracks = adapter.search(alt_query, quality=self.settings.quality, limit=8)
+                        best = self._pick_rematch_candidate(tracks, readings, alt_readings, requested)
+                        if best is not None:
+                            self._log(f"  · [{name}] 命中于读音变体检索", level="detail")
+                    except Exception:  # noqa: BLE001
+                        pass
+            if best is not None:
+                yield best
+
+    @staticmethod
+    def _pick_rematch_candidate(tracks, readings, alt_readings, requested) -> "Track | None":
+        """重匹配候选的强门槛过滤 + 排序：取最佳（疑似短资源让位，绝不提前下载）。"""
+        pool = [t for t in (tracks or []) if (t.title or t.url)]
+        if not requested:
+            originals, _dropped = split_originals(pool)
+            pool = originals
+        kept: "list[Track]" = []
+        for cand in pool:
+            ok = best_reading_match(readings, cand,
+                                    min_title=MIN_TITLE_SIMILARITY,
+                                    min_artist=MIN_ARTIST_SIMILARITY,
+                                    strict_title=not requested)[0]
+            if not ok and alt_readings:
+                ok = best_reading_match(alt_readings, cand,
+                                        min_title=MIN_TITLE_SIMILARITY,
+                                        min_artist=MIN_ARTIST_SIMILARITY,
+                                        strict_title=not requested)[0]
+            if ok:
+                kept.append(cand)
+        if not kept:
+            return None
+        rank_tracks_multi(readings, kept, prefer_ext="")
+        try:
+            return next((t for t in kept if not t.short_asset), kept[0])
+        except Exception:  # noqa: BLE001
+            return kept[0]
 
     def acquire_many(self, items) -> "list[JobResult]":
         """批量以名找歌。``items`` 可以是 "歌名"、"歌手 - 歌名" 或 ``(歌名, 歌手)``。"""
@@ -882,9 +1023,12 @@ class Pipeline:
                 self._log("⛔ 已取消", level="result")
                 break
             except MusicDecryptorError as exc:
+                # 失败也要有可读日志（结果级）：之前的批量以名找歌是静默失败
+                self._log(f"❌ {label}：{exc.message}", level="result")
                 res = JobResult(f"{SEARCH_PREFIX}{label}", label, "failed",
                                 message=exc.message, detail=exc.detail)
             except Exception as exc:  # noqa: BLE001 - 一条失败不拖垮整批
+                self._log(f"❌ {label}：未预期的错误（{str(exc)[:120]}）", level="result")
                 res = JobResult(f"{SEARCH_PREFIX}{label}", label, "failed",
                                 message="未预期的错误", detail=str(exc))
             results.append(res)
@@ -1247,7 +1391,9 @@ class Pipeline:
             "候选音源均不可用（无版权/校验失败/反爬），请更换关键词或手动补全直链",
             detail=note)
     def _write_downloaded(self, src: "Path | None", track: Track, data: bytes, v,
-                          digest: str, *, note: str = "", label: str = "") -> JobResult:
+                          digest: str, *, note: str = "", label: str = "",
+                          cover: bytes = b"", track_no: int = 0,
+                          quiet_source: bool = False) -> JobResult:
         """落盘。``src=None`` 即「以名找歌」：没有源文件可依附，也不删任何东西。"""
         display = label or (src.name if src is not None else "")
         data, out_ext, fmt_note = self._final_format(data, v.ext, display)
@@ -1258,17 +1404,17 @@ class Pipeline:
         out_path = self._unique(out_dir, base, out_ext)
         _atomic_write(out_path, data)
 
-        cover = b""
-        if self.settings.fetch_cover:
+        cover_bytes = cover
+        if not cover_bytes and self.settings.fetch_cover:
             pic_id = track.raw.get("pic_id")
             agg = self._aggregator()
             if pic_id and agg is not None and hasattr(agg, "fetch_pic"):
                 pic_url = agg.fetch_pic(str(pic_id))
                 if pic_url:
-                    cover = self._fetch_cover(pic_url)
+                    cover_bytes = self._fetch_cover(pic_url)
         if self.settings.write_metadata:
             write_tags(out_path, title=track.title, artist=track.artist,
-                       album=track.album, cover=cover)
+                       album=track.album, cover=cover_bytes, track_no=track_no)
 
         if digest and self.settings.remember_hashes:
             self.cache.add(digest, out_path=str(out_path), mode="fallback", fmt=out_ext, source=track.source)
@@ -1281,8 +1427,11 @@ class Pipeline:
         br = f"，{v.bitrate}kbps" if (v.bitrate and out_ext == v.ext) else ""
         dur = f"，时长 {format_seconds(track.actual_duration)}" if track.actual_duration else ""
         tag = "备用下载" if src is not None else "以名找歌"
-        self._log(f"✅ {tag}完成：{display} → {out_path.name}  [{out_ext.upper()}{br}{dur}] "
-                  f"来源：{track.source}" + (f"  ⚠ {note}" if note else ""), level="result")
+        self._log(f"✅ {tag}完成：{display} → {out_path.name}  [{out_ext.upper()}{br}{dur}]"
+                  + ("" if quiet_source else f" 来源：{track.source}")
+                  + (f"  ⚠ {note}" if note else ""), level="result")
+        if quiet_source:
+            self._log(f"  · 来源：{track.source}", level="detail")
         return JobResult(str(src) if src is not None else f"{SEARCH_PREFIX}{display}",
                          display, "downloaded", mode="fallback", out_path=str(out_path),
                          fmt=out_ext, bitrate=v.bitrate, source=track.source,
@@ -1562,7 +1711,12 @@ class Pipeline:
     def _fetch_cover(self, url: str) -> bytes:
         try:
             data = self.http.get_bytes(url)
-            return data if data[:2] in (b"\xff\xd8",) or data[:8] == b"\x89PNG\r\n\x1a\n" else b""
+            if data[:2] == b"\xff\xd8" or data[:8] == b"\x89PNG\r\n\x1a\n":
+                return data
+            # 咪咕封面是 webp（ID3/FLAC 都允许带 mime）；无法识别的字节一律放弃
+            if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+                return data
+            return b""
         except MusicDecryptorError:
             return b""
 

@@ -57,6 +57,9 @@ python tests/selftest.py                # 功能与容器往返（离线用例�
 python tests/test_gui.py                # 界面冒烟
 python tests/test_ui_fit.py             # 真实屏幕自适应（主窗口 + 设置弹窗）
 python tests/test_robustness.py         # 边界 / 负面 / fuzz / 故障注入 / 内存
+python tests/test_album_matrix.py       # 专辑权威性矩阵（并集不丢曲目/版本聚类/去重/日语书写形）
+# 按需（联网）：python tests/test_album_matrix.py --wide   # 多语种地毯式真源矩阵（23 张）
+# 按需（联网）：python tools/album_sweep.py                # 逐张真源扫射（重构前后对照）
 python tests/test_monkey_ui.py          # 猴子测试：随机乱点全部控件
 dist\MusicDecryptor.exe --check-qt      # 冻结后 Qt 可加载（无对话框）
 dist\MusicDecryptor.exe --check-ui      # 冻结后界面/弹窗不越界
@@ -72,6 +75,9 @@ dist\MusicDecryptor.exe --sources-report # 音源清单与台账健康（信息�
 
 后三条是 2026-10-20 补上的，**各自都抓到过真实缺陷**，不是凑数：
 
+- `test_album_matrix.py` → 抓到**参考歌单取"同歌手曲目最多者"、把 11 首的《乐行者》撑成 32 首**，
+  以及**罗马音只给读音形、原专辑检索不到**（用户 2026-10-23 实测的两个底线级缺陷）；
+  离线矩阵 + `--wide` 真源矩阵（不重复 / 不越界 / 曲目数核验）。
 - `test_robustness.py` → 抓到 NCM/KWM **静默产出打不开的文件**、台账 `_connect()` 异常分支的
   **文件句柄泄漏**、以及手改坏的 `settings.json` 会把界面炸在远处；
 - `test_monkey_ui.py` + `--check-worker` → 抓到 **QThread 生命周期导致的退出崩溃**

@@ -9,12 +9,16 @@ from __future__ import annotations
 import tempfile
 from pathlib import Path
 
-from PySide6.QtCore import QPoint
+from PySide6.QtCore import QPoint, Qt
 from PySide6.QtWidgets import QDialogButtonBox, QScrollArea
 
 from mmusic.config import AppConfig
 
 from .main_window import MainWindow
+from .album_search_dialog import MIN_SIZE as AS_MIN, AlbumSearchDialog
+from .album_search_dialog import ALBUM_COLUMNS as AS_COLS
+from .album_search_dialog import TRACK_COLUMNS as AS_TCOLS
+from .album_search_dialog import clean_album_query
 from .name_search_dialog import MIN_SIZE as NS_MIN, NameSearchDialog
 from .name_search_dialog import parse_lines as ns_parse_lines
 from .settings_dialog import MIN_SIZE, SettingsDialog
@@ -214,6 +218,65 @@ def run(app, *, verbose: bool = True) -> int:
         check("dialog(以名找歌): 最小尺寸下底部按钮仍可见",
               ns.btn_start.mapTo(ns, QPoint(0, 0)).y() + ns.btn_start.height() <= ns.height())
         ns.close()
+
+        # ---------------- album-search dialog ------------------------- #
+        al = AlbumSearchDialog(cfg.settings, cfg, parent=win)
+        al.show()
+        for _ in range(3):
+            app.processEvents()
+        aframe = al.frameGeometry()
+        if verbose:
+            print(f"[album-search dialog] frame {aframe.width()}x{aframe.height()} "
+                  f"@({aframe.x()},{aframe.y()}) | minimum client {AS_MIN[0]}x{AS_MIN[1]}")
+        check("dialog(按专辑找歌): frame inside the work area",
+              avail.contains(aframe), f"{aframe} not in {avail}")
+        abox = al.findChild(QDialogButtonBox)
+        ab = abox.mapTo(al, QPoint(0, 0)).y() + abox.height()
+        check("dialog(按专辑找歌): 关闭按钮不被截断",
+              abox is not None and abox.isVisible() and ab <= al.height(),
+              f"footer ends at y={ab}, client height={al.height()}")
+        check("dialog(按专辑找歌): 专辑与曲目两张表格可见且有可用高度",
+              al.album_table.isVisible() and al.album_table.height() >= 60
+              and al.track_table.isVisible() and al.track_table.height() >= 60,
+              f"album={al.album_table.height()} track={al.track_table.height()}")
+        check("dialog(按专辑找歌): 未取到曲目前下载按钮不可用（不会误发请求）",
+              not al.btn_dl.isEnabled() and not al.btn_dl_all.isEnabled()
+              and not al.btn_fetch.isEnabled())
+        check("dialog(按专辑找歌): 专辑名清洗会去掉序号/说明前缀",
+              clean_album_query("1. 十一月的萧邦") == "十一月的萧邦"
+              and clean_album_query("专辑：Lemon") == "Lemon"
+              and clean_album_query("  ") == "",
+              f"{clean_album_query('1. 十一月的萧邦')!r} / {clean_album_query('专辑：Lemon')!r}")
+        check("dialog(按专辑找歌): 合并视图不展示来源（两张表都没有「来源」列）",
+              "来源" not in AS_COLS and "来源" not in AS_TCOLS,
+              f"{AS_COLS} / {AS_TCOLS}")
+        # 合并视图渲染（喂合成数据，不联网）：专辑行/曲目行的列映射必须正确
+        from mmusic.model import Track as _Track
+        from mmusic.search.album import AlbumGroup as _Group, AlbumHit as _Hit
+        _g = _Group(name="十一月的萧邦", artist="周杰伦", track_count=12, year="2005",
+                    variants=[_Hit(source="migu", album_id="1", name="十一月的萧邦",
+                                   artist="周杰伦", track_count=12)])
+        al._on_albums("十一月的萧邦", [_g])
+        app.processEvents()
+        _cells = [al.album_table.item(0, c).text() for c in range(len(AS_COLS))]
+        check("dialog(按专辑找歌): 合并视图渲染专辑行（专辑/歌手/曲目数/年份）",
+              _cells[:4] == ["十一月的萧邦", "周杰伦", "12", "2005"], str(_cells))
+        al._current_album, al._current_album_row = _g, 0
+        al._on_tracklist([_Track(source="migu", title="夜曲", artist="周杰伦",
+                                 album="十一月的萧邦", duration=226)])
+        app.processEvents()
+        check("dialog(按专辑找歌): 曲目行渲染（默认勾选、时长格式化、标题带 ✓）",
+              al.track_table.rowCount() == 1
+              and al.track_table.item(0, 0).checkState() == Qt.CheckState.Checked
+              and al.track_table.item(0, 3).text() == "3:46"
+              and al.album_table.item(0, 0).text().endswith("✓"),
+              f"{al.track_table.item(0, 3).text()!r} / {al.album_table.item(0, 0).text()!r}")
+        al.resize(*AS_MIN)
+        for _ in range(3):
+            app.processEvents()
+        check("dialog(按专辑找歌): 最小尺寸下底部按钮仍可见",
+              al.btn_search.mapTo(al, QPoint(0, 0)).y() + al.btn_search.height() <= al.height())
+        al.close()
 
         dlg.close()
         win.close()

@@ -1,0 +1,32 @@
+[
+  {
+    "id": "Q65235123",
+    "aliases": ["所以我放弃了音乐", "所以我放棄了音樂"],
+    "titles": ["だから僕は音楽を辞めた", "That's Why I Gave Up on Music"],
+    "artists": ["ヨルシカ", "Yorushika"]
+  },
+  {
+    "id": "Q61275569",
+    "aliases": ["瞬间的第六感", "瞬間的第六感"],
+    "titles": ["瞬間的シックスセンス", "Momentary Sixth Sense"],
+    "artists": ["あいみょん", "Aimyon", "爱缪", "愛繆"]
+  },
+  {
+    "id": "Q44320",
+    "aliases": ["颤栗", "顫慄"],
+    "titles": ["Thriller"],
+    "artists": ["Michael Jackson", "迈克尔·杰克逊", "麥可·傑克森"]
+  },
+  {
+    "id": "Q173643",
+    "aliases": ["艾比路", "阿比路"],
+    "titles": ["Abbey Road"],
+    "artists": ["The Beatles", "披头士", "披头士乐队", "披頭四樂隊"]
+  },
+  {
+    "id": "Q23927056",
+    "aliases": ["花样年华 Young Forever", "花樣年華 Young Forever"],
+    "titles": ["화양연화 Young Forever", "The Most Beautiful Moment In Life: Young Forever"],
+    "artists": ["BTS", "방탄소년단", "防弹少年团", "防彈少年團"]
+  }
+]

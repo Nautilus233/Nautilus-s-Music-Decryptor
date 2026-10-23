@@ -12,7 +12,7 @@ from pathlib import Path
 try:
     from mutagen import File as MutagenFile
     from mutagen.flac import FLAC, Picture
-    from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TALB, TIT2, TPE1
+    from mutagen.id3 import APIC, ID3, ID3NoHeaderError, TALB, TIT2, TPE1, TRCK
     from mutagen.mp4 import MP4, MP4Cover
     from mutagen.oggvorbis import OggVorbis
     HAVE_MUTAGEN = True
@@ -40,7 +40,7 @@ def _split_artists(artist: str) -> list[str]:
 
 
 def write_tags(path: "str | Path", *, title: str = "", artist: str = "",
-               album: str = "", cover: bytes = b"") -> bool:
+               album: str = "", cover: bytes = b"", track_no: int = 0) -> bool:
     if not HAVE_MUTAGEN:
         return False
     p = str(path)
@@ -57,6 +57,8 @@ def write_tags(path: "str | Path", *, title: str = "", artist: str = "",
                 tags.add(TPE1(encoding=3, text=_split_artists(artist)))
             if album:
                 tags.add(TALB(encoding=3, text=album))
+            if track_no > 0:
+                tags.add(TRCK(encoding=3, text=str(track_no)))
             if cover:
                 tags.add(APIC(encoding=0, mime=guess_image_mime(cover), type=3, desc="Cover", data=cover))
             tags.save(p)
@@ -68,6 +70,8 @@ def write_tags(path: "str | Path", *, title: str = "", artist: str = "",
                 audio["artist"] = _split_artists(artist)
             if album:
                 audio["album"] = [album]
+            if track_no > 0:
+                audio["tracknumber"] = [str(track_no)]
             if cover:
                 pic = Picture()
                 pic.type = 3
@@ -84,6 +88,8 @@ def write_tags(path: "str | Path", *, title: str = "", artist: str = "",
                 audio["artist"] = _split_artists(artist)
             if album:
                 audio["album"] = [album]
+            if track_no > 0:
+                audio["tracknumber"] = [str(track_no)]
             audio.save()
         elif ext in ("m4a", "mp4", "mmp4"):
             audio = MP4(p)
@@ -93,6 +99,8 @@ def write_tags(path: "str | Path", *, title: str = "", artist: str = "",
                 audio["\xa9ART"] = _split_artists(artist)
             if album:
                 audio["\xa9alb"] = [album]
+            if track_no > 0:
+                audio["trkn"] = [(int(track_no), 0)]
             if cover:
                 fmt = MP4Cover.FORMAT_PNG if guess_image_mime(cover) == "image/png" else MP4Cover.FORMAT_JPEG
                 audio["covr"] = [MP4Cover(cover, imageformat=fmt)]

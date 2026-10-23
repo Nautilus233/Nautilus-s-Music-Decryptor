@@ -122,6 +122,10 @@ class MainWindow(QMainWindow):
         self.btn_name_search.setToolTip(
             "不需要加密文件：直接按歌名搜索备用音源并下载（与解密后的备用链路同一套选源逻辑）")
         out_row.addWidget(self.btn_name_search)
+        self.btn_album_search = QPushButton("按专辑找歌…")
+        self.btn_album_search.setToolTip(
+            "按专辑检索（可加歌手限定）：取曲目清单后，勾选下载或一键下载整张")
+        out_row.addWidget(self.btn_album_search)
         self.btn_manual = QPushButton("手动补链…")
         self.btn_manual.setToolTip("所有音源都找不到时，粘贴直链或本地路径，优先使用")
         out_row.addWidget(self.btn_manual)
@@ -200,6 +204,7 @@ class MainWindow(QMainWindow):
         self.btn_settings.clicked.connect(self._open_settings)
         self.btn_manual.clicked.connect(self._open_manual_links)
         self.btn_name_search.clicked.connect(self._open_name_search)
+        self.btn_album_search.clicked.connect(self._open_album_search)
         self.btn_start.clicked.connect(self.start_job)
         self.btn_open_out.clicked.connect(self._open_out_dir)
         self.btn_stop.clicked.connect(self.stop_job)
@@ -381,6 +386,16 @@ class MainWindow(QMainWindow):
                                on_sync=self._sync_settings_from_ui, parent=self)
         dlg.exec()
         # 对话框里可能改过输出目录（或写进了产物）：回到主界面时刷新一下
+        self._load_settings_into_ui()
+
+    def _open_album_search(self) -> None:
+        """「按专辑找歌」：按专辑检索 → 取曲目清单 → 下载一首/多首/整张。"""
+        from .album_search_dialog import AlbumSearchDialog
+
+        self._sync_settings_from_ui()          # 音质 / 输出目录以主界面当前值为准
+        dlg = AlbumSearchDialog(self.settings, self.config,
+                                on_sync=self._sync_settings_from_ui, parent=self)
+        dlg.exec()
         self._load_settings_into_ui()
 
     # ------------------------------------------------------------------ #

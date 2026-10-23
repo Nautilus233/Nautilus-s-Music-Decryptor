@@ -42,6 +42,7 @@ from mmusic.config import AppConfig, Settings  # noqa: E402
 from mmusic.errors import MusicDecryptorError, NetworkError  # noqa: E402
 from mmusic.pipeline import Pipeline  # noqa: E402
 from ui.main_window import MainWindow  # noqa: E402
+from ui.album_search_dialog import AlbumSearchDialog, clean_album_query  # noqa: E402
 from ui.manual_links_dialog import ManualLinksDialog, split_entries  # noqa: E402
 from ui.name_search_dialog import NameSearchDialog, parse_lines  # noqa: E402
 from ui.settings_dialog import SettingsDialog  # noqa: E402
@@ -135,7 +136,7 @@ def _random_action(win: MainWindow, rnd: random.Random, fixtures: "list[Path]",
     """随机对一个真实控件做一次动作；返回动作描述（用于报错定位）。"""
     choices = ["btn_add_files", "btn_add_dir", "btn_remove", "btn_clear",
                "btn_out_dir", "btn_open_out", "btn_settings", "btn_manual",
-               "btn_name_search",
+               "btn_name_search", "btn_album_search",
                "btn_start", "btn_stop", "quality", "out_dir", "chk_detail",
                "table", "add_paths", "drop", "drag_enter"]
     if _NO_DRAG:                    # 排查用：连"动作名"一起剔除，否则会落到 click() 分支
@@ -340,7 +341,29 @@ def phase_dialogs(cfg: AppConfig, win: MainWindow, app: QApplication,
         except Exception as exc:  # noqa: BLE001
             errors.append(f"以名找歌: {type(exc).__name__}: {str(exc)[:50]}")
         ns.deleteLater()
-    check("monkey: 设置/补链/以名找歌对话框乱点无异常", not errors, "; ".join(errors[:3]))
+
+        # 按专辑找歌对话框：乱贴文本 / 安全按钮乱点 —— 不得抛异常、不得联网检索。
+        # 只点"安全"按钮：输出目录、全选/全不选、未取到曲目时的下载/获取按钮（应只是提示）。
+        al = AlbumSearchDialog(cfg.settings, cfg, parent=win)
+        try:
+            al.name.setText(rnd.choice(_NASTY_TEXT))
+            al.artist.setText(rnd.choice(_NASTY_TEXT))
+            al.chk_detail.setChecked(not al.chk_detail.isChecked())
+            if not isinstance(clean_album_query(al.name.text()), str):
+                bad_values.append("按专辑找歌 clean_album_query 类型异常")
+            al.btn_out_dir.click()
+            al.btn_follow_main.click()
+            al.btn_all.click()
+            al.btn_none.click()
+            al.btn_fetch.click()      # 未选专辑 → 仅状态提示
+            al.btn_dl.click()         # 未取到曲目 → 仅状态提示
+            al.btn_dl_all.click()
+            al._refresh_out_hint()
+            al.close()
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"按专辑找歌: {type(exc).__name__}: {str(exc)[:50]}")
+        al.deleteLater()
+    check("monkey: 设置/补链/以名找歌/按专辑找歌对话框乱点无异常", not errors, "; ".join(errors[:3]))
     check("monkey: 乱点后设置仍是合法值", not bad_values, "; ".join(bad_values[:3]))
 
     # 设置必须能存盘并读回（乱点后重启不能丢/不能崩）

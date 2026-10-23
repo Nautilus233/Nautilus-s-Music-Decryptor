@@ -21,7 +21,7 @@ from .paths import resource_path
 __all__ = [
     "has_kana", "has_kanji", "hiraganize", "katakanaize",
     "romaji_to_kana", "kana_to_romaji", "looks_japanese",
-    "match_forms", "reading_combos", "search_variants",
+    "match_forms", "reading_combos", "search_variants", "known_titles",
     "artist_katakana", "lookup_known", "known_kind",
 ]
 
@@ -281,22 +281,13 @@ def _artists() -> "dict[str, str]":
     return _parse_named("jp_artists.tsv")
 
 
-@functools.lru_cache(maxsize=1)
-def _reverse() -> "tuple[dict[str, str], dict[str, str]]":
-    """读音罗马音 → 读音（含空格折叠键与词序无关键），用于把罗马音输入翻回假名。"""
-    plain: "dict[str, str]" = {}
-    sorted_keys: "dict[str, str]" = {}
-    for mapping in (_songs(), _artists()):
-        for reading in mapping.values():
-            romaji = kana_to_romaji(reading)
-            if not romaji:
-                continue
-            c = _collapse(romaji)
-            plain.setdefault(c.replace(" ", ""), reading)
-            sorted_keys.setdefault(" ".join(sorted(c.split())), reading)
-    return plain, sorted_keys
-
-
+# --------------------------------------------------------------------------- #
+# 查表索引：键 → (规范假名读音, 书写形)
+# 键含两族并加前缀区分：k:=假名键（去空白，含 wa/ha 助词变体）；r:=罗马音折叠键。
+# 2026-10-23 用户实测修复：`dakarabokuha ongakuwo yameta`（不空格）与
+# `dakara boku ha ongaku wo yameta`（按词空格）必须**同样命中**；旧实现用
+# "按空白分词后整词 wo→o" 的折叠，导致两种写法的键不一致 —— 一个命中、一个落空。
+# --------------------------------------------------------------------------- #
 def _key(text: str) -> str:
     t = unicodedata.normalize("NFKC", text or "").casefold()
     return re.sub(r"\s+", " ", t).strip()
@@ -324,22 +315,96 @@ def looks_japanese(text: str) -> bool:
     return _ascii_convertible(t)
 
 
-def lookup_known(text: str) -> "str | None":
-    """罗马音/假名输入 → 内置表（歌曲/歌手）里的规范假名读音；查不到返回 None。"""
+def _kana_bare(text: str) -> str:
+    t = hiraganize(unicodedata.normalize("NFKC", text or ""))
+    return t.replace(" ", "").replace("\u3000", "")
+
+
+@functools.lru_cache(maxsize=1)
+def _known_index() -> "dict[str, tuple[str, str]]":
+    idx: "dict[str, tuple[str, str]]" = {}
+    for name in ("jp_songs.tsv", "jp_artists.tsv"):
+        for parts in _read_rows(name):
+            if len(parts) < 2:
+                continue
+            written, reading = parts[0].strip(), parts[1].strip()
+            if not written or not reading:
+                continue
+            entry = (reading, written)
+            keys: "list[str]" = []
+            bare = _kana_bare(reading)
+            if bare:
+                keys.append("k:" + bare)
+            romaji = kana_to_romaji(reading)
+            if romaji:
+                c = _collapse(romaji)
+                keys.append("r:" + c.replace(" ", ""))
+                keys.append("r:" + " ".join(sorted(c.split())))
+            for key in keys:
+                idx.setdefault(key, entry)
+    return idx
+
+
+def _known_keys(text: str) -> "list[str]":
+    """输入 → 查表键候选（假名键 + 罗马音折叠键；含 Hepburn 里 wa/ha 助词拼法变体）。"""
     t = _key(text)
     if not t:
-        return None
+        return []
+    keys: "list[str]" = []
+
+    def push(key: str) -> None:
+        if key and key not in keys:
+            keys.append(key)
+
+    kana: "str | None" = None
     if has_kana(t):
+        kana = t
+    elif _ascii_convertible(t):
+        kana = romaji_to_kana(t)
+    if kana:
+        bare = _kana_bare(kana)
+        if bare:
+            push("k:" + bare)
+            # Hepburn 里常把助词は写成 wa：等价键再补一条（只用于查表，不做其它推断）
+            if "\u308f" in bare:
+                push("k:" + bare.replace("\u308f", "\u306f"))
+        romaji = kana_to_romaji(kana)
+        if romaji:
+            c = _collapse(romaji)
+            push("r:" + c.replace(" ", ""))
+            push("r:" + " ".join(sorted(c.split())))
+    return keys
+
+
+def lookup_known(text: str) -> "str | None":
+    """罗马音输入 → 内置表（歌曲/歌手）里的规范**假名读音**；查不到返回 None。"""
+    t = _key(text)
+    if not t or has_kana(t) or not _ascii_convertible(t):
         return None
-    if not _ascii_convertible(t):
-        return None
-    kana = romaji_to_kana(t)
-    romaji = kana_to_romaji(kana) if kana else None
-    if not romaji:
-        return None
-    plain, sorted_keys = _reverse()
-    c = _collapse(romaji)
-    return plain.get(c.replace(" ", "")) or sorted_keys.get(" ".join(sorted(c.split())))
+    idx = _known_index()
+    for key in _known_keys(text):
+        entry = idx.get(key)
+        if entry:
+            return entry[0]
+    return None
+
+
+def known_titles(text: str) -> "list[str]":
+    """罗马音/假名输入 → 内置表里的**书写形**（原名）。
+
+    为什么需要（2026-10-23 用户实测）：四平台的专辑检索都按**书写形**索引，读音形
+    （片假名/平假名读音）检索不到 —— 用"读音"去搜只会拿到钢琴版/翻奏。表里有书写形时
+    直接搜原名才对：
+        `dakarabokuha ongakuwo yameta` → `[だから僕は音楽を辞めた]`
+        `ただきみにはれ`（平假名读音）→ `[ただ君に晴れ]`
+    """
+    idx = _known_index()
+    out: "list[str]" = []
+    for key in _known_keys(text):
+        entry = idx.get(key)
+        if entry and entry[1] not in out:
+            out.append(entry[1])
+    return out
 
 
 def known_kind(text: str) -> "str | None":
@@ -489,9 +554,10 @@ def _match_forms_cached(t: str) -> "tuple[str, ...]":
 def search_variants(text: str) -> "list[tuple[str, str]]":
     """为检索生成「同一首歌的另一种文字形态」，按价值排序（不含原样）。
 
-    * 含假名/汉字混合 → 整条读音的**片假名**形（酷狗等对有读音索引）；
-    * 纯假名 → 片假名形 + 罗马音；
-    * 纯罗马音 → 内置表反查（知名曲/歌手）优先的片假名形；
+    * 含假名/汉字混合 → 整条读音的**片假名**形；
+    * 纯假名 → 内置表的**书写形**（如 `ただきみにはれ`→`ただ君に晴れ`）＋片假名形＋罗马音；
+    * 纯罗马音 → 内置表的**书写形**优先（`dakarabokuha ongakuwo yameta`→`だから僕は音楽を辞めた`），
+      表外才退回片假名读音形；
     * 纯汉字 → 不生成（可能是中文，不做迷信转换）。
     """
     t = _key(text)
@@ -511,10 +577,16 @@ def search_variants(text: str) -> "list[tuple[str, str]]":
             if combos:
                 add(katakanaize("".join(combos[0])), "日文片假名读音")
         else:
+            # 纯假名：若这是内置表里的**读音**，先给"书写形"（汉字原名可直接检索）
+            for title in known_titles(t):
+                add(title, "表内原名")
             h = hiraganize(t)
             add(katakanaize(h), "片假名形")
             add(kana_to_romaji(h), "罗马音")
     elif not has_kanji(t) and _ascii_convertible(t):
+        # 罗马音：内置表里的**书写形**优先（读音形平台检索不到，2026-10-23 实测修复）
+        for title in known_titles(t):
+            add(title, "表内原名")
         known = lookup_known(t)
         kana = known if known else romaji_to_kana(t)
         add(katakanaize(kana or ""), "日文片假名读音")
