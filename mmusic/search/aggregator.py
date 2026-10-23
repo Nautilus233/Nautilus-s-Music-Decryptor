@@ -63,7 +63,7 @@ class AggregatorSource(SearchSource):
         ident = str(track.raw.get("id", ""))
         if not ident:
             raise NetworkError("聚合条目缺少 id")
-        for br in (BR_CHAIN_LOSSLESS if quality == "flac" else BR_CHAIN_LOSSY):
+        for br in (BR_CHAIN_LOSSLESS if quality in ("flac", "wav") else BR_CHAIN_LOSSY):
             url = (f"{self.base}?types=url&source={urllib.parse.quote(self.provider)}"
                    f"&id={urllib.parse.quote(ident)}&br={br}")
             try:

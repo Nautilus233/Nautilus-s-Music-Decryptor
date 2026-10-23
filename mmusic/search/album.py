@@ -35,7 +35,8 @@ from ..errors import NetworkError
 from ..match import ARTIST_UNKNOWN, cross_similarity, similarity
 from ..model import Track
 from .aggregator import DEFAULT_BASE
-from .album_alias import local_album_alias, resolve_album_alias
+from .album_alias import alias_artist_matches, local_album_alias, resolve_album_alias
+from .album_text import alternate as alternate_hanzi, folded as folded_hanzi
 from .kuwo import _FIELD, _best_bitrate, _split_items, _unescape
 
 __all__ = ["AlbumHit", "AlbumGroup", "search_albums", "group_albums",
@@ -122,14 +123,54 @@ def _clean(text: str) -> str:
 def _sim(a: str, b: str) -> float:
     """字段相似度（日语形态增强）：与单曲链路的 cross_similarity 同一套。"""
     try:
-        return cross_similarity(a or "", b or "")
+        return max(cross_similarity(a or "", b or ""),
+                   similarity(folded_hanzi(a), folded_hanzi(b)))
     except Exception:  # noqa: BLE001 - 比对绝不能炸
         return similarity(a or "", b or "")
 
 
 def _norm_key(text: str) -> str:
-    t = unicodedata.normalize("NFKC", _clean(text)).casefold()
+    t = unicodedata.normalize("NFKC", folded_hanzi(_clean(text))).casefold()
     return re.sub(r"\s+", " ", t).strip()
+
+
+def _title_prefix(query: str, title: str) -> bool:
+    q, name = _norm_key(query), _norm_key(title)
+    minimum = 2 if re.search(r"[\u3400-\u9fff]", q) else 4
+    return len(q) >= minimum and name != q and name.startswith(q)
+
+
+_EDITION_MARK = re.compile(
+    r"\b(deluxe|expanded|anniversary|bonus|special|piano|instrumental|live|cover)\b"
+    r"|豪華|豪华|加長|加长|紀念|纪念|現場|现场|鋼琴|钢琴|伴奏", re.I)
+
+
+def _edition(name: str) -> tuple[str, ...]:
+    markers = {m.group().casefold() for m in _EDITION_MARK.finditer(name or "")}
+    if re.search(r"taylor[’']s\s+version", name or "", re.I):
+        markers.add("taylor's version")
+    return tuple(sorted(markers))
+
+
+def _alias_matches(hit: AlbumHit, alias, query: str = "") -> bool:
+    """An album entity alias cannot certify a deluxe/live/cover edition."""
+    if _edition(hit.name) or not alias_artist_matches(hit.artist, alias.artists):
+        return False
+    for value in (hit.name, hit.alias):
+        if not value or _edition(value):
+            continue
+        names = [value]
+        core = value
+        for _ in range(4):
+            next_core = _TRACK_BRACKETS.sub(" ", core).strip()
+            if next_core == core:
+                break
+            core = next_core
+        names.append(core)
+        if any(_norm_key(n) == _norm_key(t) for n in names
+               for t in (*alias.titles, "" if alias.prefix else query) if t):
+            return True
+    return False
 
 
 def _query_texts(query: str, limit: int = 2) -> "list[str]":
@@ -402,10 +443,15 @@ def _name_rank(name: str) -> "tuple[int, int]":
 def _source_best(hits) -> "dict[str, AlbumHit]":
     """每个来源只留一个最佳实体：名字更干净优先，同级比曲目数（歌级 1 首条目被压掉）。"""
     best: "dict[str, AlbumHit]" = {}
+    def rank(h: AlbumHit):
+        if (h.raw or {}).get("_verified_alias_id"):
+            # These spellings identify the same album, not different editions.
+            # Title length cannot make a 1-track translated entry beat 14 tracks.
+            return (0, -(h.track_count or 0), _name_rank(h.name))
+        return (1, _name_rank(h.name), -(h.track_count or 0))
     for h in hits:
         cur = best.get(h.source)
-        if cur is None or (_name_rank(h.name), -(h.track_count or 0)) < \
-                (_name_rank(cur.name), -(cur.track_count or 0)):
+        if cur is None or rank(h) < rank(cur):
             best[h.source] = h
     return best
 
@@ -552,7 +598,16 @@ def _dominant_cluster(lists: "list[tuple[AlbumHit, list[Track]]]", log: Log):
                 break
         if not placed:
             clusters.append([item])
-    clusters.sort(key=lambda cl: (len(cl), max(len(ts) for _h, ts in cl)), reverse=True)
+    expected = {int(h.raw.get("_verified_track_count") or 0) for h, _ts in lists
+                if h.raw.get("_verified_track_count")}
+    verified_count = next(iter(expected)) if len(expected) == 1 else 0
+    def rank(cl):
+        count = max(len(ts) for _h, ts in cl)
+        # A verified release count can break a majority of incomplete translated
+        # catalogs. It never fabricates or truncates a single track.
+        agreement = -abs(count - verified_count) if verified_count else 0
+        return (agreement, len(cl), count)
+    clusters.sort(key=rank, reverse=True)
     for cl in clusters[1:]:
         _note(log, "  · 已忽略另一版本（标题集与本版本不同）：" + "，".join(
             f"{h.source}《{h.name}》{len(ts)} 首" for h, ts in cl))
@@ -867,11 +922,20 @@ def search_albums(http, query: str, *, artist: str = "", per_source: int = MAX_A
     texts = _query_texts(q)
     allowed = set(sources) if sources is not None else {"migu", "kugou", "kuwo", "aggregator"}
     hits: "list[AlbumHit]" = []
+    searched: "dict[str, set[str]]" = {}
+    known = local_album_alias(q, artist.strip())
+    searches = (
+        ("migu", lambda t: _migu_search(http, t, per_source)),
+        ("kugou", lambda t: _kugou_search(http, t, per_source)),
+        ("kuwo", lambda t: _kuwo_search(http, t, per_source)),
+        ("aggregator", lambda t: _aggregator_search(http, t, per_source, settings)),
+    )
 
     def _collect(name: str, fn, note: str) -> None:
         seen: "set[str]" = set()
         kept = 0
         for idx, text in enumerate(texts):
+            searched.setdefault(name, set()).add(text)
             try:
                 part = fn(text)
             except Exception as exc:  # noqa: BLE001 - 单源失败不影响其它源
@@ -887,70 +951,113 @@ def search_albums(http, query: str, *, artist: str = "", per_source: int = MAX_A
         if kept:
             _note(log, f"  · [{name}] 命中 {kept} 张专辑")
 
-    if "migu" in allowed:
-        _collect("migu", lambda t: _migu_search(http, t, per_source), "专辑检索")
-    if "kugou" in allowed:
-        _collect("kugou", lambda t: _kugou_search(http, t, per_source), "专辑检索")
-    if "kuwo" in allowed:
-        _collect("kuwo", lambda t: _kuwo_search(http, t, per_source), "专辑检索")
-    if "aggregator" in allowed and settings is not None:
-        _collect("aggregator", lambda t: _aggregator_search(http, t, per_source, settings), "专辑归集")
+    for source, search in searches:
+        if source in allowed and (source != "aggregator" or settings is not None):
+            _collect(source, search, "专辑检索")
     if artist.strip():
-        kept_hits = [h for h in hits if _artist_matches(artist, h.artist)]
+        kept_hits = [h for h in hits if _artist_matches(artist, h.artist)
+                     or (known is not None and _alias_matches(h, known, q))]
         dropped = len(hits) - len(kept_hits)
         if dropped:
             _note(log, f"  · 按歌手「{artist.strip()}」过滤掉 {dropped} 张（演唱者不符）")
         hits = kept_hits
 
-    known = local_album_alias(q, artist.strip())
-    if known is not None:
-        title_keys = {_norm_key(t) for t in (q, *known.titles)}
-        for h in hits:
-            names = (h.name, h.alias)
-            exact_title = any(_norm_key(n) in title_keys for n in names if n)
-            bracket_title = any(_norm_key(b.strip("[]()（）【】 ")) in title_keys
-                                for n in names if n for b in _TRACK_BRACKETS.findall(n))
-            if (exact_title or bracket_title) and h.artist and any(
-                    _artist_matches(a, h.artist) for a in known.artists):
-                h.raw["_verified_query_alias"] = q
-                h.raw["_verified_alias_id"] = known.entity_id
-
-    # A translated Chinese name may not be indexed by any music source. Resolve
-    # a verified album entity only after the ordinary search fails its name gate.
-    if re.search(r"[\u3400-\u9fff]", q) and not any(
+    alias = known
+    if alias is None and re.search(r"[\u3400-\u9fff]", q) and not any(
             _group_name_sim(h, [q]) >= 0.9 for h in hits):
         alias = resolve_album_alias(http, q, artist.strip())
+    if alias is not None:
+        for h in hits:
+            if _alias_matches(h, alias, q):
+                h.raw["_verified_query_alias"] = q
+                h.raw["_verified_alias_id"] = alias.entity_id
+                h.raw["_verified_original_title"] = alias.titles[0]
+                if alias.track_count:
+                    h.raw["_verified_track_count"] = alias.track_count
+
+    # A partial result can reveal a full title even outside the curated index.
+    # Expand only one unambiguous (title, artist) observed in source metadata;
+    # this is a search hint, never an authoritative album/track-count claim.
+    observed = {}
+    if alias is None:
+        for h in hits:
+            if (_title_prefix(q, h.name) and not _edition(h.name) and h.artist
+                    and h.artist.casefold() not in ARTIST_UNKNOWN):
+                observed.setdefault((_norm_key(h.name), _norm_key(h.artist)), h)
+    discovered = next(iter(observed.values())) if len(observed) == 1 else None
+
+    # Search eligibility is per source: one short catalog or a same-name cover
+    # from another source must not suppress an original-title catalog lookup.
+    for source, search in searches:
+        if source not in allowed or (source == "aggregator" and settings is None):
+            continue
+        own = [h for h in hits if h.source == source]
+        verified = [h for h in hits if alias is not None
+                    and (h.raw or {}).get("_verified_alias_id") == alias.entity_id]
+        own_verified = [h for h in verified if h.source == source]
+        target = max([h.track_count for h in verified if h.source != "aggregator"]
+                     + ([alias.track_count] if alias is not None else [0]))
+        if source == "aggregator" and any(
+                h.source != "aggregator" and h.track_count >= max(2, target) for h in verified):
+            continue  # Inferred search results add no directory authority here.
         if alias is not None:
-            _note(log, f"  · 中文专辑译名已核对：改用原语标题检索「{alias.titles[0]}」")
-            for source, search in (
-                    ("migu", lambda t: _migu_search(http, t, per_source)),
-                    ("kugou", lambda t: _kugou_search(http, t, per_source)),
-                    ("kuwo", lambda t: _kuwo_search(http, t, per_source)),
-                    ("aggregator", lambda t: _aggregator_search(http, t, per_source, settings))):
-                if source not in allowed or (source == "aggregator" and settings is None):
+            own_count = max((h.track_count for h in own_verified), default=0)
+            # No extra request for a source already giving the most complete
+            # known entity. Counts only schedule a lookup; they never add tracks.
+            if own_verified and own_count >= max(2, target):
+                continue
+            candidates = list(alias.titles[:2])
+        else:
+            missing_title = discovered is not None and not any(
+                _norm_key(h.name) == _norm_key(discovered.name)
+                and _artist_matches(discovered.artist, h.artist) for h in own)
+            if not missing_title and any(_group_name_sim(h, [q]) >= 0.9 for h in own):
+                continue
+            candidates = [discovered.name] if missing_title else [alternate_hanzi(q)]
+        extra = 0
+        for title in candidates:
+            if not title or title in searched.get(source, set()):
+                continue
+            # At most two alias lookups, or one orthographic lookup, per source.
+            extra += 1
+            searched.setdefault(source, set()).add(title)
+            try:
+                part = search(title)
+            except Exception as exc:  # noqa: BLE001 - optional lookup is best-effort
+                _note(log, f"  · [{source}] 原名补查失败：{exc}")
+                break
+            accepted = []
+            for h in part:
+                if alias is not None:
+                    if not _alias_matches(h, alias, q):
+                        continue
+                    h.raw["_verified_query_alias"] = q
+                    h.raw["_verified_alias_id"] = alias.entity_id
+                    h.raw["_verified_original_title"] = alias.titles[0]
+                    if alias.track_count:
+                        h.raw["_verified_track_count"] = alias.track_count
+                elif (_group_name_sim(h, [q]) < 0.9
+                      or (artist.strip() and not _artist_matches(artist, h.artist))
+                      or (discovered is not None and title == discovered.name and
+                          (_norm_key(h.name) != _norm_key(discovered.name)
+                           or not _artist_matches(discovered.artist, h.artist)))):
                     continue
-                for title in alias.titles:
-                    try:
-                        part = search(title)
-                    except Exception as exc:  # noqa: BLE001 - optional lookup is best-effort
-                        _note(log, f"  · [{source}] 译名检索失败：{exc}")
-                        break
-                    verified = []
-                    for h in part:
-                        name_ok = max(_sim(title, h.name),
-                                      _sim(title, h.alias) if h.alias else 0.0) >= 0.85
-                        artist_ok = h.artist and any(
-                            _artist_matches(name, h.artist) for name in alias.artists)
-                        if not (name_ok and artist_ok):
-                            continue
-                        h.raw["_verified_query_alias"] = q
-                        h.raw["_verified_alias_id"] = alias.entity_id
-                        verified.append(h)
-                    hits.extend(h for h in verified if not any(
-                        existing.source == h.source and existing.album_id == h.album_id
-                        for existing in hits))
-                    if verified:
-                        break
+                accepted.append(h)
+            index = {(h.source, h.album_id): h for h in hits}
+            for h in accepted:
+                existing = index.get((h.source, h.album_id))
+                if existing is None:
+                    hits.append(h)
+                    index[(h.source, h.album_id)] = h
+                else:
+                    existing.raw.update({k: v for k, v in h.raw.items() if k.startswith("_verified_")})
+            if accepted:
+                _note(log, f"  · [{source}] 原名/字形补查「{title}」命中 {len(accepted)} 张")
+                if alias is None or (target >= 2 and max(
+                        (h.track_count for h in accepted), default=0) >= target):
+                    break
+            if extra >= (2 if alias is not None else 1):
+                break
     return hits
 
 
@@ -1016,6 +1123,8 @@ def _group_name_sim(hit: AlbumHit, texts: "list[str]") -> float:
     best = 0.0
     for t in texts:
         best = max(best, _sim(t, hit.name))
+        if _title_prefix(t, hit.name):
+            best = max(best, 0.9)  # Recall a full title; do not certify its release.
         if hit.alias:
             best = max(best, _sim(t, hit.alias))
         verified = (hit.raw or {}).get("_verified_query_alias")
@@ -1039,7 +1148,8 @@ def _cluster_by_name(variants: "list[AlbumHit]") -> "list[list[AlbumHit]]":
     for h in variants:
         for cl in clusters:
             entity_id = (h.raw or {}).get("_verified_alias_id")
-            if any(_sim(h.name, other.name) >= 0.95 or
+            if any((_edition(h.name) == _edition(other.name) and
+                    _sim(h.name, other.name) >= 0.95) or
                    (entity_id and entity_id == (other.raw or {}).get("_verified_alias_id"))
                    for other in cl):
                 cl.append(h)
@@ -1052,7 +1162,9 @@ def _cluster_by_name(variants: "list[AlbumHit]") -> "list[list[AlbumHit]]":
 def _pick_display(variants: "list[AlbumHit]", texts: "list[str]") -> AlbumHit:
     """展示用条目：干净原名（无括号修饰）优先，其次与检索词最像，再次来源可信度。"""
     def key(h: AlbumHit):
-        return (not _decorated(h.name), round(_group_name_sim(h, texts), 4),
+        original = (h.raw or {}).get("_verified_original_title")
+        original_name = bool(original and _norm_key(original) == _norm_key(h.name))
+        return (original_name, not _decorated(h.name), round(_group_name_sim(h, texts), 4),
                 _SOURCE_TRUST.get(h.source, 0.5), h.track_count or 0)
     return max(variants, key=key)
 
@@ -1073,7 +1185,9 @@ def _group_score(group: "AlbumGroup", texts: "list[str]", artist: str) -> float:
     # 干净原名（近满相似且无括号修饰）微加 0.03：同分并列时压过「(Cover)」类同形名
     clean_bonus = 0.03 if (best_hit is not None and name_sim >= 0.9
                            and not _decorated(best_hit.name)) else 0.0
-    return 0.55 * name_sim + 0.25 * artist_sim + 0.10 * trust + 0.10 * completeness + clean_bonus
+    edition_cost = 0.02 * min((len(_edition(h.name)) for h in group.variants), default=0)
+    return (0.55 * name_sim + 0.25 * artist_sim + 0.10 * trust + 0.10 * completeness
+            + clean_bonus - edition_cost)
 
 
 def group_albums(hits, *, query: str = "", artist: str = "",
@@ -1143,7 +1257,7 @@ def group_albums(hits, *, query: str = "", artist: str = "",
 
 
 def group_tracks(http, group: AlbumGroup, *, log: Log = None, settings=None) -> "list[Track]":
-    """取合并专辑的曲目：**多源并集**（同名同歌手 + 版本聚类 + 并集去重），保证不丢曲目。
+    """合并已取回的同版目录；源端缺失时如实报告，不能据并集证明发行版完整。
 
     1. 每个来源取"最佳实体"（名字最干净 → 曲目最多），歌级 1 首条目自然被压掉；
     2. 各来源曲目表**全部取回**，按标题集合聚成版本，只保留占优版本（语译版/别版不相混）；
@@ -1157,6 +1271,11 @@ def group_tracks(http, group: AlbumGroup, *, log: Log = None, settings=None) -> 
     has_catalog = any(src in best for src in ("migu", "kugou", "kuwo"))
     lists = _fetch_source_lists(http, best, log=log, settings=settings,
                                 allow_aggregator=not has_catalog)
+    if not lists and has_catalog and "aggregator" in best:
+        # An unavailable catalog is not a usable catalog. Never mix inferred
+        # results into an existing directory; allow fallback only when all failed.
+        lists = _fetch_source_lists(http, {"aggregator": best["aggregator"]},
+                                    log=log, settings=settings)
     if not lists:
         raise NetworkError("该专辑在全部可用通道都未能取到曲目，请稍后再试")
     cluster = _dominant_cluster(lists, log)
@@ -1166,6 +1285,12 @@ def group_tracks(http, group: AlbumGroup, *, log: Log = None, settings=None) -> 
     group.primary = backbone
     group.track_count = len(merged)                 # 列表长度与展示计数永远一致
     group.count_hint = ""
+    declared = max([h.track_count for h, _tracks in cluster if h.source != "aggregator"]
+                   + [int(h.raw.get("_verified_track_count") or 0) for h, _tracks in cluster],
+                   default=0)
+    if declared > len(merged):
+        _note(log, f"  · 曲目目录未完整：所选目录标称 {declared} 首，实际获取 {len(merged)} 首；"
+                  "未用其它专辑或同名资源凑数")
     _note(log, f"  · 并集装配：{len(lists)} 个来源 → {len(merged)} 首"
               f"（主干 {backbone.source} · 版本内不丢曲目）")
     return merged

@@ -433,7 +433,15 @@ WIDE = [
     ("花样年华 Young Forever", "BTS", 23),
     ("颤栗", "Michael Jackson", 9),
     ("艾比路", "The Beatles", None),
+    ("幻灯", "yorushika", 25),
+    ("盜作", "yorushika", 14),
+    ("夏草", "", 7),
 ]
+
+EXPECTED_TITLES = {
+    "夏草": ["夏陰、ピアノを弾く", "カトレア", "言って。", "あの夏に咲け",
+             "飛行", "靴の花火", "雲と幽霊"],
+}
 
 
 def _expected(counts: "list[int]") -> int:
@@ -469,6 +477,10 @@ def run_live(albums, *, exact: bool) -> None:
                 check(f"live: {label} 链路不抛错", False, f"{type(exc).__name__}: {exc}")
                 continue
             titles = [t.title for t in tracks]
+            if query in EXPECTED_TITLES:
+                check(f"live: {label} 逐曲名称与曲序",
+                      [_track_key(t) for t in titles] ==
+                      [_track_key(t) for t in EXPECTED_TITLES[query]], str(titles))
             problems = invariants(tracks, expected)
             if any("丢曲目" in p for p in problems):
                 loss += 1

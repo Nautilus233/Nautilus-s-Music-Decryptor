@@ -18,6 +18,7 @@ import inspect
 import os
 import re
 import time
+from itertools import chain, islice
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
@@ -811,7 +812,8 @@ class Pipeline:
 
     def download_chosen(self, track: Track, *, reference: "float | None" = None,
                         label: str = "", note: str = "", cover: bytes = b"",
-                        track_no: int = 0, quiet_source: bool = False) -> JobResult:
+                        track_no: int = 0, quiet_source: bool = False,
+                        output_metadata: "tuple[str, str, str] | None" = None) -> JobResult:
         """下载**用户点名的那一条**：不再检索、不再重新比对跨平台时长。
 
         为什么这样设计（2026-10-21 用户反馈）：候选列表已经过全部硬门槛，用户点
@@ -824,6 +826,15 @@ class Pipeline:
         真的不合格（试听片段、坏文件）照样如实拒绝，只是不再拿"测不出时长"当理由。
         """
         display = label or f"{track.artist} - {track.title}".strip(" -")
+        track, data, v = self._fetch_chosen(track, reference=reference)
+        if output_metadata is not None:
+            track.title, track.artist, track.album = output_metadata
+        return self._write_downloaded(None, track, data, v, "", note=note, label=display,
+                                      cover=cover, track_no=track_no,
+                                      quiet_source=quiet_source)
+
+    def _fetch_chosen(self, track: Track, *, reference: "float | None" = None):
+        """Resolve, fetch and validate once; leave the output decision to the caller."""
         adapter = self._adapters.get(track.source)
         if adapter is None:
             raise SearchNoResultError("该候选的音源当前不可用，请换一条",
@@ -854,9 +865,7 @@ class Pipeline:
                                       detail=f"{track.source} “{track.title}”")
         if got_secs:
             track.actual_duration = track.actual_duration or got_secs
-        return self._write_downloaded(None, track, data, v, "", note=note, label=display,
-                                      cover=cover, track_no=track_no,
-                                      quiet_source=quiet_source)
+        return track, data, v
 
     #: 「专辑批量下载」重匹配纪律（用户 2026-10-23：稳定与速度优先）——
     #: 原生通道失败后只试这些通道（本地/补链最先，然后四个平台源）；
@@ -864,25 +873,99 @@ class Pipeline:
     _ALBUM_REMATCH_SOURCES = ("local", "manual", "migu", "kugou", "kuwo", "aggregator")
     #: 重匹配最多真正尝试下载的候选数（原生通道之外）
     _ALBUM_REMATCH_ATTEMPTS = 2
+    _ALBUM_LOSSLESS_ATTEMPTS = 2
+    _ALBUM_LOSSLESS_RESOLVES = 6
 
     def download_album_track(self, track: Track, *, album: str = "", cover: bytes = b"",
                              track_no: int = 0, reference: "float | None" = None) -> JobResult:
         """专辑批量下载的单曲入口：原生通道 → 其它音源重匹配，**仅当全部失败才报错**。
 
-        曲目/歌手/时长来自已选专辑的曲目表（用户已点名整张），所以不重新检索原生
-        来源，而是先按原生通道下载；失败后在其它音源做一次**强门槛重匹配**
-        （歌名+歌手硬门槛一个不放松），逐候选尝试（数量封顶）。
+        MP3 目标沿用原生通道先下、失败再重匹配。FLAC/WAV 目标则先解析原通道，
+        若不是无损，在同曲候选中优先查无损（允许同一来源的其它专辑条目）；
+        验证失败/预算耗尽后回到有损路径。歌名/歌手/版本/完整度门槛不放松。
         中间失败只写**明细**日志（避免提前宣告某来源不可用）；全部失败时抛出
         「所有来源均无法获取，建议自行获取」，由界面统一提示。
         """
         if album:
             track.album = album
         label = f"{track.artist} - {track.title}".strip(" -")
+        target_metadata = (track.title, track.artist, album or track.album)
         ref = reference if reference is not None else (float(track.duration) if track.duration else None)
         problems: "list[str]" = []
+        rematched: "list[Track]" = []
+        lossless_tried: "set[int]" = set()
+        prepared_lossy = None
+        if self._want_lossless():
+            # A successful native MP3 is not the best available result when the
+            # user asked for FLAC/WAV. Resolve first; only download plausible
+            # lossless candidates, with a strict bounded attempt count.
+            self._log(f"  · 目标无损：为「{track.title}」优先查找同曲无损资源", level="detail")
+            candidates = chain((track,), self._rematch_album_track(track, lossless_first=True))
+            for candidate in islice(candidates, self._ALBUM_LOSSLESS_RESOLVES + 1):
+                if self._cancel:
+                    raise CancelledError("已取消")
+                is_native = candidate is track
+                if not is_native:
+                    if (candidate.source == track.source and candidate.raw
+                            and candidate.raw == track.raw):
+                        continue
+                adapter = self._adapters.get(candidate.source)
+                if adapter is None:
+                    continue
+                try:
+                    if not candidate.url:
+                        candidate = adapter.resolve(candidate, quality=self.settings.quality)
+                    if not candidate.url:
+                        raise NetworkError("音源未返回直链")
+                except CancelledError:
+                    raise
+                except MusicDecryptorError as exc:
+                    problems.append(f"{candidate.source}: {exc.message}")
+                    self._log(f"  · [{candidate.source}] 无损直链不可用：{exc.message}", level="detail")
+                    continue
+                except Exception as exc:  # noqa: BLE001 - one source cannot abort the album
+                    problems.append(f"{candidate.source}: {str(exc)[:120]}")
+                    self._log(f"  · [{candidate.source}] 无损解析异常：{str(exc)[:120]}", level="detail")
+                    continue
+                if not is_native:
+                    rematched.append(candidate)
+                if candidate.ext.lower() not in ("flac", "wav", "ape", "dff"):
+                    continue
+                if len(lossless_tried) >= self._ALBUM_LOSSLESS_ATTEMPTS:
+                    continue
+                lossless_tried.add(id(candidate))
+                try:
+                    fetched, data, validation = self._fetch_chosen(candidate, reference=ref)
+                    if validation.ext.lower() not in ("flac", "wav", "ape", "dff"):
+                        if prepared_lossy is None:
+                            prepared_lossy = (fetched, data, validation)
+                        self._log("  · 候选实际为有损格式，保留作回退，继续寻找无损", level="detail")
+                        if len(lossless_tried) >= self._ALBUM_LOSSLESS_ATTEMPTS:
+                            break
+                        continue
+                    fetched.title, fetched.artist, fetched.album = target_metadata
+                    result = self._write_downloaded(
+                        None, fetched, data, validation, "", label=label,
+                        cover=cover, track_no=track_no, quiet_source=True)
+                    if not is_native:
+                        self._log(f"  · 已从其它专辑的同曲资源取得无损音频，元数据已统一为「{album}」",
+                                  level="detail")
+                    return result
+                except CancelledError:
+                    raise
+                except MusicDecryptorError as exc:
+                    problems.append(f"{candidate.source}: {exc.message}")
+                    self._log(f"  · [{candidate.source}] 无损候选未通过：{exc.message}", level="detail")
+                except Exception as exc:  # noqa: BLE001
+                    problems.append(f"{candidate.source}: {str(exc)[:120]}")
+                    self._log(f"  · [{candidate.source}] 无损候选异常：{str(exc)[:120]}", level="detail")
+                if len(lossless_tried) >= self._ALBUM_LOSSLESS_ATTEMPTS:
+                    break
+            self._log("  · 未取得可验证无损资源，按既有规则尝试有损回退", level="detail")
         try:
-            return self.download_chosen(track, reference=ref, cover=cover, track_no=track_no,
-                                        quiet_source=True)
+            if id(track) not in lossless_tried:
+                return self.download_chosen(track, reference=ref, cover=cover, track_no=track_no,
+                                            quiet_source=True, output_metadata=target_metadata)
         except CancelledError:
             raise
         except MusicDecryptorError as exc:
@@ -891,10 +974,28 @@ class Pipeline:
         except Exception as exc:  # noqa: BLE001 - 一首失败不拖垮整批
             problems.append(f"{track.source}: {exc}")
             self._log(f"  · 原通道异常：{str(exc)[:120]}", level="detail")
+        if prepared_lossy is not None:
+            fetched, data, validation = prepared_lossy
+            fetched.title, fetched.artist, fetched.album = target_metadata
+            return self._write_downloaded(
+                None, fetched, data, validation, "", label=label,
+                cover=cover, track_no=track_no, quiet_source=True)
         tried = 0
-        for cand in self._rematch_album_track(track):
+        fallback = (chain(rematched, candidates) if self._want_lossless()
+                    else self._rematch_album_track(track))
+        seen_fallback: "set[tuple[str, str]]" = set()
+        for cand in fallback:
             if tried >= self._ALBUM_REMATCH_ATTEMPTS:
                 break
+            if id(cand) in lossless_tried:
+                continue
+            if cand is track or (cand.source == track.source and cand.raw
+                                 and cand.raw == track.raw):
+                continue
+            identity = (cand.source, str(cand.raw.get("id") or cand.raw.get("FileHash") or cand.title))
+            if identity in seen_fallback:
+                continue
+            seen_fallback.add(identity)
             tried += 1
             # 元数据统一：曲名/歌手/唱片集一律以**专辑曲目表**为准（重匹配只换资源本身）
             cand.title = track.title or cand.title
@@ -903,7 +1004,8 @@ class Pipeline:
                 cand.album = album
             try:
                 res = self.download_chosen(cand, reference=ref, cover=cover, track_no=track_no,
-                                           label=label, quiet_source=True)
+                                           label=label, quiet_source=True,
+                                           output_metadata=target_metadata)
                 self._log(f"  · 已自动改用其它通道获取「{track.title}」（重匹配通过强门槛）",
                           level="detail")
                 return res
@@ -918,8 +1020,8 @@ class Pipeline:
         raise SearchNoResultError("所有来源均无法获取，建议自行获取",
                                   detail="；".join(problems) or "无可用通道")
 
-    def _rematch_album_track(self, track: Track):
-        """为失败曲目在其它音源做一次**强门槛**重匹配（生成器；逐源 1 个最佳候选）。
+    def _rematch_album_track(self, track: Track, *, lossless_first: bool = False):
+        """强门槛重匹配：普通逐源 1 条，无损目标逐源至多 2 条并允许原来源。
 
         门槛与单曲链路完全一致：歌名+歌手必须**同一读法**同时达标
         （`best_reading_match`），版本过滤照常；日语输入追加一次读音变体检索
@@ -927,7 +1029,10 @@ class Pipeline:
         """
         native = track.source
         order = [n for n in self._ALBUM_REMATCH_SOURCES
-                 if n in self._adapters and n != native]
+                 if n in self._adapters and (n != native or lossless_first)]
+        if lossless_first and _LOSSLESS_FIRST_SOURCE in order:
+            order.remove(_LOSSLESS_FIRST_SOURCE)
+            order.insert(0, _LOSSLESS_FIRST_SOURCE)
         readings = [(track.title, track.artist)]
         alt_readings: "list[tuple[str, str]]" = []
         try:
@@ -966,11 +1071,26 @@ class Pipeline:
                     except Exception:  # noqa: BLE001
                         pass
             if best is not None:
-                yield best
+                if lossless_first:
+                    # The same provider may expose the lossless copy under a
+                    # single/compilation rather than this album's resource id.
+                    pool = self._rank_rematch_candidates(tracks, readings, alt_readings, requested)
+                    pool.sort(key=lambda t: (t.short_asset,
+                              t.ext.lower() not in ("flac", "wav", "ape", "dff"), -t.score))
+                    for candidate in pool[:2]:
+                        yield candidate
+                else:
+                    yield best
 
     @staticmethod
     def _pick_rematch_candidate(tracks, readings, alt_readings, requested) -> "Track | None":
         """重匹配候选的强门槛过滤 + 排序：取最佳（疑似短资源让位，绝不提前下载）。"""
+        kept = Pipeline._rank_rematch_candidates(tracks, readings, alt_readings, requested)
+        return next((t for t in kept if not t.short_asset), kept[0] if kept else None)
+
+    @staticmethod
+    def _rank_rematch_candidates(tracks, readings, alt_readings, requested) -> "list[Track]":
+        """Use the existing song/artist/version gates before any metadata rewrite."""
         pool = [t for t in (tracks or []) if (t.title or t.url)]
         if not requested:
             originals, _dropped = split_originals(pool)
@@ -989,12 +1109,9 @@ class Pipeline:
             if ok:
                 kept.append(cand)
         if not kept:
-            return None
+            return []
         rank_tracks_multi(readings, kept, prefer_ext="")
-        try:
-            return next((t for t in kept if not t.short_asset), kept[0])
-        except Exception:  # noqa: BLE001
-            return kept[0]
+        return kept
 
     def acquire_many(self, items) -> "list[JobResult]":
         """批量以名找歌。``items`` 可以是 "歌名"、"歌手 - 歌名" 或 ``(歌名, 歌手)``。"""

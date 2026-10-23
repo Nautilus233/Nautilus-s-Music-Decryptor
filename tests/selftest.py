@@ -3305,6 +3305,173 @@ def test_album_download_e2e() -> None:
             pipe3.close()
 
 
+def test_album_lossless_rematch() -> None:
+    """A successful native MP3 must not hide a verified FLAC from another album."""
+    print("\n[album: lossless preference and selected-album metadata]")
+    from unittest.mock import patch
+    from mmusic.search.base import SearchSource
+
+    class AlbumSource(SearchSource):
+        def __init__(self, name, path, ext, *, other_album=False, bad_artist=False):
+            super().__init__(None, {})
+            self.name = self.label = name
+            self.path = path
+            self.ext = ext
+            self.other_album = other_album
+            self.bad_artist = bad_artist
+            self.searches = 0
+            self.resolves = 0
+
+        def search(self, query, *, quality="mp3", limit=8):
+            self.searches += 1
+            return [Track(self.name, "極夜", "別人" if self.bad_artist else "あたらよ",
+                          album="单曲集" if self.other_album else "極夜において月は語らず",
+                          duration=200, raw={"id": self.name, "other": self.other_album})]
+
+        def resolve(self, track, *, quality="mp3"):
+            self.resolves += 1
+            track.url = self.path.resolve().as_uri()
+            track.ext = self.ext
+            return track
+
+    with tempfile.TemporaryDirectory() as temp:
+        root = Path(temp)
+        mp3 = root / "native.mp3"
+        mp3.write_bytes(fx.make_mp3_xing(200, pad=40000))
+        flac = root / "other.flac"
+        flac.write_bytes(fx.make_flac(200, pad=40000))
+
+        def run(quality, other_source, tag):
+            native = AlbumSource("kugou", mp3, "mp3")
+            chosen = Track("kugou", "極夜", "あたらよ", "旧专辑", duration=200)
+            written = []
+            settings = Settings(quality=quality, output_dir=str(root / tag),
+                                write_metadata=True, fetch_cover=False,
+                                remember_hashes=False, min_bitrate=0)
+            pipe = Pipeline(settings, cache_path=root / (tag + ".json"),
+                            sources=[native, other_source])
+            try:
+                with patch("mmusic.pipeline.write_tags", side_effect=lambda path, **kw: written.append(kw)):
+                    result = pipe.download_album_track(
+                        chosen, album="極夜において月は語らず", track_no=3, reference=200)
+                return result, written, native
+            finally:
+                pipe.close()
+
+        other = AlbumSource("aggregator", flac, "flac", other_album=True)
+        got, tags, native = run("flac", other, "lossless")
+        check("album quality: another album's verified FLAC beats successful native MP3",
+              got.fmt == "flac" and got.source == "aggregator"
+              and Path(got.out_path).read_bytes() == flac.read_bytes()
+              and native.resolves == 1, f"{got.fmt}/{got.source}/{native.resolves}")
+        check("album quality: title, artist, selected album and track number replace source metadata",
+              len(tags) == 1 and tags[0]["title"] == "極夜"
+              and tags[0]["artist"] == "あたらよ"
+              and tags[0]["album"] == "極夜において月は語らず"
+              and tags[0]["track_no"] == 3, str(tags))
+
+        unavailable = AlbumSource("aggregator", mp3, "mp3", other_album=True)
+        downgraded, _, _ = run("flac", unavailable, "downgrade")
+        check("album quality: no verified lossless still falls back to native MP3",
+              downgraded.fmt == "mp3" and downgraded.source == "kugou"
+              and unavailable.searches == 1,
+              f"{downgraded.fmt}/{downgraded.source}/{unavailable.searches}")
+
+        wrong = AlbumSource("aggregator", flac, "flac", other_album=True, bad_artist=True)
+        rejected, _, _ = run("flac", wrong, "wrong-artist")
+        check("album quality: FLAC by a different artist cannot replace the original",
+              rejected.source == "kugou" and rejected.fmt == "mp3" and wrong.resolves == 0)
+
+        normal = AlbumSource("aggregator", flac, "flac", other_album=True)
+        fast, _, _ = run("mp3", normal, "mp3")
+        check("album quality: MP3 target keeps original fast path",
+              fast.source == "kugou" and normal.searches == 0)
+
+        fake_flac = AlbumSource("aggregator", mp3, "flac", other_album=True)
+        fake, _, _ = run("flac", fake_flac, "fake-flac")
+        check("album quality: claimed FLAC with MP3 bytes never writes a false FLAC",
+              fake.source == "kugou" and fake.fmt == "mp3"
+              and len(list((root / "fake-flac").glob("*"))) == 1)
+
+        short = root / "short.flac"
+        short.write_bytes(fx.make_flac(60, pad=40000))
+        clip_source = AlbumSource("aggregator", short, "flac", other_album=True)
+        clip, _, _ = run("flac", clip_source, "short-flac")
+        check("album quality: incomplete FLAC cannot beat a complete MP3",
+              clip.source == "kugou" and clip.fmt == "mp3")
+
+        same = AlbumSource("kugou", mp3, "mp3")
+        def same_resolve(t, *, quality="mp3"):
+            is_other = bool(t.raw.get("other"))
+            t.url = (flac if is_other else mp3).resolve().as_uri()
+            t.ext = "flac" if is_other else "mp3"
+            return t
+        same.other_album = True
+        same.resolve = same_resolve
+        settings = Settings(quality="flac", output_dir=str(root / "same-source"),
+                            write_metadata=False, fetch_cover=False,
+                            remember_hashes=False, min_bitrate=0)
+        pipe = Pipeline(settings, cache_path=root / "same.json", sources=[same])
+        try:
+            result = pipe.download_album_track(
+                Track("kugou", "極夜", "あたらよ", duration=200), album="極夜において月は語らず")
+            check("album quality: same provider can rematch a lossless single from another album",
+                  result.fmt == "flac" and same.searches == 1)
+        finally:
+            pipe.close()
+
+        class FreshSource(AlbumSource):
+            def resolve(self, t, *, quality="mp3"):
+                # Some adapters return a fresh Track instead of mutating it.
+                from dataclasses import replace
+                return replace(t, album="单曲集", url=self.path.resolve().as_uri(), ext=self.ext)
+
+        fresh = FreshSource("aggregator", flac, "flac", other_album=True)
+        got_fresh, fresh_tags, _ = run("flac", fresh, "fresh-object")
+        check("album quality: adapter returning a fresh object cannot restore source album tags",
+              got_fresh.fmt == "flac" and fresh_tags[0]["album"] == "極夜において月は語らず")
+
+        class BrokenSource(AlbumSource):
+            def resolve(self, t, *, quality="mp3"):
+                raise OSError("fake source failure")
+
+        broken = BrokenSource("aggregator", flac, "flac", other_album=True)
+        recovered, _, _ = run("flac", broken, "source-error")
+        check("album quality: unexpected resolver failure still falls back without crashing",
+              recovered.source == "kugou" and recovered.fmt == "mp3")
+
+        wave_target = AlbumSource("aggregator", flac, "flac", other_album=True)
+        wave, _, _ = run("wav", wave_target, "wav-target")
+        check("album quality: WAV target also seeks lossless and preserves original FLAC",
+              wave.source == "aggregator" and wave.fmt == "flac")
+
+        masquerading_native = AlbumSource("kugou", mp3, "flac")
+        pipe = Pipeline(Settings(quality="flac", output_dir=str(root / "native-masquerade"),
+                                 write_metadata=False, fetch_cover=False,
+                                 remember_hashes=False, min_bitrate=0),
+                        cache_path=root / "masquerade.json", sources=[masquerading_native])
+        try:
+            res = pipe.download_album_track(
+                Track("kugou", "極夜", "あたらよ", duration=200), album="極夜において月は語らず")
+            check("album quality: mislabeled native lossless can still fall back to validated MP3",
+                  res.fmt == "mp3" and Path(res.out_path).read_bytes() == mp3.read_bytes())
+        finally:
+            pipe.close()
+
+        class WaveHttp:
+            def __init__(self):
+                self.urls = []
+            def get_json(self, url, **kwargs):
+                self.urls.append(url)
+                return {"url": "https://example.invalid/audio.flac", "br": 999}
+        from mmusic.search.aggregator import AggregatorSource
+        http = WaveHttp()
+        adapter = AggregatorSource(http, {})
+        resolved = adapter.resolve(Track("aggregator", "極夜", raw={"id": "demo"}), quality="wav")
+        check("album quality: WAV resolution requests lossless provider tier first",
+              "br=999" in http.urls[0] and resolved.ext == "flac")
+
+
 def test_search_output_dir() -> None:
     """以名找歌的输出目录：专用 → 主 → 默认（按需按优），且与解密模式互不影响。"""
     print("\n[search output dir: 按需按优]")
@@ -4047,6 +4214,7 @@ def main() -> int:
     test_fast_mode_e2e()
     test_album_search()
     test_album_download_e2e()
+    test_album_lossless_rematch()
     test_search_output_dir()
     test_settings_roundtrip()
     test_portable_config_dir()

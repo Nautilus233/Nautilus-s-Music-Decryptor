@@ -254,6 +254,13 @@ def main(argv=None) -> int:
         _ck("reading table loaded", any(f == "zankokunatenshinoteze" for f in forms), str(forms))
         corrections = fuzzy.corrections_for("\u775b\u5929", limit=2)
         _ck("cjk correction table", corrections[:1] == ["\u6674\u5929"], str(corrections))
+        from mmusic.search.album import _sim
+        from mmusic.search.album_alias import local_album_alias
+        from mmusic.search.album_text import alternate
+        _ck("album hanzi table", _sim("幻灯", "幻燈") == 1.0
+            and alternate("幻灯") == "幻燈" and alternate("发") == "发")
+        gentou = local_album_alias("幻灯", "yorushika")
+        _ck("album alias table", gentou is not None and gentou.titles[0] == "幻燈")
         failed = [name for name, good, _extra in checks if not good]
         for name, good, extra in checks:
             print(("OK  " if good else "FAIL") + f" {name}" + (f"  {extra}" if extra and not good else ""))

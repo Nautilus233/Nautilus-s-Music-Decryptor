@@ -1,5 +1,18 @@
 [
   {
+    "id": "Q86734884",
+    "aliases": [],
+    "track_count": 7,
+    "titles": ["夏草が邪魔をする", "The Summer Grass Is Getting in My Way"],
+    "artists": ["ヨルシカ", "Yorushika"]
+  },
+  {
+    "id": "Q117788597",
+    "aliases": ["幻灯", "幻燈"],
+    "titles": ["幻燈", "Magic Lantern"],
+    "artists": ["ヨルシカ", "Yorushika"]
+  },
+  {
     "id": "Q65235123",
     "aliases": ["所以我放弃了音乐", "所以我放棄了音樂"],
     "titles": ["だから僕は音楽を辞めた", "That's Why I Gave Up on Music"],

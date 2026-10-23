@@ -10,6 +10,7 @@ from functools import lru_cache
 
 from ..match import cross_similarity
 from ..paths import resource_path
+from .album_text import folded
 
 _API = "https://www.wikidata.org/w/api.php"
 _HEADERS = {"User-Agent": "MusicDecryptor/1.0 (local album title lookup)"}
@@ -23,24 +24,34 @@ class AlbumAlias:
     entity_id: str
     titles: tuple[str, ...]
     artists: tuple[str, ...]
+    prefix: bool = False
+    track_count: int = 0
 
 
 def _key(value: str) -> str:
-    text = unicodedata.normalize("NFKC", value or "").casefold()
+    text = unicodedata.normalize("NFKC", folded(value)).casefold()
     return re.sub(r"[\s\-‐–—·:：,，.。'‘’\"“”]+", "", text)
 
 
 def _artist_ok(requested: str, names: tuple[str, ...]) -> bool:
     if not requested:
         return True
+    # Parenthesized artist translations are common; an arbitrary substring or
+    # a similar spelling is not enough to certify a release's performer.
+    requested = re.split(r"[（(]", requested, maxsplit=1)[0].strip()
     want = _key(requested)
     for name in names:
+        name = re.split(r"[（(]", name, maxsplit=1)[0].strip()
         candidate = _key(name)
-        if want == candidate or (len(want) >= 3 and want in candidate):
+        if want == candidate:
             return True
-        if cross_similarity(requested, name) >= 0.75:
+        if cross_similarity(requested, name) >= 0.999:
             return True
     return False
+
+
+def alias_artist_matches(artist: str, names: tuple[str, ...]) -> bool:
+    return bool(artist.strip()) and _artist_ok(artist, names)
 
 
 @lru_cache(maxsize=1)
@@ -53,15 +64,27 @@ def _local() -> tuple[dict, ...]:
 
 
 def local_album_alias(query: str, artist: str = "") -> AlbumAlias | None:
-    """Resolve a curated exact alias without issuing a network request."""
+    """Exact curated aliases first, then a unique bounded title prefix."""
     wanted = _key(query)
     for row in _local():
-        if wanted not in {_key(a) for a in row.get("aliases") or []}:
+        if wanted not in {_key(a) for a in (*row.get("aliases", []), *row.get("titles", []))}:
             continue
         names = tuple(row.get("artists") or ())
-        return (AlbumAlias(str(row["id"]), tuple(row["titles"]), names)
+        return (AlbumAlias(str(row["id"]), tuple(row["titles"]), names,
+                           track_count=int(row.get("track_count") or 0))
                 if _artist_ok(artist, names) else None)
-    return None
+    if len(wanted) < (2 if re.search(r"[\u3400-\u9fff]", wanted) else 4):
+        return None
+    candidates = {}
+    for row in _local():
+        names = tuple(row.get("artists") or ())
+        if not _artist_ok(artist, names):
+            continue
+        if any(_key(t).startswith(wanted) for t in row.get("titles") or []):
+            candidates[row["id"]] = AlbumAlias(
+                str(row["id"]), tuple(row["titles"]), names, prefix=True,
+                track_count=int(row.get("track_count") or 0))
+    return next(iter(candidates.values())) if len(candidates) == 1 else None
 
 
 def _api_json(http, **params):
