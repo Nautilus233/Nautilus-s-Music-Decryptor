@@ -146,8 +146,9 @@ class NameSearchWorker(QThread):
     def _emit_file(self, result) -> None:
         if self.cancel_requested:
             return
-        if result.status == "failed":
-            self.suggestions.emit(list(getattr(result, "suggestions", ())))
+        if result.status == "failed" and getattr(result, "suggestions", ()):
+            # An empty hint set belongs to this song, not to earlier batch failures.
+            self.suggestions.emit(list(result.suggestions))
         self.file_done.emit(result)
 
     def cancel(self) -> None:

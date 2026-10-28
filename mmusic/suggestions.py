@@ -228,12 +228,13 @@ def query_suggestion_choices(readings: Sequence[tuple[str, str]], candidates: It
     Otherwise version-filtered records are allowed, with their real title and
     any metadata-only version markers appended, never invented studio titles.
 
-    One short insertion/deletion needs an explicit artist OR two distinct
-    nonempty source IDs agreeing on base title + artist. Substitution needs an
+    One short insertion/deletion needs an explicit artist OR a nonempty source
+    ID attesting the displayed title + artist. Source agreement ranks optional
+    identities; it is not a download gate. Substitution needs an
     explicit artist, plus two sources for two-character titles. One-character
     edits, prefix/suffix extensions and short fuzzy aliases are forbidden.
-    Equally close different work
-    identities suppress short guesses. Source agreement proves a catalog
+    Equally close different work identities remain explicit choices, without
+    selecting an artist or claiming a correction. Source agreement proves a catalog
     identity, NOT user intent, recording availability, or source independence.
 
     Cost caps: 8 readings, 256 candidates, 24 aliases/record, 8192 comparisons,
@@ -323,28 +324,25 @@ def query_suggestion_choices(readings: Sequence[tuple[str, str]], candidates: It
     for index, work, choice, hits in records:
         for row, identity, similarity, short in hits:
             sources = len(support.get((row, work), ()))
-            if short == "indel" and not (identity or sources >= 2):
+            if short == "indel" and not (identity or sources):
                 continue
             if short in {"sub", "sub2"} and not (identity and (short != "sub2" or sources >= 2)):
                 continue
             score = (identity, similarity)
             eligible.append((row, work, choice, short, score, index))
-            best, works = closest.get(row, ((-1.0, -1.0), set()))
-            if score > best:
-                closest[row] = (score, {work})
-            elif score == best:
-                works.add(work)
+            closest[row] = max(closest.get(row, (-1.0, -1.0)), score)
 
     ranked = {}
     for row, work, choice, short, score, index in eligible:
-        best, works = closest[row]
-        if short and (score < best or len(works) != 1):
+        best = closest[row]
+        if short and score < best:
             continue
         key = (_key(choice[0]), _key(choice[1]))
-        value = (*score, -index, choice)
-        if key not in ranked or value[:3] > ranked[key][:3]:
+        sources = len(support.get((row, work), ()))
+        value = (*score, sources, -index, choice)
+        if key not in ranked or value[:4] > ranked[key][:4]:
             ranked[key] = value
-    return [item[3] for item in sorted(ranked.values(), reverse=True)[:limit]]
+    return [item[4] for item in sorted(ranked.values(), reverse=True)[:limit]]
 
 
 def query_suggestions(readings: Sequence[tuple[str, str]], candidates: Iterable[Track],

@@ -316,7 +316,7 @@ def main(argv=None) -> int:
             not query_suggestions([("卖花", "yorushika")],
                                   [Track("test", "春ひさぎ", "ヨルシカ", raw={"alias": ["卖春"]})]))
         from mmusic.suggestions import query_suggestion_choices
-        _ck("short typo hint needs supporting catalog identities",
+        _ck("short typo provides optional catalog identities",
             query_suggestion_choices([("夜曲子", "")], [
                 Track("test-a", "夜曲", "周杰伦"), Track("test-b", "夜曲", "周杰伦")])
             == [("夜曲", "周杰伦")])

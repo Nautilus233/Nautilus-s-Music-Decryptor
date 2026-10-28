@@ -105,12 +105,13 @@ class QuerySuggestionTests(unittest.TestCase):
                                            [song("夜曲", "周杰伦")]),
                          ["夜曲（周杰伦）"])
 
-    def test_artistless_short_query_requires_two_sources(self):
+    def test_artistless_short_query_keeps_attested_single_source_choice(self):
         tracks = [Track("source-a", "夜曲", "周杰伦"),
                   Track("source-b", "夜曲", "周杰伦")]
         self.assertEqual(query_suggestion_choices([("夜曲子", "")], tracks),
                          [("夜曲", "周杰伦")])
-        self.assertEqual(query_suggestions([("夜曲子", "")], [tracks[0]]), [])
+        self.assertEqual(query_suggestions([("夜曲子", "")], [tracks[0]]),
+                         ["夜曲（周杰伦）"])
 
     def test_two_character_substitution_requires_artist_and_two_sources(self):
         one = [Track("source-a", "夜曲", "周杰伦")]
@@ -150,20 +151,46 @@ class QuerySuggestionTests(unittest.TestCase):
             [Track("a", "夜曲", "周杰伦"), Track("b", "夜曲", "周杰伦", raw={"query_echo": True})],
         ]
         for tracks in bad_pools:
-            self.assertEqual(query_suggestion_choices([("夜曲子", "")], tracks), [])
+            # Two-character substitution still requires real cross-source
+            # agreement for the SAME performer, not pooled optional identities.
+            self.assertEqual(query_suggestion_choices([("夜困", "周杰伦")], tracks), [])
         tracks = [Track("a", "夜曲", "周杰伦"), Track("b", "夜曲", "周杰伦")]
         self.assertEqual(query_suggestion_choices([("夜曲子", "错歌手"), ("夜曲子", "")], tracks), [])
         self.assertEqual(query_suggestion_choices([("夜曲子", "unknown"), ("夜曲子", "")], tracks), [])
         self.assertEqual(query_suggestion_choices([("夜曲子", "别的歌手"), ("无关", "周杰伦")], tracks), [])
         self.assertEqual(query_suggestion_choices([("夜困", "")], tracks), [])
 
-    def test_equally_close_works_suppress_short_guess_and_exact_wins(self):
+    def test_equally_close_works_remain_choices_and_exact_wins(self):
         tracks = [Track(source, title, "歌手") for source in ("a", "b")
                   for title in ("星海", "星河")]
-        self.assertEqual(query_suggestion_choices([("星海河", "")], tracks), [])
+        self.assertEqual(query_suggestion_choices([("星海河", "")], tracks),
+                         [("星海", "歌手"), ("星河", "歌手")])
         exact = Track("c", "星海河", "歌手")
         self.assertEqual(query_suggestion_choices([("星海河", "")], tracks + [exact]),
                          [("星海河", "歌手")])
+
+    def test_single_source_artist_ambiguity_keeps_full_real_identities(self):
+        tracks = [Track("migu", "海風", "甲歌手", album="Live at Somewhere"),
+                  Track("migu", "海風", "乙歌手"),
+                  Track("aggregator", "海風 (Cover)", "丙歌手")]
+        before = copy.deepcopy(tracks)
+        self.assertEqual(query_suggestion_choices([("海風子", "")], tracks),
+                         [("海風 (Live)", "甲歌手"), ("海風", "乙歌手"),
+                          ("海風 (Cover)", "丙歌手")])
+        self.assertEqual(query_suggestion_choices([("海風子", "甲歌手")], tracks),
+                         [("海風 (Live)", "甲歌手")])
+        self.assertEqual(tracks, before)
+
+    def test_source_agreement_ranks_choices_without_erasing_other_artists(self):
+        tracks = [Track("aggregator", "夜曲", "别的歌手"),
+                  Track("migu", "夜曲", "周杰伦"),
+                  Track("kugou", "夜曲", "周杰伦")]
+        for candidates in (tracks, list(reversed(tracks))):
+            self.assertEqual(query_suggestion_choices([("夜曲子", "")], candidates),
+                             [("夜曲", "周杰伦"), ("夜曲", "别的歌手")])
+        for source in ("", "unknown", "none", "未知"):
+            self.assertEqual(query_suggestion_choices([("夜曲子", "")],
+                             [Track(source, "夜曲", "周杰伦")]), [])
 
     def test_metadata_versions_append_without_fabricating_studio_identity(self):
         for kwargs, suffix in (({"album": "Live at Somewhere"}, "Live"),

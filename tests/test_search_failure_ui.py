@@ -19,7 +19,8 @@ from PySide6.QtWidgets import QApplication, QDialogButtonBox
 from mmusic.config import AppConfig
 from mmusic.errors import SearchNoResultError
 from mmusic.model import Track
-from mmusic.pipeline import JobResult
+from mmusic.pipeline import JobResult, Pipeline
+from mmusic.search.base import SearchSource
 from ui import geometry, theme
 from ui.name_search_dialog import MIN_SIZE, NameSearchDialog
 
@@ -195,19 +196,22 @@ class SearchFailureUiTests(unittest.TestCase):
         self.assertIn(title, doc.toPlainText())
         self.assertIn(artist, doc.toPlainText())
         self.assertIn("仅列出候选，不会直接下载", doc.toPlainText())
-        self.assertIn(f"你可能想找的歌是：{title}（{artist}）？", self.dialog.log.toPlainText())
+        self.assertEqual(self.dialog.log.toPlainText().count("你可能想找的歌是："), 0)
 
-    def test_detail_suffix_survives_compact_filter_and_buffer_limit(self):
+    def test_details_stay_folded_and_persistent_failure_survives_buffer_limit(self):
         worker = self.worker()
         suffix = "你可能想找的歌是：<夜曲 & 原文>？"
+        worker.failed.emit("未找到符合要求的歌曲")
+        hint = self.dialog._failure_hint.text()
         worker.logged.emit("明细" * 500 + "\n" + suffix, "detail")
-        self.assertEqual(self.dialog.log.toPlainText(), suffix)
+        self.assertNotIn(suffix, self.dialog.log.toPlainText())
         for i in range(4100):
             worker.logged.emit(f"后续明细 {i}", "detail")
         self.dialog.chk_detail.setChecked(True)
-        self.assertIn(suffix, self.dialog.log.toPlainText())
         self.dialog.chk_detail.setChecked(False)
-        self.assertEqual(self.dialog.log.toPlainText(), suffix)
+        self.assertNotIn(suffix, self.dialog.log.toPlainText())
+        self.assertEqual(self.dialog._failure_hint.text(), hint)
+        self.assertTrue(self.dialog._failure_hint.isVisible())
         self.assertEqual(self.dialog._hidden_details,
                          sum(level != "result" for _, level in self.dialog._log_lines))
         self.assertLessEqual(len(self.dialog._log_lines), 4000)
@@ -231,19 +235,22 @@ class SearchFailureUiTests(unittest.TestCase):
         self.assertTrue(self.dialog._suggestion_buttons[0].isEnabled())
         self.assert_no_download_guidance()
 
-    def test_auto_empty_suggestions_and_success_clear_previous(self):
+    def test_auto_empty_suggestions_and_success_preserve_previous(self):
         worker = self.worker("auto")
         worker.suggestions.emit([("上一首", "歌手")])
+        worker.file_done.emit(JobResult("search:first", "first", "failed", message="首曲失败",
+                                        suggestions=(("上一首", "歌手"),)))
+        hint = self.dialog._failure_hint.text()
         worker.suggestions.emit([])
         worker.file_done.emit(JobResult("search:x", "x", "failed"))
-        self.assert_no_choices()
-        worker.suggestions.emit([("上一首", "歌手")])
         worker.file_done.emit(JobResult("search:y", "y", "downloaded"))
-        self.assert_no_choices()
         worker.completed.emit([JobResult("search:x", "x", "failed"),
                                JobResult("search:y", "y", "downloaded")])
         self.finish(worker)
-        self.assert_no_choices()
+        self.assertEqual(self.dialog._suggestion_choices, [("上一首", "歌手")])
+        self.assertEqual(self.dialog._failure_hint.text(), hint)
+        self.assertTrue(self.dialog._failure_hint.isVisible())
+        self.assertTrue(self.dialog._suggestion_buttons[0].isEnabled())
 
     def test_pick_failure_preserves_candidates_and_other_choice(self):
         listing = self.worker()
@@ -328,6 +335,7 @@ class SearchFailureUiTests(unittest.TestCase):
             self.pump()
         self.assertTrue(work_area.contains(self.dialog.frameGeometry()))
         for widget in [self.dialog._suggestion_area, *self.dialog._suggestion_buttons,
+                       self.dialog._failure_hint,
                        self.dialog.btn_search, self.dialog.btn_pick, self.dialog.btn_stop,
                        self.dialog.log, self.dialog.findChild(QDialogButtonBox)]:
             with self.subTest(widget=type(widget).__name__):
@@ -369,6 +377,78 @@ class SearchFailureUiTests(unittest.TestCase):
         self.assert_no_choices()
         self.assertEqual(self.dialog.table.rowCount(), 1)
         self.assertTrue(self.dialog.btn_pick.isEnabled())
+
+    def test_real_pipeline_flac_four_sources_default_compact_failure(self):
+        """Real Pipeline/worker/Qt wiring, only provider metadata is fake."""
+        calls = []
+        provide_hints = False
+
+        class MetadataOnlySource(SearchSource):
+            def __init__(inner, name):
+                super().__init__(None)
+                inner.name = inner.label = name
+
+            def search(inner, query, **kwargs):
+                calls.append((inner.name, query, kwargs.get("quality")))
+                if provide_hints:
+                    return [Track(inner.name, "夜曲", "周杰伦")]
+                return [Track(inner.name, "毫不相关的歌曲", "其他歌手")]
+
+            def resolve(inner, *args, **kwargs):
+                raise AssertionError("weak metadata must not resolve audio")
+
+        sources = [MetadataOnlySource(name) for name in ("kuwo", "kugou", "migu", "aggregator")]
+        self.config.settings.quality = "flac"
+        self.config.settings.remember_hashes = False
+        self.config.settings.fetch_cover = False
+        self.dialog.artist.clear()
+        self.assertFalse(self.dialog.chk_detail.isChecked())
+
+        def factory(settings, **kwargs):
+            return Pipeline(settings, sources=sources, **kwargs)
+
+        with patch("ui.worker.Pipeline", side_effect=factory), \
+             patch.object(Pipeline, "_download", side_effect=AssertionError("download")), \
+             patch.object(Pipeline, "_probe_audio", side_effect=AssertionError("probe")):
+            for provide_hints in (False, True):
+                with self.subTest(hints=provide_hints):
+                    calls.clear()
+                    self.dialog.btn_search.click()
+                    self.assertTrue(self.wait(lambda: self.dialog._worker is None))
+                    self.assertFalse(self.dialog.chk_detail.isChecked())
+                    self.assertTrue(self.dialog._failure_hint.isVisible())
+                    self.assertEqual(self.dialog.table.rowCount(), 0)
+                    self.assert_no_download_guidance()
+                    self.assertEqual(calls[0][0], "aggregator")
+                    self.assertEqual({name for name, _, _ in calls}, {s.name for s in sources})
+                    self.assertTrue(all(quality == "flac" for _, _, quality in calls))
+                    if provide_hints:
+                        self.assertEqual(self.dialog._suggestion_choices, [("夜曲", "周杰伦")])
+                        self.assertTrue(self.dialog._suggestion_buttons[0].isVisible())
+                        self.assertTrue(self.dialog._suggestion_buttons[0].isEnabled())
+                        self.assertEqual(self.dialog.log.toPlainText().count("你可能想找的歌是："), 1)
+                    else:
+                        self.assert_no_choices()
+                        self.assertIn("未找到足够接近曲名", self.dialog._failure_hint.text())
+                        self.assertIn("精简歌名或补充歌手", self.dialog._failure_hint.text())
+                    for checked in (True, False):
+                        self.dialog.chk_detail.setChecked(checked)
+                        self.assertTrue(self.dialog._failure_hint.isVisible())
+                        self.assertEqual(self.dialog._suggestion_area.isVisible(), provide_hints)
+                        if provide_hints:
+                            self.assertTrue(self.dialog._suggestion_buttons[0].isVisible())
+                            self.assertTrue(self.dialog._suggestion_buttons[0].isEnabled())
+        self.assertEqual(list(Path(self.tmp.name).glob("*.flac")), [])
+
+    def test_failure_summary_plain_text_and_direct_slots(self):
+        message = '<img src=x> & <b>原文</b>'
+        self.dialog._on_failed(message)
+        self.assertIn(message, self.dialog._failure_hint.text())
+        doc = QTextDocument()
+        doc.setHtml(self.dialog._failure_hint.toolTip())
+        self.assertEqual(doc.toPlainText(), message)
+        self.dialog._on_file_done(JobResult("search:x", "x", "failed", message=message))
+        self.assertTrue(self.dialog._failure_hint.isVisible())
 
 
 if __name__ == "__main__":

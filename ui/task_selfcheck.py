@@ -142,6 +142,54 @@ def run(app) -> int:
             worker_module.Pipeline = real_pipeline
             hint_dialog.deleteLater()
 
+        class HintRescueSource(SearchSource):
+            def __init__(self, name):
+                super().__init__(None)
+                self.name = self.label = name
+
+            def search(self, query, **kwargs):
+                if query == "夜曲子":
+                    return [Track(self.name, "雨夜的曲子 (Demo)", "Other Artist")]
+                if query == "夜曲":
+                    performer = "Other Artist" if self.name == "aggregator" else "周杰伦"
+                    return [Track(self.name, "夜曲", performer, duration=60, ext="wav")]
+                return []
+
+            def resolve(self, track, **kwargs):
+                track.url = (library / "Test Artist - Worker Test.wav").as_uri()
+                return track
+
+        worker_module.Pipeline = lambda settings, **kwargs: real_pipeline(
+            settings, sources=[HintRescueSource(name) for name in
+                               ("kuwo", "kugou", "migu", "aggregator")], **kwargs)
+        cfg.settings.quality = "flac"
+        cfg.settings.remember_hashes = True
+        rescue_dialog = NameSearchDialog(cfg.settings, cfg)
+        try:
+            rescue_dialog.show()
+            rescue_dialog.names.setPlainText("夜曲子")
+            rescue_dialog.btn_search.click()
+            completed = until(lambda: rescue_dialog._worker is None)
+            check("FLAC compact: real pipeline emits short-title suggestions without details",
+                  completed and not rescue_dialog.chk_detail.isChecked()
+                  and ("夜曲", "周杰伦") in rescue_dialog._suggestion_choices
+                  and rescue_dialog._suggestion_area.isVisible()
+                  and "你可能想找的歌是：" in rescue_dialog.log.toPlainText()
+                  and not rescue_dialog.btn_pick.isEnabled())
+            choices = list(rescue_dialog._suggestion_choices)
+            rescue_dialog.chk_detail.setChecked(True)
+            rescue_dialog.chk_detail.setChecked(False)
+            check("FLAC compact: detail toggle never determines suggestion visibility",
+                  choices == rescue_dialog._suggestion_choices
+                  and rescue_dialog._suggestion_area.isVisible()
+                  and "你可能想找的歌是：" in rescue_dialog.log.toPlainText())
+        finally:
+            rescue_dialog.close()
+            until(lambda: rescue_dialog._worker is None)
+            worker_module.Pipeline = real_pipeline
+            rescue_dialog.deleteLater()
+            cfg.settings.quality = "wav"
+
         # Same title/artist, two different recordings: the concert duration
         # must never reject a complete studio file. Exercise the frozen core.
         studio_file = root / "studio.wav"

@@ -21,6 +21,7 @@ from .album_search_dialog import TRACK_COLUMNS as AS_TCOLS
 from .album_search_dialog import clean_album_query
 from .name_search_dialog import MIN_SIZE as NS_MIN, NameSearchDialog
 from .name_search_dialog import parse_lines as ns_parse_lines
+from .manual_links_dialog import ManualLinksDialog
 from .settings_dialog import MIN_SIZE, SettingsDialog
 
 __all__ = ["run"]
@@ -217,6 +218,18 @@ def run(app, *, verbose: bool = True) -> int:
         app.processEvents()
         check("dialog(以名找歌): 切换「先列出候选」不抛异常",
               not ns.btn_pick.isEnabled())
+        from mmusic.model import Track
+        ns._on_candidates("蒲公英的约定", [Track("migu", "蒲公英的约定", "周杰伦", bitrate=128)])
+        for _ in range(3):
+            app.processEvents()
+        check("dialog(以名找歌): 找到候选后完整首行可见，操作栏不挤压表格",
+              ns.table.viewport().height() >= ns.table.rowHeight(0)
+              and ns.status.width() > ns.width() // 2
+              and ns.btn_search.height() <= ns.btn_search.sizeHint().height() + 4)
+        check("dialog(以名找歌): 歌名列优先于数字列且无无效空白",
+              ns.table.columnWidth(1) > ns.table.columnWidth(3)
+              and sum(ns.table.columnWidth(i) for i in range(ns.table.columnCount()))
+              >= ns.table.viewport().width() - 2)
         ns.resize(*NS_MIN)
         for _ in range(3):
             app.processEvents()
@@ -282,6 +295,17 @@ def run(app, *, verbose: bool = True) -> int:
         check("dialog(按专辑找歌): 最小尺寸下底部按钮仍可见",
               al.btn_search.mapTo(al, QPoint(0, 0)).y() + al.btn_search.height() <= al.height())
         al.close()
+
+        manual = ManualLinksDialog(["https://example.invalid/test.mp3"], win)
+        manual.show()
+        for _ in range(3):
+            app.processEvents()
+        mbox = manual.findChild(QDialogButtonBox)
+        check("dialog(手动补链): 窗口与保存取消均可达，输入语义保持",
+              avail.contains(manual.frameGeometry())
+              and mbox.mapTo(manual, QPoint()).y() + mbox.height() <= manual.height()
+              and manual.entries() == ["https://example.invalid/test.mp3"])
+        manual.close()
 
         dlg.close()
         win.close()

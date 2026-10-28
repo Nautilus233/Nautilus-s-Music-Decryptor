@@ -14,14 +14,16 @@
 """
 from __future__ import annotations
 
+from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QSize, Qt, QTimer
+from PySide6.QtGui import QPainter
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog,
-                               QDialogButtonBox, QFileDialog, QFormLayout,
+                               QDialogButtonBox, QFileDialog, QFrame, QHeaderView,
                                QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit,
-                               QPushButton, QTableWidget, QTableWidgetItem,
-                               QVBoxLayout)
+                               QMenu, QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem,
+                               QVBoxLayout, QWidgetAction)
 
 from mmusic.duration import format_seconds
 from mmusic.match import sanitize_query_text
@@ -34,6 +36,32 @@ MIN_SIZE = (620, 560)
 PREFERRED_SIZE = (980, 780)
 ALBUM_COLUMNS = ["专辑", "歌手", "曲目数", "年份"]   # 合并视图：不展示来源
 TRACK_COLUMNS = ["选择", "歌名", "歌手", "时长", "备注", "状态"]
+
+class _SummaryLabel(QLabel):
+    """Keep literal metadata available while painting a single elided line."""
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setText(text)
+
+    def setText(self, text):  # noqa: N802
+        super().setText(text)
+        self.setToolTip("<qt>" + escape(text) + "</qt>")
+
+    def sizeHint(self):  # noqa: N802
+        return QSize(160, self.fontMetrics().height() + 4)
+
+    def minimumSizeHint(self):  # noqa: N802
+        return QSize(0, self.fontMetrics().height() + 4)
+
+    def paintEvent(self, event):  # noqa: N802
+        painter = QPainter(self)
+        painter.setPen(self.palette().windowText().color())
+        text = self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideRight,
+                                           self.contentsRect().width())
+        painter.drawText(self.contentsRect(), Qt.AlignmentFlag.AlignLeft
+                         | Qt.AlignmentFlag.AlignVCenter, text)
+
 
 def clean_album_query(text: str) -> str:
     """专辑检索词清洗：复用输入审计的序号/说明前缀清洗（只动噪声，不动名称本身）。"""
@@ -68,111 +96,132 @@ class AlbumSearchDialog(QDialog):
         root.setContentsMargins(14, 10, 14, 10)
         root.setSpacing(6)
 
+        heading = QHBoxLayout()
         title = QLabel("专辑下载")
         title.setProperty("role", "title")
-        root.addWidget(title)
-        tip = QLabel("输入专辑名 → 选择专辑 → 下载整张或勾选歌曲"
-                     f"  ·  {self.settings.quality.upper()}（在主窗口调整）")
-        tip.setWordWrap(True)
-        tip.setProperty("role", "muted")
-        root.addWidget(tip)
+        heading.addWidget(title)
+        quality = QLabel(self.settings.quality.upper())
+        quality.setProperty("role", "badge")
+        quality.setToolTip("下载音质，在主窗口调整。")
+        heading.addWidget(quality)
+        heading.addStretch(1)
 
-        form = QFormLayout()
-        form.setSpacing(6)
-        self.name = QLineEdit()
-        self.name.setPlaceholderText("十一月的萧邦 / Lemon / 残酷な天使のテーゼ…")
-        form.addRow("专辑名", self.name)
-        self.artist = QLineEdit()
-        self.artist.setPlaceholderText("选填，例如：周杰伦 / Yorushika")
-        form.addRow("歌手", self.artist)
-        root.addLayout(form)
-
-        opts = QHBoxLayout()
-        self.btn_search = QPushButton("搜索专辑")
-        self.btn_search.setProperty("role", "primary")
-        self.btn_stop = QPushButton("停止")
-        self.btn_stop.setEnabled(False)
-        opts.addWidget(self.btn_search)
-        opts.addWidget(self.btn_stop)
-        opts.addStretch(1)
-        root.addLayout(opts)
-        save_row = QHBoxLayout()
-        save_row.addWidget(QLabel("保存位置"))
-        save_row.addStretch(1)
+        # Less frequent directory actions live in a standard, screen-aware menu.
+        # Keep the existing controls and settings semantics intact.
+        self.btn_location = QPushButton("保存位置…")
+        self.btn_location.setProperty("role", "quiet")
+        self.output_menu = QMenu(self)
+        output_card = QFrame()
+        output_card.setProperty("role", "card")
+        output_layout = QVBoxLayout(output_card)
+        output_label = QLabel("下载保存位置")
+        output_label.setProperty("role", "section")
+        output_layout.addWidget(output_label)
+        self.out_hint = _SummaryLabel()
+        self.out_hint.setMinimumWidth(280)
+        self.out_hint.setProperty("role", "muted")
+        output_layout.addWidget(self.out_hint)
         self.btn_out_dir = QPushButton("更改位置…")
         self.btn_out_dir.setToolTip("单曲和专辑下载共用此保存位置，不影响本地文件的保存设置。")
         self.btn_follow_main = QPushButton("使用默认位置")
         self.btn_follow_main.setToolTip("清掉专用目录，改回：主输出目录 → 默认目录（按需按优）")
         self.btn_open_out = QPushButton("打开文件夹")
-        save_row.addWidget(self.btn_out_dir)
-        save_row.addWidget(self.btn_follow_main)
-        save_row.addWidget(self.btn_open_out)
-        root.addLayout(save_row)
+        for button in (self.btn_out_dir, self.btn_follow_main, self.btn_open_out):
+            output_layout.addWidget(button)
+        output_action = QWidgetAction(self.output_menu)
+        output_action.setDefaultWidget(output_card)
+        self.output_menu.addAction(output_action)
+        self.btn_location.setMenu(self.output_menu)
+        heading.addWidget(self.btn_location)
+        root.addLayout(heading)
 
-        self.out_hint = QLabel("")
-        self.out_hint.setProperty("role", "muted")
-        self.out_hint.setWordWrap(True)
-        root.addWidget(self.out_hint)
+        inputs = QHBoxLayout()
+        self.name = QLineEdit()
+        self.name.setPlaceholderText("专辑名（必填）")
+        self.name.setAccessibleName("专辑名")
+        self.name.setToolTip("输入专辑名，搜索后点击一张专辑即可加载曲目。")
+        self.artist = QLineEdit()
+        self.artist.setPlaceholderText("歌手（选填）")
+        self.artist.setAccessibleName("歌手（选填）")
+        inputs.addWidget(self.name, 3)
+        inputs.addWidget(self.artist, 2)
+        self.btn_search = QPushButton("搜索专辑")
+        self.btn_search.setProperty("role", "primary")
+        self.btn_stop = QPushButton("停止")
+        self.btn_stop.setEnabled(False)
+        inputs.addWidget(self.btn_search)
+        inputs.addWidget(self.btn_stop)
+        root.addLayout(inputs)
 
         head_a = QHBoxLayout()
-        head_a.addWidget(QLabel("搜索结果 · 点击专辑查看歌曲"))
+        album_heading = QLabel("1 · 选择专辑")
+        album_heading.setProperty("role", "section")
+        head_a.addWidget(album_heading)
+        self.album_count = QLabel("共 0 张")
+        self.album_count.setProperty("role", "muted")
+        head_a.addWidget(self.album_count)
         head_a.addStretch(1)
         self.btn_fetch = QPushButton("刷新曲目")
-        self.btn_fetch.setToolTip("点选专辑会自动加载歌曲；点这里重新加载当前专辑。")
+        self.btn_fetch.setProperty("role", "quiet")
+        self.btn_fetch.setToolTip("点击专辑会自动加载歌曲；此处重新加载当前专辑。")
         self.btn_fetch.setEnabled(False)
         head_a.addWidget(self.btn_fetch)
         root.addLayout(head_a)
 
         self.album_table = QTableWidget(0, len(ALBUM_COLUMNS))
         self.album_table.setHorizontalHeaderLabels(ALBUM_COLUMNS)
-        self.album_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.album_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.album_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.album_table.verticalHeader().setVisible(False)
         self.album_table.setMinimumHeight(75)
-        root.addWidget(self.album_table, 1)
+        self._configure_table(self.album_table, (None, 130, 124, 64))
+        root.addWidget(self.album_table, 2)
 
         head_t = QHBoxLayout()
-        self.track_header = QLabel("专辑歌曲 · 先从上方选择一张专辑")
-        self.track_header.setWordWrap(True)
-        head_t.addWidget(self.track_header)
-        head_t.addStretch(1)
+        self.track_header = _SummaryLabel("2 · 专辑歌曲 · 点击上方专辑加载")
+        self.track_header.setProperty("role", "section")
+        head_t.addWidget(self.track_header, 1)
+        self.selection_hint = QLabel("已选 0 / 共 0 首")
+        self.selection_hint.setProperty("role", "summary")
+        head_t.addWidget(self.selection_hint)
         self.btn_all = QPushButton("全选")
         self.btn_none = QPushButton("全不选")
-        self.btn_dl = QPushButton("下载选中")
-        self.btn_dl_all = QPushButton("下载整张专辑")
-        self.btn_dl.setProperty("role", "primary")
-        for b in (self.btn_all, self.btn_none, self.btn_dl, self.btn_dl_all):
-            b.setEnabled(False)
-            head_t.addWidget(b)
+        for button in (self.btn_all, self.btn_none):
+            button.setProperty("role", "quiet")
+            button.setEnabled(False)
+            head_t.addWidget(button)
         root.addLayout(head_t)
 
         self.track_table = QTableWidget(0, len(TRACK_COLUMNS))
         self.track_table.setHorizontalHeaderLabels(TRACK_COLUMNS)
-        self.track_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.track_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.track_table.verticalHeader().setVisible(False)
         self.track_table.setMinimumHeight(100)
-        root.addWidget(self.track_table, 1)
+        self._configure_table(self.track_table, (48, None, 110, 64, 82, 78))
+        root.addWidget(self.track_table, 3)
 
         log_row = QHBoxLayout()
-        log_row.addWidget(QLabel("下载结果"))
-        self.chk_detail = QCheckBox("查看处理详情")
+        log_label = QLabel("处理结果")
+        log_label.setProperty("role", "section")
+        log_row.addWidget(log_label)
+        self.chk_detail = QCheckBox("处理详情")
         log_row.addWidget(self.chk_detail)
-        log_row.addStretch(1)
         self.log_hint = QLabel("")
         self.log_hint.setProperty("role", "muted")
         log_row.addWidget(self.log_hint)
+        self.status = _SummaryLabel("就绪")
+        self.status.setProperty("role", "summary")
+        log_row.addWidget(self.status, 1)
         root.addLayout(log_row)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        self.log.setFixedHeight(66)
+        self.log.setAccessibleName("专辑处理结果")
+        self.log.setFixedHeight(56)
         root.addWidget(self.log)
 
         footer = QHBoxLayout()
-        self.status = QLabel("就绪")
-        self.status.setProperty("role", "muted")
-        footer.addWidget(self.status)
+        self.btn_dl = QPushButton("下载选中")
+        self.btn_dl.setProperty("role", "primary")
+        self.btn_dl_all = QPushButton("下载整张专辑")
+        for button in (self.btn_dl, self.btn_dl_all):
+            button.setEnabled(False)
+            footer.addWidget(button)
         footer.addStretch(1)
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         box.button(QDialogButtonBox.StandardButton.Close).setText("返回主窗口")
@@ -180,6 +229,13 @@ class AlbumSearchDialog(QDialog):
         box.clicked.connect(lambda *_: self.reject())
         footer.addWidget(box)
         root.addLayout(footer)
+
+        for table in (self.album_table, self.track_table):
+            table.model().rowsInserted.connect(self._refresh_counts)
+            table.model().rowsRemoved.connect(self._refresh_counts)
+            table.model().modelReset.connect(self._refresh_counts)
+            table.model().dataChanged.connect(
+                lambda first, last, roles, t=table: self._present_cells(t, first, last, roles))
 
         self.btn_search.clicked.connect(self.search)
         self.btn_stop.clicked.connect(self.stop)
@@ -191,11 +247,53 @@ class AlbumSearchDialog(QDialog):
         self.btn_out_dir.clicked.connect(self._pick_out_dir)
         self.btn_follow_main.clicked.connect(self._follow_main_out_dir)
         self.btn_open_out.clicked.connect(self._open_out_dir)
+        for button in (self.btn_out_dir, self.btn_follow_main, self.btn_open_out):
+            button.clicked.connect(self.output_menu.close)
         self.chk_detail.toggled.connect(self._on_detail_toggled)
         self.album_table.itemSelectionChanged.connect(self._on_album_selected)
         self.album_table.doubleClicked.connect(lambda *_: self.fetch_tracks())
 
         self._refresh_out_hint()
+
+    def _configure_table(self, table, widths) -> None:
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setAlternatingRowColors(True)
+        table.setShowGrid(False)
+        table.setWordWrap(False)
+        table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        rows = table.verticalHeader()
+        rows.hide()
+        rows.setMinimumSectionSize(max(32, table.fontMetrics().height() + 12))
+        rows.setDefaultSectionSize(max(34, table.fontMetrics().height() + 12))
+        rows.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+        header = table.horizontalHeader()
+        header.setMinimumSectionSize(48)
+        for column, width in enumerate(widths):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.Stretch if width is None
+                                        else QHeaderView.ResizeMode.Interactive)
+            if width is not None:
+                table.setColumnWidth(column, width)
+
+    def _present_cells(self, table, first, last, roles) -> None:
+        # Tooltip changes must not recursively overwrite failure explanations.
+        if not roles or Qt.ItemDataRole.DisplayRole in roles:
+            for row in range(first.row(), last.row() + 1):
+                for column in range(first.column(), last.column() + 1):
+                    item = table.item(row, column)
+                    if item is not None:
+                        item.setToolTip("<qt>" + escape(item.text()) + "</qt>")
+        if table is self.track_table and first.column() == 0:
+            self._refresh_counts()
+
+    def _refresh_counts(self, *_args) -> None:
+        total = self.track_table.rowCount()
+        checked = sum(self.track_table.item(row, 0) is not None and
+                      self.track_table.item(row, 0).checkState() == Qt.CheckState.Checked
+                      for row in range(total))
+        self.selection_hint.setText(f"已选 {checked} / 共 {total} 首")
+        self.album_count.setText(f"共 {self.album_table.rowCount()} 张")
 
     # ---------------- 生命周期 ---------------- #
     def showEvent(self, event) -> None:  # noqa: N802
@@ -258,6 +356,7 @@ class AlbumSearchDialog(QDialog):
             self.out_hint.setText(f"保存到：{target}（使用主窗口位置）")
         else:
             self.out_hint.setText(f"保存到：{target}（默认）")
+        self.btn_location.setToolTip("<qt>" + escape(self.out_hint.text()) + "</qt>")
 
     def _pick_out_dir(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, "选择输出目录",
@@ -366,18 +465,18 @@ class AlbumSearchDialog(QDialog):
             old_item = self.album_table.item(self._loaded_row, 0)
             if old_item is not None:
                 old_item.setText(self._albums[self._loaded_row].name)
-                old_item.setToolTip("")
+                old_item.setToolTip("<qt>" + escape(old_item.text()) + "</qt>")
         self._loaded_row = row
         if album is not None and count and 0 <= row < self.album_table.rowCount():
             item = self.album_table.item(row, 0)
             if item is not None:
                 item.setText(f"{album.name} ✓")
-                item.setToolTip(f"已加载 {count} 首曲目（换选其它专辑会自动切换）")
+                item.setToolTip("<qt>" + escape(f"{album.name}\n已加载 {count} 首曲目（换选其它专辑会自动切换）") + "</qt>")
             self.track_header.setText(
-                f"曲目 · 当前：{album.name}（{count} 首；勾选要下载的）")
+                f"2 · {album.name} · {count} 首")
         elif album is not None and count == 0:
             self.track_header.setText(
-                f"曲目 · 当前：{album.name}（未取到曲目）")
+                f"2 · {album.name} · 未取到曲目")
 
     def _refresh_fetch_button(self) -> None:
         has_pick = 0 <= self.album_table.currentRow() < len(self._albums)
@@ -417,7 +516,7 @@ class AlbumSearchDialog(QDialog):
         self._loaded_row = -1
         self.album_table.setRowCount(0)
         self.track_table.setRowCount(0)
-        self.track_header.setText("专辑歌曲 · 先从上方选择一张专辑")
+        self.track_header.setText("2 · 专辑歌曲 · 点击上方专辑加载")
         self._log("=" * 46, "detail")
         self._log(f"▶ 检索专辑：{query}" + (f"（歌手：{self.artist.text().strip()}）" if self.artist.text().strip() else ""))
         self._start_worker(AlbumSearchWorker(self.settings, cache_path=self.config.cache_path,

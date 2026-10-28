@@ -80,6 +80,9 @@ python tests/test_title_alias_evidence.py # API/本地译名置信度、绑定�
 python tests/test_query_suggestions.py  # 失败检索建议：不自动下载、不串字段、无额外联网
 python tests/test_search_failure_matrix.py # 失败入口/空候选/校验失败全链路矩阵
 python tests/test_search_failure_ui.py # 失败建议按钮、清空与旧任务信号隔离
+python tests/test_single_search_layout.py # 单曲建议→重搜→点选：行/列/操作区布局
+python tests/test_workspace_presentation.py # 主窗口与设置页分组、滚动和配置不变
+python tests/test_album_presentation.py # 专辑表格/保存菜单/补链窗口展示矩阵
 # 按需（联网）：python tests/test_album_matrix.py --wide   # 多语种地毯式真源矩阵（23 张）
 # 按需（联网）：python tools/album_sweep.py                # 逐张真源扫射（重构前后对照）
 python tests/test_monkey_ui.py          # 猴子测试：随机乱点全部控件

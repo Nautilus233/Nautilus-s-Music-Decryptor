@@ -16,7 +16,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog,
                                QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
-                               QLabel, QLineEdit, QPlainTextEdit, QPushButton,
+                               QHeaderView, QLabel, QLineEdit, QPlainTextEdit, QPushButton,
                                QSizePolicy, QTableWidget, QTableWidgetItem, QVBoxLayout,
                                QWidget)
 
@@ -48,6 +48,7 @@ class NameSearchDialog(QDialog):
         self.config = config
         self._on_sync = on_sync
         self._fitted = False
+        self._compact_layout = None
         self._worker = None
         self._pending_done = None
         self._retired: "list" = []
@@ -65,11 +66,17 @@ class NameSearchDialog(QDialog):
         root.setContentsMargins(14, 10, 14, 10)
         root.setSpacing(6)
 
+        heading = QHBoxLayout()
         title = QLabel("单曲下载")
         title.setProperty("role", "title")
-        root.addWidget(title)
-        tip = QLabel("输入歌名即可下载。每行一首，可一次粘贴多首。"
-                     f"  输出格式：{self.settings.quality.upper()}（在主窗口调整）")
+        heading.addWidget(title)
+        heading.addStretch(1)
+        quality_note = QLabel(self.settings.quality.upper())
+        quality_note.setProperty("role", "badge")
+        quality_note.setToolTip("三个模式共用输出格式，可在主窗口调整。")
+        heading.addWidget(quality_note)
+        root.addLayout(heading)
+        tip = QLabel("输入歌名先搜索并选择，或自动下载。每行一首，歌手选填。")
         tip.setWordWrap(True)
         tip.setProperty("role", "muted")
         root.addWidget(tip)
@@ -78,7 +85,7 @@ class NameSearchDialog(QDialog):
         form.setSpacing(6)
         self.names = QPlainTextEdit()
         self.names.setPlaceholderText("夜曲\n周杰伦 - 发如雪\n光年之外")
-        self.names.setFixedHeight(76)
+        self.names.setFixedHeight(56)
         form.addRow("歌名", self.names)
         self.artist = QLineEdit()
         self.artist.setPlaceholderText("选填；批量下载时用于上面所有歌曲")
@@ -91,10 +98,6 @@ class NameSearchDialog(QDialog):
         self.chk_auto.setParent(self)
         self.chk_auto.setChecked(True)
         self.chk_auto.hide()
-        mode_help = QLabel("先搜索查看结果并选择下载，或自动匹配下载（支持每行一首）。")
-        mode_help.setWordWrap(True)
-        mode_help.setProperty("role", "muted")
-        root.addWidget(mode_help)
         save_row = QHBoxLayout()
         save_row.addWidget(QLabel("保存位置"))
         save_row.addStretch(1)
@@ -111,6 +114,7 @@ class NameSearchDialog(QDialog):
         self.out_hint = QLabel("")
         self.out_hint.setProperty("role", "muted")
         self.out_hint.setWordWrap(True)
+        self.out_hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         root.addWidget(self.out_hint)
 
         self.table = QTableWidget(0, len(COLUMNS))
@@ -118,9 +122,29 @@ class NameSearchDialog(QDialog):
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
-        self.table.verticalHeader().setVisible(False)
+        self.table.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.table.setWordWrap(False)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        rows = self.table.verticalHeader()
+        rows.setVisible(False)
+        rows.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        rows.setMinimumSectionSize(self.table.fontMetrics().height() + 12)
+        header = self.table.horizontalHeader()
+        header.setStretchLastSection(False)
+        for column in (0, 3, 4, 5):
+            header.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+        header.resizeSection(2, self.table.fontMetrics().horizontalAdvance("歌手 / Artist") + 32)
         self.table.setAlternatingRowColors(True)
         root.addWidget(self.table, 3)
+
+        self._failure_hint = QLabel()
+        self._failure_hint.setTextFormat(Qt.TextFormat.PlainText)
+        self._failure_hint.setWordWrap(True)
+        self._failure_hint.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        root.addWidget(self._failure_hint)
+        self._failure_hint.hide()
 
         self._suggestion_area = QWidget()
         suggestion_layout = QVBoxLayout(self._suggestion_area)
@@ -162,8 +186,11 @@ class NameSearchDialog(QDialog):
         self.status.setProperty("role", "muted")
         self.status.setWordWrap(True)
         self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-        act.addWidget(self.status)
         root.addLayout(act)
+        # A wrapped label inside the button row can receive zero width and
+        # reserve hundreds of pixels vertically. Give it the full row width;
+        # the candidate table keeps the remaining vertical space.
+        root.addWidget(self.status)
 
         log_row = QHBoxLayout()
         log_row.addWidget(QLabel("下载结果"))
@@ -176,7 +203,7 @@ class NameSearchDialog(QDialog):
         root.addLayout(log_row)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
-        self.log.setFixedHeight(72)
+        self.log.setFixedHeight(56)
         root.addWidget(self.log)
 
         box = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
@@ -206,6 +233,17 @@ class NameSearchDialog(QDialog):
             self._fitted = True
             geometry.fit(self, preferred=PREFERRED_SIZE, minimum=MIN_SIZE,
                          center_on=self.parentWidget())
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        compact = self.height() < 640
+        if compact != self._compact_layout:
+            self._compact_layout = compact
+            self.layout().setContentsMargins(12 if compact else 14, 8 if compact else 10,
+                                            12 if compact else 14, 8 if compact else 10)
+            self.layout().setSpacing(4 if compact else 6)
+            self.names.setFixedHeight(44 if compact else 56)
+            self.log.setFixedHeight(44 if compact else 56)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         if self._worker is not None:
@@ -264,6 +302,8 @@ class NameSearchDialog(QDialog):
         else:
             self.out_hint.setText(f"保存到：{target}（默认）"
                                   "（可更改）")
+        from html import escape
+        self.out_hint.setToolTip("<qt>" + escape(self.out_hint.text()) + "</qt>")
 
     def _pick_out_dir(self) -> None:
         start = str(self.effective_out_dir())
@@ -324,6 +364,8 @@ class NameSearchDialog(QDialog):
 
     def _clear_suggestions(self) -> None:
         self._suggestion_choices.clear()
+        self._failure_hint.clear()
+        self._failure_hint.hide()
         self._suggestion_area.hide()
         for button in self._suggestion_buttons:
             button.setText("")
@@ -333,6 +375,10 @@ class NameSearchDialog(QDialog):
 
     def _on_suggestions(self, suggestions) -> None:
         if not self._accept_worker_signal():
+            return
+        # A later song without hints must not discard usable batch suggestions.
+        if (not suggestions and self._worker is not None
+                and self._worker.mode == NameSearchWorker.MODE_AUTO):
             return
         self._clear_suggestions()
         for item in suggestions or ():
@@ -353,10 +399,22 @@ class NameSearchDialog(QDialog):
             button.show()
         self._suggestion_area.setVisible(bool(self._suggestion_choices))
         self._update_actions()
-        if self._suggestion_choices:
-            names = "；".join(title + (f"（{artist}）" if artist else "")
-                             for title, artist in self._suggestion_choices)
-            self._log(f"你可能想找的歌是：{names}？")
+
+    def _show_failure(self, message: str, *, search: bool = False) -> None:
+        # The persistent summary must survive log scrolling and detail filtering.
+        # Structured choices already have buttons; don't repeat their suffix here.
+        summary = message
+        for marker in ("你可能想找的歌是：", "你可能想搜："):
+            summary = summary.split(marker, 1)[0]
+        summary = " ".join(summary.split()) or "没有可下载的候选"
+        from html import escape
+        self._failure_hint.setToolTip("<qt>" + escape(summary) + "</qt>")
+        if len(summary) > 180:
+            summary = summary[:179] + "…"
+        if search and not self._suggestion_choices:
+            summary += "\n未找到足够接近曲名的建议；可尝试精简歌名或补充歌手。"
+        self._failure_hint.setText(summary)
+        self._failure_hint.show()
 
     @staticmethod
     def _suggestion_tooltip(title: str, artist: str) -> str:
@@ -394,15 +452,7 @@ class NameSearchDialog(QDialog):
             self.log_hint.setText(f"已折叠 {self._hidden_details} 行明细")
 
     def _log(self, message: str, level: str = "result") -> None:
-        # Suggestions are results even if a worker reports them as detail, or
-        # attaches them after a long diagnostic. Never truncate the suffix.
-        for marker in ("你可能想找的歌是：", "你可能想搜："):
-            pos = message.find(marker)
-            if pos >= 0:
-                if pos:
-                    self._log(message[:pos].rstrip(), level)
-                message, level = message[pos:], "result"
-                break
+        # Diagnostics stay diagnostics, even if they mention a suggestion.
         self._log_lines.append((message, level))
         if len(self._log_lines) > 4000:
             # Verbose diagnostics must not evict the current failure suggestion.
@@ -428,7 +478,10 @@ class NameSearchDialog(QDialog):
         self.table.item(row, 0).setText(status)
         for name, value in cells.items():
             col = COLUMNS.index(name)
-            self.table.item(row, col).setText(str(value))
+            text = str(value)
+            self.table.item(row, col).setText(text)
+            from html import escape
+            self.table.item(row, col).setToolTip("<qt>" + escape(text) + "</qt>")
         return row
 
     # ---------------- 跑任务 ---------------- #
@@ -555,7 +608,7 @@ class NameSearchDialog(QDialog):
         ref = (f"，跨平台参考时长 {format_seconds(self._candidate_reference)}"
                if self._candidate_reference else "")
         if not self._candidates:
-            self._clear_suggestions()
+            self._show_failure("没有可下载的候选", search=True)
             self._log("⚠ 没有可下载的候选")
             self.status.setText("没有可下载的候选")
         if self._candidates:
@@ -575,8 +628,16 @@ class NameSearchDialog(QDialog):
     def _on_file_done(self, res) -> None:
         if not self._accept_worker_signal():
             return
-        if res.ok:
+        mode = getattr(self._worker, "mode", None)
+        if res.ok and mode != NameSearchWorker.MODE_AUTO:
             self._clear_suggestions()
+        elif res.status == "failed":
+            # Preserve the explanation associated with retained batch choices.
+            if getattr(res, "suggestions", ()) or not self._suggestion_choices:
+                label = getattr(res, "name", "")
+                self._show_failure((f"{label}：" if label else "")
+                                   + (res.message or "未能完成下载"),
+                                   search=mode != NameSearchWorker.MODE_PICK)
         if self._pick_row >= 0 and str(res.path).startswith(SEARCH_PREFIX):
             self._mark_picked("已完成" if res.ok else "失败")
         else:
@@ -601,6 +662,8 @@ class NameSearchDialog(QDialog):
             self._mark_picked("已完成" if results[0].ok else "失败")
             if results[0].ok:
                 self._clear_suggestions()
+            else:
+                self._show_failure(results[0].message or "下载校验未通过")
         skipped = sum(1 for r in results if r.status == "skipped")
         self.status.setText(f"完成：成功 {ok} · 跳过 {skipped} · 失败 {fail}"
                             if skipped else f"完成：成功 {ok} · 失败 {fail}")
@@ -615,5 +678,7 @@ class NameSearchDialog(QDialog):
                             if len(self._candidates) > 1
                             else "失败（原因见下载结果）")
         self._mark_picked("失败")
+        self._show_failure(message, search=not self._candidates
+                           and getattr(self._worker, "mode", None) != NameSearchWorker.MODE_PICK)
         self._log(f"❌ {message}")
         self._pick_row = -1

@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog,
                                QComboBox, QDialogButtonBox, QDoubleSpinBox, QFileDialog,
                                QFormLayout, QFrame, QGroupBox, QHBoxLayout,
                                QLabel, QLineEdit, QListWidget, QPushButton,
-                               QScrollArea, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
+                               QScrollArea, QSizePolicy, QSpinBox, QTabWidget, QVBoxLayout, QWidget)
 
 from . import geometry, theme
 
@@ -38,32 +38,44 @@ class SettingsDialog(QDialog):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ---- scrollable body ----------------------------------------
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-
-        content = QWidget()
-        body = QVBoxLayout(content)
-        body.setContentsMargins(14, 12, 14, 12)
-        body.setSpacing(10)
-
+        # Heading and footer belong to the dialog, not any scrolling page.
         heading = QLabel("设置")
         heading.setProperty("role", "title")
-        body.addWidget(heading)
-        appearance = QGroupBox("外观")
-        appearance_form = QFormLayout(appearance)
+        header = QHBoxLayout()
+        header.setContentsMargins(16, 10, 16, 2)
+        header.addWidget(heading)
+        header.addStretch(1)
+        root.addLayout(header)
+
+        def note(text):
+            label = QLabel(text)
+            label.setWordWrap(True)
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setProperty("role", "summary")
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            return label
+
+        def responsive_form(group):
+            layout = QFormLayout(group)
+            layout.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+            layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+            layout.setHorizontalSpacing(12)
+            layout.setVerticalSpacing(8)
+            return layout
+
+        appearance = QGroupBox("界面外观")
+        appearance_form = responsive_form(appearance)
         self.appearance = QComboBox()
         for label, value in theme.MODES:
             self.appearance.addItem(label, value)
         self.appearance.setToolTip("跟随系统：Windows 切换深浅色时，界面自动同步；点击保存后生效。")
         appearance_form.addRow("界面颜色", self.appearance)
-        body.addWidget(appearance)
 
         # -- sources ---------------------------------------------------
         gb_src = QGroupBox("搜索来源")
         v = QVBoxLayout(gb_src)
+        v.addWidget(note("用于单曲、专辑搜索与备用下载；本地解密不依赖在线来源。"))
         self.source_boxes: "dict[str, QCheckBox]" = {}
         self.specs = all_specs(self.settings.to_dict())
         for spec in self.specs:
@@ -72,11 +84,10 @@ class SettingsDialog(QDialog):
                 cb.setToolTip(spec.license_note)
             self.source_boxes[spec.id] = cb
             v.addWidget(cb)
-        body.addWidget(gb_src)
 
         # -- network / generic ----------------------------------------
         gb_net = QGroupBox("网络与接口（通常无需修改）")
-        form = QFormLayout(gb_net)
+        form = responsive_form(gb_net)
         self.timeout = QDoubleSpinBox()
         self.timeout.setRange(3, 120)
         self.timeout.setSuffix(" 秒")
@@ -87,112 +98,119 @@ class SettingsDialog(QDialog):
         self.min_bitrate.setSuffix(" kbps")
         self.agg_base = QLineEdit()
         self.agg_provider = QLineEdit()
+        self.agg_base.setMinimumWidth(0)
+        self.agg_base.setPlaceholderText("留空使用默认接口")
+        self.agg_provider.setMinimumWidth(0)
+        self.agg_provider.setPlaceholderText("netease")
+        self.timeout.setToolTip("每次网络请求的超时上限。")
+        self.retries.setToolTip("请求失败后的重试次数。")
+        self.min_bitrate.setToolTip("下载候选的最低码率要求；0 表示不限制。")
         form.addRow("请求超时", self.timeout)
         form.addRow("重试次数", self.retries)
         form.addRow("最低码率", self.min_bitrate)
         form.addRow("聚合接口地址", self.agg_base)
         form.addRow("聚合默认平台", self.agg_provider)
-        body.addWidget(gb_net)
 
         # -- QQ 凭证（按需静默获取 ekey）--------------------------------
         gb_ekey = QGroupBox("QQ 音乐账号配置")
-        gb_ekey.setCheckable(True)          # 折叠：同事默认看不到内容，也不会误改
+        gb_ekey.setCheckable(True)          # 保留原开关语义：未配置时禁用编辑区。
         gb_ekey.setChecked(False)
         self.gb_ekey = gb_ekey
-        ef = QFormLayout(gb_ekey)
+        ef = responsive_form(gb_ekey)
         self.qq_uin = QLineEdit()
         self.qq_uin.setPlaceholderText("你的 QQ 号")
         self.qq_key = QLineEdit()
         self.qq_key.setEchoMode(QLineEdit.EchoMode.Password)
         self.qq_key.setPlaceholderText("qqmusic_key（整条 Cookie 直接粘贴也行）")
+        self.qq_uin.setMinimumWidth(0)
+        self.qq_key.setMinimumWidth(0)
+        self.qq_key.setToolTip("仅保存在本机 settings.json，用于官方取钥匙接口；留空关闭。")
         ef.addRow("QQ 号", self.qq_uin)
         ef.addRow("会话 Cookie", self.qq_key)
         btn_row = QHBoxLayout()
         btn_paste = QPushButton("从剪贴板粘贴 Cookie")
         btn_clear = QPushButton("清空")
+        btn_clear.setProperty("role", "quiet")
         btn_paste.clicked.connect(self._paste_cookie)
         btn_clear.clicked.connect(self._clear_cookie)
         btn_row.addWidget(btn_paste)
         btn_row.addWidget(btn_clear)
         btn_row.addStretch(1)
         ef.addRow(btn_row)
-        self.qq_feedback = QLabel("")
-        self.qq_feedback.setProperty("role", "muted")
+        self.qq_feedback = note("")
         ef.addRow(self.qq_feedback)
-        hint = QLabel("配置一次即可：之后拖入新版加密歌曲会自动取钥匙，无需再设置。Cookie 仅存本机、"
-                      "日志不会输出；等价于登录凭证，改密/退出登录即失效。留空即关闭该功能。")
-        hint.setProperty("role", "muted")
-        hint.setWordWrap(True)
+        hint = note("可选：用于新版加密文件自动取钥匙。Cookie 仅存本机，日志不会输出；"
+                    "改密或退出登录后可能失效。留空即关闭，不影响其他功能。")
         ef.addRow(hint)
-        body.addWidget(gb_ekey)
 
         # -- local dirs ------------------------------------------------
-        gb_local = QGroupBox("本地曲库目录（可选，离线优先命中）")
+        gb_local = QGroupBox("本地曲库")
         lv = QVBoxLayout(gb_local)
+        lv.addWidget(note("可选目录，用于优先查找电脑里已有的歌曲。"))
         self.local_list = QListWidget()
         self.local_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.local_list.setMinimumHeight(88)          # keeps the form compact
+        self.local_list.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.local_list.setToolTip("本地曲库的完整目录；支持多选移除。")
         lv.addWidget(self.local_list)
         row = QHBoxLayout()
         add = QPushButton("添加目录…")
         rm = QPushButton("移除所选")
+        rm.setProperty("role", "quiet")
         add.clicked.connect(self._add_local_dir)
         rm.clicked.connect(self._remove_local_dirs)
         row.addWidget(add)
         row.addWidget(rm)
         row.addStretch(1)
         lv.addLayout(row)
-        body.addWidget(gb_local)
 
         # -- behaviour -------------------------------------------------
-        gb_beh = QGroupBox("日常使用")
+        gb_beh = QGroupBox("处理方式")
         bv = QVBoxLayout(gb_beh)
-        self.chk_fallback = QCheckBox("本地文件无法转换时，自动查找同一首歌")
+        self.chk_fallback = QCheckBox("转换失败时，自动查找同一首歌")
         self.chk_meta = QCheckBox("保存歌名、歌手、专辑和封面信息")
         self.chk_cover = QCheckBox("在线补齐封面")
         self.chk_overwrite = QCheckBox("同名文件直接覆盖（否则自动加序号）")
         self.chk_keep = QCheckBox("保留原始加密文件")
         self.chk_cache = QCheckBox("跳过已经处理过的文件")
         self.chk_auto = QCheckBox("添加文件后自动开始")
-        self.chk_fast = QCheckBox("极速模式（更快，减少多来源交叉核对）")
+        self.chk_fast = QCheckBox("极速模式（减少多来源交叉核对）")
         self.chk_fast.setToolTip("开启后取歌更快，但不再用其它平台的时长互相印证；\n"
                                  "默认关闭 = 精确优先。歌名/歌手门槛与下载校验不受影响。")
-        for cb in (self.chk_fallback, self.chk_meta, self.chk_cover,
-                   self.chk_overwrite, self.chk_keep, self.chk_cache, self.chk_auto,
-                   self.chk_fast):
+        for cb in (self.chk_auto, self.chk_fallback, self.chk_fast):
             bv.addWidget(cb)
-        body.addWidget(gb_beh)
+        gb_files = QGroupBox("文件保留与重复处理")
+        files_layout = QVBoxLayout(gb_files)
+        for cb in (self.chk_keep, self.chk_cache, self.chk_overwrite):
+            files_layout.addWidget(cb)
+        gb_tags = QGroupBox("歌曲信息")
+        tags_layout = QVBoxLayout(gb_tags)
+        for cb in (self.chk_meta, self.chk_cover):
+            tags_layout.addWidget(cb)
 
-        # Move existing controls into pages; their values and save callbacks stay intact.
-        for group in (gb_src, gb_net, gb_ekey, gb_local, gb_beh):
-            body.removeWidget(group)
-        body.addWidget(gb_beh)
-        body.addStretch(1)
-        scroll.setWidget(content)
         self.tabs = QTabWidget()
-        self.tabs.addTab(scroll, "常用设置")
-        for title, groups in (("账号配置", (gb_ekey,)),
+        self.tabs.setUsesScrollButtons(True)
+        for title, groups in (("常用设置", (appearance, gb_beh, gb_files, gb_tags)),
+                              ("账号配置", (gb_ekey,)),
                               ("高级设置", (gb_src, gb_net, gb_local))):
             page = QWidget()
             layout = QVBoxLayout(page)
             layout.setContentsMargins(14, 12, 14, 12)
-            if title == "账号配置":
-                help_text = QLabel("仅管理员需要配置。已有登录信息可继续使用，无需重复填写。")
-                help_text.setWordWrap(True)
-                help_text.setProperty("role", "muted")
-                layout.addWidget(help_text)
+            layout.setSpacing(10)
             for group in groups:
                 layout.addWidget(group)
             layout.addStretch(1)
             area = QScrollArea()
             area.setWidgetResizable(True)
             area.setFrameShape(QFrame.Shape.NoFrame)
+            area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             area.setWidget(page)
             self.tabs.addTab(area, title)
         root.addWidget(self.tabs, 1)
 
         # ---- pinned footer (always visible) --------------------------
         footer = QWidget()
+        footer.setProperty("role", "toolbar")
         fv = QVBoxLayout(footer)
         fv.setContentsMargins(14, 8, 14, 12)
         fv.setSpacing(8)
@@ -263,10 +281,10 @@ class SettingsDialog(QDialog):
                 name, _, value = part.strip().partition("=")
                 if name.strip().lower() in ("qqmusic_uin", "uin") and value.strip():
                     self.qq_uin.setText(value.strip())
-            self.qq_feedback.setText(f"✓ 已粘贴整条 Cookie（末尾 …{raw[-12:]}）")
+            self.qq_feedback.setText("已粘贴整条 Cookie（保存后生效）")
         else:
             self.qq_key.setText(raw)
-            self.qq_feedback.setText(f"✓ 已粘贴 qqmusic_key（末尾 …{raw[-8:]}）")
+            self.qq_feedback.setText("已粘贴 qqmusic_key（保存后生效）")
 
     def _clear_cookie(self) -> None:
         self.qq_uin.clear()

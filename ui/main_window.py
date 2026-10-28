@@ -1,15 +1,17 @@
 """The main application window."""
 from __future__ import annotations
 
+from html import escape
 from pathlib import Path
 
-from PySide6.QtCore import QRect, QSettings, Qt, QTimer, QUrl
+from PySide6.QtCore import QRect, QSettings, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import (QColor, QDesktopServices, QDragEnterEvent,
-                           QDropEvent, QIcon)
+                           QDropEvent, QIcon, QPainter)
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox,
                                QApplication, QFileDialog, QFrame, QHBoxLayout, QHeaderView,
                                QLabel, QLineEdit, QMainWindow, QMessageBox,
                                QPlainTextEdit, QProgressBar, QPushButton,
+                               QSizePolicy,
                                QTableWidget, QTableWidgetItem, QVBoxLayout,
                                QWidget)
 
@@ -37,6 +39,37 @@ _STATUS = {
 }
 
 
+class _SummaryLabel(QLabel):
+    """One bounded line; full status stays available even in a narrow window."""
+
+    def __init__(self, text="", parent=None):
+        super().__init__(parent)
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+        self.setMinimumWidth(0)
+        self.setProperty("role", "summary")
+        self.setText(text)
+
+    def setText(self, text):  # noqa: N802
+        super().setText(text)
+        self.setToolTip("<qt>" + escape(text) + "</qt>")
+        self.setAccessibleDescription(text)
+
+    def sizeHint(self):  # noqa: N802
+        return QSize(160, self.fontMetrics().height() + 4)
+
+    def minimumSizeHint(self):  # noqa: N802
+        return QSize(0, self.fontMetrics().height() + 4)
+
+    def paintEvent(self, event):  # noqa: N802
+        painter = QPainter(self)
+        painter.setPen(self.palette().windowText().color())
+        text = self.fontMetrics().elidedText(self.text(), Qt.TextElideMode.ElideRight,
+                                           self.contentsRect().width())
+        painter.drawText(self.contentsRect(), Qt.AlignmentFlag.AlignLeft
+                         | Qt.AlignmentFlag.AlignVCenter, text)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, config: AppConfig, initial_paths=None) -> None:
         super().__init__()
@@ -58,8 +91,9 @@ class MainWindow(QMainWindow):
         # every control must stay reachable even on a short screen / tall
         # taskbar; the final size is applied in showEvent(), where the window
         # frame (title bar/borders) is known and can be kept fully on-screen.
-        self.setMinimumSize(820, 520)
+        self.setMinimumSize(820, 500)
         self._geometry_ready = False
+        self._compact_layout = None
         self.setAcceptDrops(True)
 
         self._build_ui()
@@ -87,6 +121,7 @@ class MainWindow(QMainWindow):
         head.addWidget(subtitle)
         header.addLayout(head, 1)
         self.btn_manual = QPushButton("提供音频链接…")
+        self.btn_manual.setProperty("role", "quiet")
         self.btn_manual.setToolTip("高级操作：使用自己提供的链接或本地路径，优先于自动搜索")
         self.btn_settings = QPushButton("设置")
         header.addWidget(self.btn_manual)
@@ -106,91 +141,114 @@ class MainWindow(QMainWindow):
             navigation.addWidget(button, 1)
         outer.addLayout(navigation)
 
-        options = QHBoxLayout()
+        # Shared output preferences are secondary to the task entry points.
+        output_tools = QFrame()
+        output_tools.setProperty("role", "toolbar")
+        options = QHBoxLayout(output_tools)
+        options.setContentsMargins(10, 6, 10, 6)
+        options.setSpacing(8)
         options.addWidget(QLabel("输出格式"))
         self.quality = QComboBox()
         self.quality.addItem("MP3 · 通用播放", "mp3")
         self.quality.addItem("FLAC · 优先无损", "flac")
         self.quality.addItem("WAV · 优先无损", "wav")
-        self.quality.setMinimumContentsLength(15)
+        self.quality.setMinimumContentsLength(11)
         self.quality.setToolTip("找不到无损源时保留有损格式，不进行无效升格；三个模式共用此选项。")
         options.addWidget(self.quality)
-        options.addStretch(1)
-        output_note = QLabel("格式选择也适用于单曲和专辑下载")
-        output_note.setProperty("role", "muted")
-        options.addWidget(output_note)
-        outer.addLayout(options)
+        options.addWidget(QLabel("保存到"))
+        self.out_dir = QLineEdit()
+        self.out_dir.setMinimumWidth(0)
+        self.out_dir.setPlaceholderText("原文件所在文件夹（默认）")
+        self.out_dir.setToolTip("留空时，本地文件保存在原文件夹；单曲和专辑下载沿用各自默认目录。")
+        options.addWidget(self.out_dir, 1)
+        self.btn_out_dir = QPushButton("更改位置…")
+        self.btn_open_out = QPushButton("打开文件夹")
+        self.btn_open_out.setProperty("role", "quiet")
+        self.btn_open_out.setToolTip("打开上次输出或设置的文件夹")
+        options.addWidget(self.btn_out_dir)
+        options.addWidget(self.btn_open_out)
+        outer.addWidget(output_tools)
 
         # toolbar
         bar = QHBoxLayout()
         bar.setSpacing(8)
+        queue_title = QLabel("本地文件")
+        queue_title.setProperty("role", "section")
+        bar.addWidget(queue_title)
+        self.queue_count = QLabel("0 个文件")
+        self.queue_count.setProperty("role", "badge")
+        bar.addWidget(self.queue_count)
+        bar.addStretch(1)
         self.btn_add_files = QPushButton("添加文件")
         self.btn_add_dir = QPushButton("添加文件夹")
         self.btn_remove = QPushButton("移除所选")
         self.btn_clear = QPushButton("清空列表")
+        self.btn_remove.setProperty("role", "quiet")
+        self.btn_clear.setProperty("role", "quiet")
         for b in (self.btn_add_files, self.btn_add_dir, self.btn_remove, self.btn_clear):
             bar.addWidget(b)
-        bar.addStretch(1)
-
         outer.addLayout(bar)
-
-        # Saving controls are separate from the three task entry points.
-        out_row = QHBoxLayout()
-        out_row.setSpacing(8)
-        out_row.addWidget(QLabel("保存到"))
-        self.out_dir = QLineEdit()
-        self.out_dir.setPlaceholderText("原文件所在文件夹（默认）")
-        out_row.addWidget(self.out_dir, 1)
-        self.btn_out_dir = QPushButton("更改位置…")
-        self.btn_open_out = QPushButton("打开文件夹")
-        self.btn_open_out.setToolTip("打开上次输出或设置的文件夹")
-        out_row.addWidget(self.btn_out_dir)
-        out_row.addWidget(self.btn_open_out)
-        outer.addLayout(out_row)
-        queue_title = QLabel("文件列表 · 可直接把文件或文件夹拖到这里")
-        queue_title.setProperty("role", "section")
-        outer.addWidget(queue_title)
 
         # table
         self.table = QTableWidget(0, 5)
         self.table.setHorizontalHeaderLabels(["文件名", "状态", "格式", "输出文件", "说明"])
         self.table.verticalHeader().setVisible(False)
+        self.table.verticalHeader().setDefaultSectionSize(36)
+        self.table.verticalHeader().setMinimumSectionSize(32)
+        self.table.setWordWrap(False)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideRight)
+        self.table.setShowGrid(False)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         hh = self.table.horizontalHeader()
+        hh.setMinimumSectionSize(52)
         hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
         hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
         hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
-        self.table.setColumnWidth(1, 80)
-        self.table.setColumnWidth(2, 60)
+        self.table.setColumnWidth(1, 88)
+        self.table.setColumnWidth(2, 64)
+        for col, tip in enumerate(("原始文件名；悬停查看完整路径", "当前文件的处理状态",
+                                   "实际输出格式", "输出文件名；悬停查看完整路径",
+                                   "处理说明；悬停查看完整内容")):
+            self.table.horizontalHeaderItem(col).setToolTip(tip)
         self.table.setMinimumHeight(100)
-        outer.addWidget(self.table, 3)
+        outer.addWidget(self.table, 5)
+
+        # An overlay leaves the empty queue the same size as the populated one.
+        empty_layout = QVBoxLayout(self.table.viewport())
+        empty_layout.setContentsMargins(12, 0, 12, 0)
+        self.empty_state = QLabel("拖入文件或文件夹，或点击「添加文件」\n支持 NCM、QMC 及常见音频格式")
+        self.empty_state.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.empty_state.setProperty("role", "subtitle")
+        self.empty_state.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        empty_layout.addWidget(self.empty_state)
+        self.table.model().rowsInserted.connect(self._update_queue_presentation)
+        self.table.model().rowsRemoved.connect(self._update_queue_presentation)
+        self.table.model().modelReset.connect(self._update_queue_presentation)
 
         # progress
-        prog_row = QHBoxLayout()
+        self.status_label = _SummaryLabel("等待添加文件")
+        self.status_label.setAccessibleName("处理状态")
+        outer.addWidget(self.status_label)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.setValue(0)
-        self.status_label = QLabel("等待添加文件")
-        self.status_label.setProperty("role", "muted")
-        prog_row.addWidget(self.progress, 1)
-        prog_row.addWidget(self.status_label)
-        outer.addLayout(prog_row)
 
         # log（默认只显示"结论"，明细收进「显示详细信息」）
         log_row = QHBoxLayout()
-        log_row.addWidget(QLabel("处理结果"))
+        log_title = QLabel("处理结果")
+        log_title.setProperty("role", "section")
+        log_row.addWidget(log_title)
         self.chk_detail = QCheckBox("查看处理详情")
         self.chk_detail.setToolTip("展开每个音源的排除统计、时长探测、降权说明等过程明细")
         self.chk_detail.toggled.connect(self._on_detail_toggled)
         log_row.addWidget(self.chk_detail)
         log_row.addStretch(1)
-        self.log_hint = QLabel("")
-        self.log_hint.setProperty("role", "muted")
-        log_row.addWidget(self.log_hint)
+        self.log_hint = _SummaryLabel()
+        log_row.addWidget(self.log_hint, 1)
         outer.addLayout(log_row)
 
         self.log = QPlainTextEdit()
@@ -198,11 +256,12 @@ class MainWindow(QMainWindow):
         self.log.setMaximumBlockCount(4000)
         self.log.setPlaceholderText("每个文件的处理结果会显示在这里。")
         self.log.setMinimumHeight(60)
-        outer.addWidget(self.log, 2)
+        self.log.setMaximumHeight(96)
+        outer.addWidget(self.log, 1)
 
         # actions
         act = QHBoxLayout()
-        act.addStretch(1)
+        act.addWidget(self.progress, 1)
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setProperty("role", "danger")
         self.btn_stop.setEnabled(False)
@@ -226,6 +285,11 @@ class MainWindow(QMainWindow):
         self.btn_start.clicked.connect(self.start_job)
         self.btn_open_out.clicked.connect(self._open_out_dir)
         self.btn_stop.clicked.connect(self.stop_job)
+
+    def _update_queue_presentation(self, *_args) -> None:
+        count = self.table.rowCount()
+        self.queue_count.setText(f"{count} 个文件")
+        self.empty_state.setVisible(count == 0)
 
     # ------------------------------------------------------------------ #
     def _load_settings_into_ui(self) -> None:
@@ -274,6 +338,16 @@ class MainWindow(QMainWindow):
             self._geometry_ready = True
             if not self._restore_geometry():
                 self._fit_to_screen()
+
+    def resizeEvent(self, event) -> None:  # noqa: N802
+        super().resizeEvent(event)
+        compact = self.height() < 620
+        if compact != self._compact_layout:
+            self._compact_layout = compact
+            layout = self.centralWidget().layout()
+            layout.setContentsMargins(12 if compact else 16, 8 if compact else 12,
+                                      12 if compact else 16, 8 if compact else 12)
+            layout.setSpacing(4 if compact else 6)
 
     def _focus_file_list(self) -> None:
         self.table.setFocus()
@@ -324,7 +398,7 @@ class MainWindow(QMainWindow):
         row = self.table.rowCount()
         self.table.insertRow(row)
         name_item = QTableWidgetItem(path.name)
-        name_item.setToolTip(key)
+        name_item.setToolTip("<qt>" + escape(key) + "</qt>")
         name_item.setData(Qt.ItemDataRole.UserRole, key)
         self.table.setItem(row, 0, name_item)
         self._set_cell(row, 1, "pending")
@@ -337,6 +411,7 @@ class MainWindow(QMainWindow):
     def _set_cell(self, row: int, col: int, status: str) -> None:
         text, color = _STATUS.get(status, (status, "#8b93a7"))
         item = QTableWidgetItem(text)
+        item.setToolTip("<qt>" + escape(text) + "</qt>")
         item.setForeground(QColor(color))
         self.table.setItem(row, col, item)
 
@@ -470,6 +545,9 @@ class MainWindow(QMainWindow):
         self.table.item(row, 2).setText((res.fmt or "").upper())
         self.table.item(row, 3).setText(Path(res.out_path).name if res.out_path else "")
         self.table.item(row, 4).setText(res.message + (f" · 来源 {res.source}" if res.source and res.status == "downloaded" else ""))
+        self.table.item(row, 2).setToolTip("<qt>" + escape(self.table.item(row, 2).text()) + "</qt>")
+        self.table.item(row, 3).setToolTip("<qt>" + escape(res.out_path or "") + "</qt>")
+        self.table.item(row, 4).setToolTip("<qt>" + escape(self.table.item(row, 4).text()) + "</qt>")
         self.table.scrollToItem(self.table.item(row, 0))
         if res.out_path:
             self._last_out_dir = str(Path(res.out_path).parent)

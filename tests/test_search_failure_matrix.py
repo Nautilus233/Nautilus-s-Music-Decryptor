@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import copy
+from itertools import permutations, product
 import sys
 import tempfile
 import unittest
@@ -48,6 +49,7 @@ class SearchFailureMatrixTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory(prefix="failure_matrix_")
         self.root = Path(self.tmp.name)
         self.pipes = []
+        self.pipe_number = 0
         self.logs = []
 
     def tearDown(self):
@@ -55,10 +57,13 @@ class SearchFailureMatrixTests(unittest.TestCase):
             pipe.close()
         self.tmp.cleanup()
 
-    def pipe(self, sources):
-        number = len(self.pipes)
-        pipe = Pipeline(Settings(remember_hashes=False, fetch_cover=False,
-                                 output_dir=str(self.root / "output"), retries=0),
+    def pipe(self, sources, **preferences):
+        number = self.pipe_number
+        self.pipe_number += 1
+        settings = dict(remember_hashes=False, fetch_cover=False,
+                        output_dir=str(self.root / "output"), retries=0)
+        settings.update(preferences)
+        pipe = Pipeline(Settings(**settings),
                         sources=sources, cache_path=self.root / f"c{number}.json",
                         index_path=self.root / f"i{number}.db",
                         on_log=lambda message, level="detail": self.logs.append((message, level)))
@@ -130,6 +135,7 @@ class SearchFailureMatrixTests(unittest.TestCase):
                     pipe.search_candidates_ex("Unfamiliar Long Melody", artist="yorushika")
                 self.assertEqual(error.exception.suggestions, ())
                 self.assertNotIn("你可能想找", error.exception.message)
+                self.assertIn("未形成可靠的检索建议", error.exception.message)
 
     def test_hints_are_per_query_not_carried_into_next_request(self):
         source = MetadataSource([Track("matrix", "Unfamiliar Long Melodi", "ヨルシカ")])
@@ -185,6 +191,162 @@ class SearchFailureMatrixTests(unittest.TestCase):
         for text in ("夜曲", "夜", "!!!!", "Unrelated strings", "x" * 10000):
             self.assertEqual(suggestion_queries([(text, "")]), [])
         self.assertFalse((self.root / "output").exists())
+
+    def test_format_fast_cache_and_all_configured_source_orders(self):
+        class CatalogSource(MetadataSource):
+            def search(self, query, **kwargs):
+                self.queries.append(query)
+                if query == "夜曲":
+                    if self.name in {"migu", "kugou"}:
+                        return [Track(self.name, "夜曲", "周杰伦"),
+                                Track(self.name, "夜曲 (Live)", "周杰伦")]
+                    return [Track(self.name, "夜曲", "别的歌手")]
+                return [Track(self.name, "完全不同的曲名", "甲歌手")]
+
+        # Actual user order is included, together with every permutation.
+        for quality, fast, cached, order in product(
+                ("mp3", "flac", "wav"), (False, True), (False, True),
+                permutations(("kuwo", "kugou", "migu", "aggregator"))):
+            with self.subTest(quality=quality, fast=fast, cached=cached, order=order):
+                sources = [CatalogSource(name=name) for name in order]
+                pipe = self.pipe(sources, quality=quality, fast_mode=fast,
+                                 remember_hashes=True)
+                if cached:
+                    for source in sources:
+                        pipe.index.note_search(source.name, "夜曲子", found=False)
+                with patch.object(pipe, "_download", side_effect=AssertionError("download")), \
+                     patch.object(pipe, "_probe_audio", side_effect=AssertionError("probe")):
+                    with self.assertRaises(SearchNoResultError) as error:
+                        pipe.search_candidates_ex("夜曲子")
+                self.assertEqual(error.exception.suggestions,
+                                 (("夜曲", "周杰伦"), ("夜曲 (Live)", "周杰伦")))
+                self.assertIn("你可能想找的歌是", error.exception.message)
+                self.assertIn("尚未通过下载校验", error.exception.message)
+                self.assertEqual([s.name for s in sources if "夜曲" in s.queries],
+                                 [name for name in order if name in {"migu", "kugou"}])
+                self.assertTrue(all(not s.resolves and len(s.queries) <= 4 for s in sources))
+                self.assertEqual(sum(s.queries.count("夜曲") for s in sources), 2)
+                self.assertEqual(sum(s.queries.count("夜曲子") for s in sources),
+                                 0 if cached else 4)
+                # Close each SQLite-backed matrix row promptly.
+                pipe.close()
+                self.pipes.remove(pipe)
+        self.assertFalse((self.root / "output").exists())
+
+    def test_cached_skips_do_not_exhaust_actual_request_budget(self):
+        from mmusic.search.query import QueryVariant
+
+        class CatalogSource(MetadataSource):
+            def search(self, query, **kwargs):
+                self.queries.append(query)
+                return [Track(self.name, "夜曲", "周杰伦")] if query == "夜曲" else []
+
+        variants = [QueryVariant(f"缓存变体{i}", "test") for i in range(4)]
+        for cached_count in (0, 1, 3, 4):
+            with self.subTest(cached_count=cached_count):
+                source = CatalogSource(name="migu")
+                pipe = self.pipe([source], remember_hashes=True)
+                for variant in variants[:cached_count]:
+                    pipe.index.note_search(source.name, variant.text, found=False)
+                with patch("mmusic.pipeline.expand_query", return_value=variants):
+                    with self.assertRaises(SearchNoResultError) as error:
+                        pipe.search_candidates_ex("夜曲子")
+                self.assertEqual(bool(error.exception.suggestions), bool(cached_count))
+                self.assertEqual(source.queries.count("夜曲"), int(bool(cached_count)))
+                self.assertLessEqual(len(source.queries), 4)
+                self.assertEqual(source.resolves, 0)
+
+    def test_metadata_priority_fallback_and_cached_rescue_query(self):
+        class CatalogSource(MetadataSource):
+            def search(self, query, **kwargs):
+                self.queries.append(query)
+                if query == "夜曲":
+                    return [Track(self.name, "夜曲", "周杰伦")]
+                return []
+
+        for missing, blocked, expected in (
+                ("migu", "", ("kugou", "kuwo")),
+                ("kugou", "", ("migu", "kuwo")),
+                ("kuwo", "migu", ("kugou", "aggregator"))):
+            with self.subTest(missing=missing, blocked=blocked):
+                sources = [CatalogSource(name=name) for name in
+                           ("aggregator", "kuwo", "migu", "kugou") if name != missing]
+                pipe = self.pipe(sources, quality="flac", remember_hashes=True)
+                if blocked:
+                    pipe.index.note_search(blocked, "夜曲", found=False)
+                with self.assertRaises(SearchNoResultError) as error:
+                    pipe.search_candidates_ex("夜曲子")
+                self.assertEqual(error.exception.suggestions, (("夜曲", "周杰伦"),))
+                self.assertEqual({s.name for s in sources if "夜曲" in s.queries}, set(expected))
+                self.assertEqual(sum(s.queries.count("夜曲") for s in sources), 2)
+
+    def test_single_available_catalog_retains_version_and_tied_artist_choices(self):
+        class CatalogSource(MetadataSource):
+            def search(self, query, **kwargs):
+                self.queries.append(query)
+                if query == "夜曲":
+                    return [Track(self.name, "夜曲", "周杰伦", album="Live at Somewhere"),
+                            Track(self.name, "夜曲", "另一歌手")]
+                return []
+
+        sources = [MetadataSource(name="aggregator", error=True), CatalogSource(name="migu")]
+        pipe = self.pipe(sources, quality="flac")
+        with self.assertRaises(SearchNoResultError) as error:
+            pipe.search_candidates_ex("夜曲子")
+        self.assertEqual(error.exception.suggestions,
+                         (("夜曲 (Live)", "周杰伦"), ("夜曲", "另一歌手")))
+        self.assertTrue(all(not s.resolves for s in sources))
+
+    def test_rescue_is_bounded_even_if_catalog_ignores_limit(self):
+        class CatalogSource(MetadataSource):
+            def search(self, query, **kwargs):
+                self.queries.append(query)
+                if query == "夜曲":
+                    return [Track(self.name, "无关的歌曲", "歌手")] * self.padding + [
+                        Track(self.name, "夜曲", "周杰伦")]
+                # Fill the ordinary record budget before the failure rescue.
+                return [Track(self.name, "无关的歌曲", "歌手")] * 256
+
+        for padding in (0, 8):
+            with self.subTest(padding=padding):
+                sources = [CatalogSource(name="migu"), CatalogSource(name="kugou")]
+                for source in sources:
+                    source.padding = padding
+                pipe = self.pipe(sources)
+                with self.assertRaises(SearchNoResultError) as error:
+                    pipe.search_candidates_ex("夜曲子")
+                self.assertEqual(error.exception.suggestions,
+                                 () if padding else (("夜曲", "周杰伦"),))
+                if padding:
+                    self.assertIn("未形成可靠的检索建议", error.exception.message)
+
+    def test_rescue_limits_restore_after_failure_and_cancellation(self):
+        from mmusic.errors import CancelledError
+        from mmusic.net import HttpClient
+
+        class CatalogSource(MetadataSource):
+            def search(self, query, **kwargs):
+                self.queries.append(query)
+                if query == "夜曲":
+                    self.limits = self.http._request_state.limits
+                    self.kwargs = kwargs
+                    raise self.problem
+                return []
+
+        for problem in (NetworkError("offline"), ValueError("bad record"), CancelledError("已取消")):
+            source = CatalogSource(name="migu")
+            pipe = self.pipe([source])
+            source.http = pipe.http
+            source.problem = problem
+            with self.assertRaises(CancelledError if isinstance(problem, CancelledError)
+                                   else SearchNoResultError):
+                pipe.search_candidates_ex("夜曲子")
+            self.assertIsInstance(source.http, HttpClient)
+            self.assertEqual(source.limits, (3.0, 0))
+            self.assertEqual(source.kwargs["limit"], 8)
+            self.assertIsNone(source.http._request_state.limits)
+            self.assertEqual(source.queries.count("夜曲"), 1)
+            self.assertEqual(source.resolves, 0)
 
     def test_optional_http_limits_restore_and_cap_timeout_and_retry(self):
         import io

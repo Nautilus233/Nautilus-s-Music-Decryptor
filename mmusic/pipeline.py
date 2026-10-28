@@ -1452,11 +1452,10 @@ class Pipeline:
                     continue
                 kept: "list[Track]" = []
                 for variant in batch:
-                    query_counts[source.name] = query_counts.get(source.name, 0) + 1
                     attempted.add((source.name, variant.text))
                     kept, off_title_n, off_artist_n, dropped_ver = self._search_and_gate(
                         source, variant, readings, requested, alt_readings=alt_readings,
-                        suggestion_candidates=suggestion_candidates)
+                        suggestion_candidates=suggestion_candidates, query_counts=query_counts)
                     dropped_total += dropped_ver
                     dropped_artist += off_artist_n
                     if kept:
@@ -1496,24 +1495,34 @@ class Pipeline:
             choices = query_suggestion_choices(readings, suggestion_candidates, requested=requested)
             rescue = fuzzy.suggestion_queries(readings) if not choices else []
             rescue_budget = 2 if rescue else 0
-            for source in search_order:
+            # Catalog hints need useful metadata, not lossless download links.
+            # FLAC/WAV's aggregator-first order must not consume one of only
+            # two hint lookups before the direct catalogs can be consulted.
+            metadata_order = {name: i for i, name in enumerate(
+                ("migu", "kugou", "kuwo", "aggregator"))}
+            rescue_candidates: list[Track] = []
+            for source in sorted(search_order, key=lambda s: metadata_order.get(s.name, 4)):
                 if rescue_budget <= 0:
                     break
                 if (source.name not in {"migu", "kugou", "kuwo", "aggregator"}
                         or query_counts.get(source.name, 0) >= MAX_VARIANTS_PER_SOURCE * 2):
                     continue
-                text = next((q for q in rescue if (source.name, q) not in attempted), "")
+                text = next((q for q in rescue if (source.name, q) not in attempted
+                             and not index.query_block_reason(q, source.name)), "")
                 if not text:
                     continue
                 self._check_cancelled()
                 rescue_budget -= 1
+                query_counts[source.name] = query_counts.get(source.name, 0) + 1
+                attempted.add((source.name, text))
                 self._log(f"  · [{source.label}] 仅为检索建议补查「{text}」（不下载）")
                 try:
                     client = getattr(source, "http", None)
                     budget_context = (client.request_limits(timeout=3.0, retries=0)
                                       if isinstance(client, HttpClient) else nullcontext())
                     with budget_context:
-                        observed = source.search(text, quality=self.settings.quality, limit=8)
+                        observed = list(islice(source.search(
+                            text, quality=self.settings.quality, limit=8), 8))
                 except CancelledError:
                     raise
                 except MusicDecryptorError:
@@ -1521,12 +1530,17 @@ class Pipeline:
                 except Exception as exc:  # Optional metadata must never turn failure into a crash.
                     self._log(f"  · [{source.label}] 建议补查已跳过（{type(exc).__name__}）")
                     continue
-                suggestion_candidates.extend(observed[:max(0, 256 - len(suggestion_candidates))])
+                rescue_candidates.extend(observed)
             self._check_cancelled()
-            choices = query_suggestion_choices(readings, suggestion_candidates, requested=requested)
+            # Reserve room for both bounded rescue responses even if ordinary
+            # queries filled the raw-record budget. No record enters `pool`.
+            choices = query_suggestion_choices(readings, chain(
+                suggestion_candidates[:256 - len(rescue_candidates)], rescue_candidates),
+                requested=requested)
             labels = [f"{title}（{artist}）" for title, artist in choices]
             suffix = ("\n你可能想找的歌是：" + "；".join(labels) + "？"
-                      "\n以上仅为检索建议，尚未通过下载校验。" if choices else "")
+                      "\n以上仅为检索建议，尚未通过下载校验。" if choices else
+                      "\n未形成可靠的检索建议，当前没有可下载的匹配结果。")
             if dropped_artist:
                 raise SearchNoResultError(
                     "未找到符合要求的歌曲，歌手不符的候选已排除。" + suffix,
@@ -1926,7 +1940,7 @@ class Pipeline:
                              suggestions=getattr(exc, "suggestions", ()))
 
     def _search_and_gate(self, source, variant, readings, requested, alt_readings=(),
-                         suggestion_candidates=None):
+                         suggestion_candidates=None, query_counts=None):
         """检索一个源的一个查询变体，并跑完三道门槛。
 
         返回 ``(可用候选, 歌名淘汰数, 歌手淘汰数, 版本淘汰数)``；
@@ -1942,6 +1956,9 @@ class Pipeline:
             self._log(f"  · [{source.label}] 已跳过（{blocked}，负缓存内）")
             return [], 0, 0, 0
         started = time.monotonic()
+        # Cached skips consume no request budget; failed real requests do.
+        if query_counts is not None:
+            query_counts[source.name] = query_counts.get(source.name, 0) + 1
         try:
             tracks = source.search(text, quality=self.settings.quality, limit=8)
         except MusicDecryptorError as exc:
