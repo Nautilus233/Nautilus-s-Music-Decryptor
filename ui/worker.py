@@ -7,6 +7,8 @@
 """
 from __future__ import annotations
 
+import threading
+
 from PySide6.QtCore import QThread, Signal
 
 from mmusic.errors import CancelledError, MusicDecryptorError
@@ -71,6 +73,7 @@ class NameSearchWorker(QThread):
     completed = Signal(list)
     failed = Signal(str)
     candidates = Signal(str, object, object)   # (查询标签, list[Track], 跨平台参考时长)
+    cancelled = Signal()
 
     MODE_AUTO, MODE_LIST, MODE_PICK = "auto", "list", "pick"
 
@@ -87,33 +90,62 @@ class NameSearchWorker(QThread):
         self.chosen = chosen
         self.reference = reference      # 「先列候选」时带过来的跨平台参考时长
         self._pipe = None
+        self._cancel_requested = threading.Event()
+
+    @property
+    def cancel_requested(self) -> bool:
+        return self._cancel_requested.is_set()
 
     def run(self) -> None:  # noqa: D102
-        pipe = Pipeline(self.settings, cache_path=self.cache_path,
-                        on_log=make_log_sink(self.logged),
-                        on_progress=self.progressed.emit,
-                        on_file=self.file_done.emit)
-        self._pipe = pipe
+        pipe = None
         try:
+            if self.cancel_requested:
+                raise CancelledError("已取消")
+            pipe = Pipeline(self.settings, cache_path=self.cache_path,
+                            on_log=make_log_sink(self.logged),
+                            on_progress=self.progressed.emit,
+                            on_file=self.file_done.emit)
+            self._pipe = pipe
+            # cancel() may run while Pipeline is being constructed.
+            if self.cancel_requested:
+                pipe.cancel()
+                raise CancelledError("已取消")
             if self.mode == self.MODE_LIST:
                 tracks, reference = pipe.search_candidates_ex(self.query,
                                                              artist=self.artist)
-                self.candidates.emit(self.query, tracks, reference)
+                if not self.cancel_requested:
+                    self.candidates.emit(self.query, tracks, reference)
+                    self.completed.emit([])
             elif self.mode == self.MODE_PICK:
                 # 点名的那一条：直接下载，**不重新检索**
-                self.completed.emit([pipe.download_chosen(self.chosen,
-                                                          reference=self.reference)])
+                results = [pipe.download_chosen(self.chosen, reference=self.reference)]
+                if not self.cancel_requested:
+                    self.completed.emit(results)
             else:
-                self.completed.emit(pipe.acquire_many(self.items))
+                results = pipe.acquire_many(self.items)
+                if not self.cancel_requested:
+                    self.completed.emit(results)
+            if self.cancel_requested:
+                raise CancelledError("已取消")
+        except CancelledError:
+            self.cancelled.emit()
         except Exception as exc:  # noqa: BLE001
-            self.failed.emit(str(exc))
+            if self.cancel_requested:
+                self.cancelled.emit()
+            else:
+                self.failed.emit(str(exc))
         finally:
-            pipe.close()
-            self._pipe = None
+            try:
+                if pipe is not None:
+                    pipe.close()
+            finally:
+                self._pipe = None
 
     def cancel(self) -> None:
-        if self._pipe is not None:
-            self._pipe.cancel()
+        self._cancel_requested.set()
+        pipe = self._pipe
+        if pipe is not None:
+            pipe.cancel()
 
 class AlbumSearchWorker(QThread):
     """「按专辑找歌」后台线程（三种模式）。

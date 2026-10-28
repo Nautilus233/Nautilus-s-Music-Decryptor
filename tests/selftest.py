@@ -4062,7 +4062,9 @@ def test_completeness_gate() -> None:
     check("complete: 测不出时长时不额外否决（交给未比对逻辑）", ok6)
 
     PROMPT = fx.make_mp3_xing(11)
-    REAL = fx.make_mp3_xing(200)
+    # This fixture's authoritative annotation is 228s. A 200s file is a cut,
+    # not a full recording; test_recording_duration separately asserts its rejection.
+    REAL = fx.make_mp3_xing(228)
 
     class FakeSource(SearchSource):
         def __init__(self, name, path):

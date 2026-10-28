@@ -32,7 +32,7 @@ from typing import Callable, Optional
 
 from .. import jp
 from ..errors import NetworkError
-from ..match import ARTIST_UNKNOWN, cross_similarity, similarity
+from ..match import ARTIST_UNKNOWN, artist_match_score, cross_similarity, similarity
 from ..model import Track
 from .aggregator import DEFAULT_BASE
 from .album_alias import alias_artist_matches, local_album_alias, resolve_album_alias
@@ -237,9 +237,9 @@ def _artist_matches(want: str, cand: str) -> bool:
     want_s, cand_s = _clean(want), _clean(cand)
     if not want_s or not cand_s:
         return False
-    if want_s.casefold() in cand_s.casefold():
-        return True
-    return _sim(want_s, cand_s) >= 0.6
+    if _norm_key(cand_s) in ARTIST_UNKNOWN:
+        return False
+    return artist_match_score([("", want_s)], Track("", artist=cand_s)) >= 0.6
 
 
 def _join_artists(value) -> str:

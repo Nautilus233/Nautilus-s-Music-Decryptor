@@ -1,0 +1,23 @@
+# Exact user-requested common abbreviation; canonical title/artist verified by
+# jp_songs.tsv and jp_artists.tsv (ja.wikipedia readings). This file is curated,
+# separate from generated tables. No substring, kanji deletion or guessed reading.
+# alias<TAB>canonical title<TAB>performer<TAB>provenance (optional for legacy rows)
+音辞	だから僕は音楽を辞めた	ヨルシカ
+# Official song-detail alias/transNames, checked 2026-10-28; no inferred translations.
+# 卖春 was also supplied by the user and independently confirmed by these records.
+卖春	春ひさぎ	ヨルシカ	netease:1452829556,1466520411
+Prostitution	春ひさぎ	ヨルシカ	netease:1466520411
+说吧	言って。	ヨルシカ	netease:487527980
+说吧。	言って。	ヨルシカ	netease:487527980
+所以我放弃了音乐	だから僕は音楽を辞めた	ヨルシカ	netease:1357953768
+老人与海	老人と海	ヨルシカ	netease:1870469768
+雨和卡布奇诺	雨とカプチーノ	ヨルシカ	netease:1381706151
+靛蓝平方	藍二乗	ヨルシカ	netease:1357960253
+烦死了	うっせぇわ	Ado	netease:1489254523
+吵死了	うっせぇわ	Ado	netease:1915176787
+爱我爱我爱我	愛して愛して愛して	Ado	netease:2108142021
+向夜晚奔去	夜に駆ける	YOASOBI	netease:1409311773
+大概	たぶん	YOASOBI	netease:1459343252
+偶像	アイドル	YOASOBI	netease:2034742057
+春紫菀	ハルジオン	YOASOBI	netease:1444071945
+描绘着那场梦	あの夢をなぞって	YOASOBI	netease:1417236632

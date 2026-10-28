@@ -37,13 +37,16 @@ from .errors import (CancelledError, DecryptionFailedError, MusicDecryptorError,
 from .hashcache import HashCache
 from . import fuzzy, jp
 from .lang import is_chinese_likely
-from .match import (ARTIST_UNKNOWN, best_reading_match, clean_text, filename_query,
+from .match import (ARTIST_UNKNOWN, artist_match_score, best_reading_match, clean_text, filename_query,
                     parse_song_filename_candidates, rank_tracks_multi, reading_scores,
                     looks_like_song_query, normalize_for_version, sanitize_query, sanitize_query_text,
-                    space_split_readings, split_originals, version_markers)
+                    space_split_readings, split_originals, version_markers,
+                    album_version_markers, recording_version_ok, track_version_markers,
+                    filter_title_alias_ambiguity)
 from .metadata import read_source_meta, write_tags
 from .model import AudioResult, Track
 from .net import HttpClient
+from .suggestions import query_suggestions
 from .search.fusion import (collapse_duplicates, dedupe_key,
                             mark_low_confidence)
 from .search.index import ResourceIndex
@@ -62,6 +65,15 @@ MIN_ARTIST_SIMILARITY = 0.60  # 歌手字段硬门槛：同名翻唱/不同演�
 MIN_TRACK_SECONDS = 45.0     # 实测时长下限：低于此秒数视为试听片段/前奏，不是完整原曲
 EARLY_STOP_SCORE = 0.95    # 已拿到高置信度原曲（歌名+歌手几乎完全一致）就不再打扰其它音源
 MAX_DOWNLOADS = 6          # 单文件最多尝试的下载次数（按分数从高到低顺延）
+
+
+class _ExplicitArtistReadings(list):
+    """Keep explicit UI field provenance without changing legacy tuple values."""
+
+    def __init__(self, readings, artist):
+        super().__init__(readings)
+        self.required_artist = artist
+
 #: 华语歌预匹配（mmusic/lang.py）：备用链路的动态排序与按需检索
 def _add_reversed_reading(readings, name):
     """日语输入补一条反序读法（«歌手 歌名» 语序很常见）。只增不减、纯文本。"""
@@ -178,6 +190,137 @@ def _plausible_max(values) -> "float | None":
     return max(plausible) if plausible else vals[-1]
 
 
+def _recording_tags(data: bytes) -> dict:
+    try:
+        return _read_recording_tags(data)
+    except (ValueError, UnicodeError, IndexError, OverflowError):
+        return {}
+
+
+def _read_recording_tags(data: bytes) -> dict:
+    """Bounded, local text-tag read; no optional dependencies or cover decoding.
+
+    The same parser accepts a probe prefix and a downloaded file. Incomplete
+    frames/blocks are ignored, never guessed. Covers and audio frames are skipped.
+    """
+    data = memoryview(data)[:1024 * 1024]
+    result = {}
+
+    def text(key, payload, encoding="utf-8"):
+        if len(payload) <= 16384:
+            value = bytes(payload).decode(encoding, errors="replace").strip("\x00 \r\n")
+            if value:
+                # Multiple values must all participate in version checks.
+                result[key] = value.replace("\x00", " ")
+
+    def comments(block):
+        if len(block) < 8:
+            return
+        pos = 4 + int.from_bytes(block[:4], "little")
+        if pos + 4 > len(block):
+            return
+        count = min(int.from_bytes(block[pos:pos + 4], "little"), 256)
+        pos += 4
+        for _ in range(count):
+            if pos + 4 > len(block):
+                break
+            size = int.from_bytes(block[pos:pos + 4], "little")
+            pos += 4
+            if pos + size > len(block):
+                break
+            if size <= 16384:
+                entry = bytes(block[pos:pos + size])
+                key, sep, value = entry.partition(b"=")
+                if sep and key.lower() in (b"album", b"title"):
+                    name = key.decode("ascii").lower()
+                    previous = result.get(name, "")
+                    text(name, value)
+                    if previous:
+                        result[name] = previous + " / " + result.get(name, "")
+            pos += size
+
+    if bytes(data[:3]) == b"ID3" and len(data) >= 10:
+        version = data[3]
+        if version not in (2, 3, 4) or any(x & 128 for x in data[6:10]):
+            return result
+        synchsafe = lambda b: sum(v << (7 * (len(b) - i - 1)) for i, v in enumerate(b))
+        end = min(len(data), 10 + synchsafe(data[6:10]))
+        body = data[10:end]
+        if data[5] & 0x80:
+            body = memoryview(bytes(body).replace(b"\xff\x00", b"\xff"))
+        pos = 0
+        if data[5] & 0x40:
+            if version == 2 or len(body) < 4:
+                return result
+            pos = (synchsafe(body[:4]) if version == 4 else 4 + int.from_bytes(body[:4], "big"))
+        header = 6 if version == 2 else 10
+        for _ in range(256):
+            if pos + header > len(body):
+                break
+            name = bytes(body[pos:pos + (3 if version == 2 else 4)])
+            sizebytes = body[pos + (3 if version == 2 else 4):pos + header - (0 if version == 2 else 2)]
+            size = synchsafe(sizebytes) if version == 4 else int.from_bytes(sizebytes, "big")
+            if not size or pos + header + size > len(body):
+                break
+            payload = body[pos + header:pos + header + size]
+            flags = body[pos + 9] if version != 2 else 0
+            compressed = flags & (0x0d if version == 4 else 0xe0)
+            if name in (b"TALB", b"TAL", b"TIT2", b"TT2") and not compressed and payload:
+                enc = payload[0]
+                if enc in (0, 1, 2, 3):
+                    value = bytes(payload[1:])
+                    if version == 4 and flags & 2:
+                        value = value.replace(b"\xff\x00", b"\xff")
+                    text("album" if name in (b"TALB", b"TAL") else "title", value,
+                         ("latin-1", "utf-16", "utf-16-be", "utf-8")[enc])
+            pos += header + size
+    elif bytes(data[:4]) == b"fLaC":
+        pos = 4
+        for _ in range(128):
+            if pos + 4 > len(data):
+                break
+            kind = data[pos]
+            size = int.from_bytes(data[pos + 1:pos + 4], "big")
+            pos += 4
+            if pos + size > len(data):
+                break
+            if kind & 127 == 4:
+                comments(data[pos:pos + size])
+            pos += size
+            if kind & 128:
+                break
+    elif bytes(data[:4]) == b"OggS":
+        pos, packet, serial = 0, bytearray(), None
+        for _ in range(128):
+            if pos + 27 > len(data) or bytes(data[pos:pos + 4]) != b"OggS":
+                break
+            page_serial = bytes(data[pos + 14:pos + 18])
+            if serial is None:
+                serial = page_serial
+            if page_serial != serial:
+                break
+            count = data[pos + 26]
+            start = pos + 27 + count
+            if start > len(data):
+                break
+            sizes = data[pos + 27:start]
+            if start + sum(sizes) > len(data):
+                break
+            for size in sizes:
+                packet.extend(data[start:start + size])
+                start += size
+                if size < 255:
+                    if packet.startswith(b"\x03vorbis"):
+                        comments(memoryview(packet)[7:])
+                        return result
+                    if packet.startswith(b"OpusTags"):
+                        comments(memoryview(packet)[8:])
+                        return result
+                    packet = bytearray()
+            pos = start
+    return result
+
+
 def _accepts_level(fn) -> "bool | None":
     """sink 的参数形态：``True`` 两参数 / ``False`` 单参数 / ``None`` 不可内省。
 
@@ -271,6 +414,26 @@ class JobResult:
 
 
 class Pipeline:
+    @staticmethod
+    def _bind_recording(track, requested):
+        track.raw = dict(track.raw or {})
+        track.raw["_requested_recording"] = sorted(requested)
+        return track
+
+    @staticmethod
+    def _requested_recording(track):
+        return set(track.raw.get("_requested_recording", track_version_markers(track)))
+
+    def _guard_recording(self, track, requested, data=None):
+        if data is not None:
+            tags = _recording_tags(data)
+            if tags:
+                track.raw = dict(track.raw or {})
+                track.raw["_recording_tags"] = tags
+        if not recording_version_ok(track, requested):
+            raise SearchNoResultError("录音版本不符：已排除现场/改编或其它非目标版本",
+                                      detail=f"{track.source} “{track.title}” / {track.album}")
+
     def __init__(self, settings, *, cache_path: "str | Path | None" = None,
                  on_log: "Callable[[str], None] | None" = None,
                  on_progress: "Callable[[int, int], None] | None" = None,
@@ -325,6 +488,13 @@ class Pipeline:
     # ------------------------------------------------------------------ #
     def cancel(self) -> None:
         self._cancel = True
+        cancel_http = getattr(self.http, "cancel", None)
+        if cancel_http is not None:
+            cancel_http()
+
+    def _check_cancelled(self) -> None:
+        if self._cancel:
+            raise CancelledError("已取消")
 
     def close(self) -> None:
         self.http.close()
@@ -714,10 +884,19 @@ class Pipeline:
 
     @classmethod
     def _seed_for(cls, name: str, artist: str = "") -> "tuple[str, list, str, set]":
-        """用户填的「歌名 / 歌手」→ 与文件名模式同构的 seed（两种读法都会被尝试）。"""
+        """Explicit fields stay typed; ambiguous free text alone may be reversed."""
         name = (name or "").strip()
         artist = (artist or "").strip()
         seed = f"{artist} - {name}" if (artist and name) else (name or artist)
+        if artist:
+            # Never run a composed pair through the filename parser: its
+            # reversed reading lets title=atarayo / artist=tayori pass a query
+            # whose explicit artist is atarayo. Missing title stays missing,
+            # so the normal title gate rejects artist-only download requests.
+            title = sanitize_query_text(name) if name else ""
+            performer = sanitize_query_text(artist)
+            return seed, _ExplicitArtistReadings([(title, performer)], performer), " ".join(
+                value for value in (title, performer) if value), version_markers(title)
         readings, query, requested = cls._seed_from_name(seed)
         if name and not artist:
             # 手动搜索框里「夜曲 周杰伦」这种空格写法很自然：补两种读法（只增不减，
@@ -749,16 +928,16 @@ class Pipeline:
         参考时长只用平台标注算（``_plausible_max``），不探测音频、不下载音频；拿它去校验
         用户点选的那一条（见 :meth:`download_chosen`），这样"点名下载"不必再重跑一遍检索。
         """
+        self._check_cancelled()
         seed, readings, query, requested = self._seed_for(name, artist)
         pool = self._collect_pool(seed, readings, query, requested,
                                   consensus=self._nameless_artist(readings))
-        strong = [t for t in pool if t.duration and t.score >= EARLY_STOP_SCORE]
-        declared = [t.duration for t in (strong or [t for t in pool if t.duration])]
-        reference = _plausible_max(declared)
-
+        pool = [self._bind_recording(t, requested) for t in pool
+                if recording_version_ok(t, requested)]
         listed: "list[Track]" = []
         dropped = 0
-        for track in pool:
+        for pos, track in enumerate(pool):
+            self._check_cancelled()
             if len(listed) >= MAX_LIST_CANDIDATES:
                 break
             if track.duration and track.duration < MIN_TRACK_SECONDS:
@@ -773,8 +952,13 @@ class Pipeline:
             try:
                 if not track.url:
                     track = adapter.resolve(track, quality=self.settings.quality)
+                pool[pos] = track
+                self._bind_recording(track, requested)
+                self._guard_recording(track, requested)
                 if not track.url:
                     raise NetworkError("音源未返回直链")
+            except CancelledError:
+                raise
             except MusicDecryptorError as exc:
                 dropped += 1
                 self._log(f"  · 已剔除无法解析直链的候选：{track.source} “{track.title}”"
@@ -788,6 +972,10 @@ class Pipeline:
             listed.append(track)
         self._log(f"  · 可下载候选 {len(listed)} 个（已逐条解析直链"
                   + (f"，剔除 {dropped} 个下不了/疑似片段的" if dropped else "") + "）")
+        self._check_cancelled()
+        evidence = [t for t in pool if recording_version_ok(t, requested)]
+        strong = [t for t in evidence if t.duration and t.score >= EARLY_STOP_SCORE]
+        reference = _plausible_max(t.duration for t in (strong or evidence))
         return listed, reference
 
     def acquire(self, name: str, *, artist: str = "", chosen: "Track | None" = None,
@@ -800,6 +988,8 @@ class Pipeline:
         label = f"{artist} - {name}" if (artist and name) else (name or artist)
         if chosen is not None:
             # 用户点名的那一条：直接下，**不再检索**（见 download_chosen 的说明）
+            _seed, _readings, _query, requested = self._seed_for(name, artist)
+            self._bind_recording(chosen, requested)
             return self.download_chosen(chosen, reference=reference, label=label,
                                         note=note)
         seed, readings, query, requested = self._seed_for(name, artist)
@@ -835,6 +1025,9 @@ class Pipeline:
 
     def _fetch_chosen(self, track: Track, *, reference: "float | None" = None):
         """Resolve, fetch and validate once; leave the output decision to the caller."""
+        self._check_cancelled()
+        requested = self._requested_recording(track)
+        self._guard_recording(track, requested)
         adapter = self._adapters.get(track.source)
         if adapter is None:
             raise SearchNoResultError("该候选的音源当前不可用，请换一条",
@@ -842,14 +1035,21 @@ class Pipeline:
         self._log(f"⬇ 点名下载：{track.source} “{track.title}”（{track.artist}）")
         if not track.url:
             track = adapter.resolve(track, quality=self.settings.quality)
+        self._bind_recording(track, requested)
+        self._guard_recording(track, requested)
         try:
             data = self._download(track)
+        except CancelledError:
+            raise
         except MusicDecryptorError:
             # 列表里解析出来的直链可能已过期 → 重新解析一次（仍然**不重新检索**）
             self._log("  · 直链可能已过期，重新解析一次")
             track = adapter.resolve(track, quality=self.settings.quality)
+            self._bind_recording(track, requested)
+            self._guard_recording(track, requested)
             data = self._download(track)
 
+        self._guard_recording(track, requested, data)
         v = validate(data, track.ext, expected_bitrate=track.bitrate,
                      duration=track.duration, min_bitrate=self.settings.min_bitrate)
         if not v.ok:
@@ -887,8 +1087,9 @@ class Pipeline:
         中间失败只写**明细**日志（避免提前宣告某来源不可用）；全部失败时抛出
         「所有来源均无法获取，建议自行获取」，由界面统一提示。
         """
-        if album:
-            track.album = album
+        requested = version_markers(track.title) | album_version_markers(album or track.album)
+        self._bind_recording(track, requested)
+        track.raw["_target_album"] = album or track.album
         label = f"{track.artist} - {track.title}".strip(" -")
         target_metadata = (track.title, track.artist, album or track.album)
         ref = reference if reference is not None else (float(track.duration) if track.duration else None)
@@ -916,6 +1117,8 @@ class Pipeline:
                 try:
                     if not candidate.url:
                         candidate = adapter.resolve(candidate, quality=self.settings.quality)
+                    self._bind_recording(candidate, requested)
+                    self._guard_recording(candidate, requested)
                     if not candidate.url:
                         raise NetworkError("音源未返回直链")
                 except CancelledError:
@@ -998,11 +1201,8 @@ class Pipeline:
                 continue
             seen_fallback.add(identity)
             tried += 1
-            # 元数据统一：曲名/歌手/唱片集一律以**专辑曲目表**为准（重匹配只换资源本身）
-            cand.title = track.title or cand.title
-            cand.artist = track.artist or cand.artist
-            if album:
-                cand.album = album
+            # Preserve the source's version evidence until bytes are checked.
+            self._bind_recording(cand, requested)
             try:
                 res = self.download_chosen(cand, reference=ref, cover=cover, track_no=track_no,
                                            label=label, quiet_source=True,
@@ -1044,7 +1244,7 @@ class Pipeline:
                     alt_readings.append((track.title, value))
         except Exception:  # noqa: BLE001
             alt_readings = []
-        requested = version_markers(track.title or "")
+        requested = self._requested_recording(track)
         for name in order:
             if self._cancel:
                 raise CancelledError("已取消")
@@ -1060,7 +1260,8 @@ class Pipeline:
             except Exception as exc:  # noqa: BLE001
                 self._log(f"  · [{name}] 重匹配检索异常：{str(exc)[:100]}", level="detail")
                 continue
-            context = dict(expected_album=track.album, reference_duration=track.duration)
+            context = dict(expected_album=track.raw.get("_target_album", track.album),
+                           reference_duration=track.duration)
             best = self._pick_rematch_candidate(tracks, readings, alt_readings, requested, **context)
             if best is None and alt_readings:
                 alt_query = " ".join(x for x in (alt_readings[0][0], alt_readings[0][1]) if x).strip()
@@ -1087,9 +1288,9 @@ class Pipeline:
                     pool.sort(key=lambda t: (t.short_asset,
                               t.ext.lower() not in ("flac", "wav", "ape", "dff"), -t.score))
                     for candidate in pool[:2]:
-                        yield candidate
+                        yield self._bind_recording(candidate, requested)
                 else:
-                    yield best
+                    yield self._bind_recording(best, requested)
 
     @staticmethod
     def _pick_rematch_candidate(tracks, readings, alt_readings, requested, **context) -> "Track | None":
@@ -1102,9 +1303,7 @@ class Pipeline:
                                 expected_album: str = "", reference_duration: float = 0) -> "list[Track]":
         """Use the existing song/artist/version gates before any metadata rewrite."""
         pool = [t for t in (tracks or []) if (t.title or t.url)]
-        if not requested:
-            originals, _dropped = split_originals(pool)
-            pool = originals
+        pool = [t for t in pool if recording_version_ok(t, requested)]
         kept: "list[Track]" = []
         supported: "list[Track]" = []
         for cand in pool:
@@ -1132,8 +1331,7 @@ class Pipeline:
             kept.extend(supported)
         if not kept:
             return []
-        rank_tracks_multi(readings, kept, prefer_ext="")
-        return kept
+        return rank_tracks_multi(readings, filter_title_alias_ambiguity(readings, kept), prefer_ext="")
 
     def acquire_many(self, items) -> "list[JobResult]":
         """批量以名找歌。``items`` 可以是 "歌名"、"歌手 - 歌名" 或 ``(歌名, 歌手)``。"""
@@ -1195,7 +1393,8 @@ class Pipeline:
                       " / ".join(f"歌名「{t}」歌手「{a}」" for t, a in readings))
 
         # 文件名自带版本标记 -> 用户主动点名要该版本：不过滤，但必须警告
-        requested = version_markers(seed)
+        requested = (requested if getattr(readings, "required_artist", "")
+                     else version_markers(seed))
         if requested:
             self._log("  · ⚠ 文件名包含版本标记「" + "、".join(sorted(requested)) +
                       "」，本次将保留该版本；若你要的是原曲，请把文件名改干净后重试")
@@ -1203,6 +1402,8 @@ class Pipeline:
         adapters = self._adapters
         index = self.index
         pool: list[Track] = []          # 跨音源的"干净"候选池
+        alias_observations: list[Track] = []
+        suggestion_candidates: list[Track] = []
         dropped_total = 0
         dropped_artist = 0
 
@@ -1213,6 +1414,12 @@ class Pipeline:
         if len(variants) > 1:
             self._log("  · 检索变体：" + " / ".join(f"{v.reason}「{v.text}」" for v in variants))
         alt_readings = fuzzy.corrected_readings(readings)
+        explicit_artist = getattr(readings, "required_artist", "")
+        if explicit_artist:
+            # Title typo recovery stays available. An explicitly supplied
+            # performer cannot silently turn into another artist via typo edits.
+            alt_readings = _ExplicitArtistReadings(
+                [(t, a) for t, a in alt_readings if a == explicit_artist], explicit_artist)
         # 分层 sweep（2026-10-22 收紧）：首轮每源 ≤2 个；**仅当首轮全源零命中**才
         # 追加第二轮（再 ≤2 个）。失败路径每源封顶 4 个请求（原为 6），成功路径仍是
         # ≤2 个。变体表已按价值排序：日语读音形紧跟原样；纠错候选只在“疑似错字”时
@@ -1241,7 +1448,8 @@ class Pipeline:
                 kept: "list[Track]" = []
                 for variant in batch:
                     kept, off_title_n, off_artist_n, dropped_ver = self._search_and_gate(
-                        source, variant, readings, requested, alt_readings=alt_readings)
+                        source, variant, readings, requested, alt_readings=alt_readings,
+                        suggestion_candidates=suggestion_candidates)
                     dropped_total += dropped_ver
                     dropped_artist += off_artist_n
                     if kept:
@@ -1251,9 +1459,10 @@ class Pipeline:
                 if not kept:
                     continue
                 tracks = kept
+                alias_observations.extend(kept)
                 found_any = True
 
-                rank_tracks_multi(readings, tracks, prefer_ext=self.settings.quality)
+                tracks = rank_tracks_multi(readings, tracks, prefer_ext=self.settings.quality)
                 best_t, best_a = reading_scores(readings, tracks[0],
                                                 prefer_ext=self.settings.quality)[0][1]
                 self._log(f"  · [{source.label}] {len(tracks)} 个原曲候选，最佳“{tracks[0].title}”"
@@ -1271,28 +1480,40 @@ class Pipeline:
                               "（不做跨平台时长核验；可在 设置→行为 关闭）")
                     break
 
+        unambiguous_ids = {id(t) for t in filter_title_alias_ambiguity(readings, alias_observations)}
+        pool = [t for t in pool if id(t) in unambiguous_ids]
         if not pool:
+            hints = query_suggestions(readings, suggestion_candidates, requested=requested)
+            suffix = ("\n你可能想搜：" + "；".join(hints) + "。这些候选尚未通过下载校验。"
+                      if hints else "")
             if dropped_artist:
                 raise SearchNoResultError(
-                    "未找到原曲：仅找到同名但演唱者不同的版本（翻唱/翻录），已全部排除。",
+                    "未找到原曲：仅找到同名但演唱者不同的版本（翻唱/翻录），已全部排除。" + suffix,
                     detail=f"已排除 {dropped_artist} 个歌手不符的候选")
             if dropped_total and not requested:
                 raise SearchNoResultError(
-                    "未找到原曲，当前仅有伴奏/改编版，请确认是否需要下载。",
+                    "未找到原曲，当前仅有伴奏/改编版，请确认是否需要下载。" + suffix,
                     detail=f"已排除 {dropped_total} 个伴奏/改编版本")
-            raise SearchNoResultError("搜索无结果，请检查网络或歌曲名")
+            raise SearchNoResultError("搜索无结果，请检查网络或歌曲名" + suffix)
 
         # 跨音源择优：不再"第一个能用的音源就算"，而是所有音源一起比，分高者先下
-        pool.sort(key=lambda t: t.score, reverse=True)
+        pool = rank_tracks_multi(readings, pool, prefer_ext=self.settings.quality)
         if consensus:
             self._prefer_dominant_artist(pool)
-        return pool
+        return [self._bind_recording(t, requested) for t in pool
+                if recording_version_ok(t, requested)]
 
     def _take_from_pool(self, pool, *, src, digest, note, label,
                         consensus: bool = False) -> JobResult:
         """候选池 → 跨平台时长核验 → 下载 → 校验/完整度门禁 → 落盘（两种模式共用）。"""
         adapters = self._adapters
         index = self.index
+        requested = set(next((t.raw["_requested_recording"] for t in pool
+                              if "_requested_recording" in t.raw), ()))
+        pool = [self._bind_recording(t, requested) for t in pool
+                if recording_version_ok(t, requested)]
+        if not pool:
+            raise SearchNoResultError("没有符合目标录音版本的候选，现场/改编版已排除")
         consensus_ids = self._dominant_artist(pool)[0] if consensus else set()
         # 查询里**给了歌手**时，"群星/未知"这类占位候选不算可信证据：既不拿它当参考时长，
         # 也让位给"有明确歌手"的候选。一个明确歌手的候选都没有时才原样使用（不硬删）。
@@ -1315,30 +1536,30 @@ class Pipeline:
         # 参考时长绝不能只信"正在提供文件的这个平台"：实测同一首歌在不同平台的标注
         # 可能一个是被截短的（周杰伦《最长的电影》：酷我 2:22 / 酷狗 3:55，后者才对）。
         # 因此跨平台取"最完整且不离群"的标注作为参考，全程自动、不打扰用户。
+        # Probe before the length gate: a long mislabelled Live file must not
+        # eliminate the studio candidate before its embedded tags are inspected.
+        candidates = list(pool)
+
+        # 实测交叉验证：只取文件头（最多 MAX_PROBES 个、超时 8s、失败即跳过）
+        self._log(f"  · 开始时长核验（探测前 {min(len(candidates), MAX_PROBES)} 个候选）")
+        self._probe_durations(candidates)
+        candidates = [t for t in candidates if recording_version_ok(t, requested)]
+        if not candidates:
+            raise SearchNoResultError("没有符合目标录音版本的候选，音频标签表明为其它版本")
+        pool = candidates
         strong = [t for t in pool if t.duration and t.score >= EARLY_STOP_SCORE]
-        declared = [t.duration for t in _credited(strong or
-                                                 [t for t in pool if t.duration])]
+        declared = [t.duration for t in _credited(strong or [t for t in pool if t.duration])]
         reference = _plausible_max(declared)
         tolerance = max(TOL_ABS, TOL_REL * reference) if reference else TOL_ABS
         if reference:
             self._log(f"  · 跨平台参考时长 {format_seconds(reference)}"
-                      f"（{len(declared)} 个平台标注中取最完整值，容差 ±{int(tolerance)}s）")
-
-        # 免费预筛：标注就明显偏短的候选连文件都不用取（省一次请求）
+                      f"（{len(declared)} 个同版本平台标注中取最完整值，容差 ±{int(tolerance)}s）")
         short_meta = [t for t in pool
                       if reference and t.duration and t.duration < reference - tolerance]
         for track in short_meta[:3]:
             self._log(f"    ✗ 标注时长偏短已排除：{track.source} “{track.title}” "
                       f"{format_seconds(track.duration)}（参考 {format_seconds(reference)}）")
         candidates = [t for t in pool if t not in short_meta]
-        if not candidates:
-            raise SearchNoResultError(
-                "未找到原曲，当前仅有伴奏/改编版，请确认是否需要下载。",
-                detail="各平台标注时长互相矛盾，偏短版本已全部排除")
-
-        # 实测交叉验证：只取文件头（最多 MAX_PROBES 个、超时 8s、失败即跳过）
-        self._log(f"  · 开始时长核验（探测前 {min(len(candidates), MAX_PROBES)} 个候选）")
-        self._probe_durations(candidates)
         short_n = sum(1 for t in candidates if t.short_asset)
         last_n = sum(1 for t in candidates
                      if t.source in _LAST_RESORT_SOURCES and not t.short_asset)
@@ -1353,9 +1574,8 @@ class Pipeline:
                         "全程只降权、不做硬性排除")
         measured = [t.actual_duration
                     for t in _credited([t for t in candidates if t.actual_duration])]
-        if len(measured) >= 2:
-            # 有两个以上真实文件测出了时长 —— 这是"原曲原时长"最硬的一手证据，
-            # 直接以它为准，平台标注只作旁证（标注本身可能就是被剪短版本的）。
+        if not declared and measured:
+            # No compatible platform annotation: use measured evidence only.
             measured_ref = _plausible_max(measured)
             if measured_ref:
                 reference = measured_ref
@@ -1363,13 +1583,8 @@ class Pipeline:
                 self._log(f"  · 参考时长 {format_seconds(reference)}"
                           f"（取自 {len(measured)} 个候选的**实测**值，容差 ±{int(tolerance)}s）")
         elif measured:
-            # 只测到一个：与平台标注一起取"最完整且不离群"的值，
-            # 避免唯一测到的那个恰好是缩短版、把参考值压低。
-            extra = _plausible_max(list(measured) + list(declared))
-            if extra and (reference is None or extra > reference):
-                reference = extra
-                self._log(f"  · 参考时长 {format_seconds(reference)}"
-                          f"（实测 + 平台标注综合取值，容差 ±{int(TOL_REL * reference)}s）")
+            self._log(f"  · 参考时长 {format_seconds(reference)}"
+                      "（同版本平台标注；实测仅核验，不以最长文件覆盖参考）")
         tolerance = max(TOL_ABS, TOL_REL * reference) if reference else TOL_ABS
         over_tolerance = _over_tolerance(reference)
 
@@ -1468,6 +1683,9 @@ class Pipeline:
                 self._log(f"    ✗ 重复资源已合并：{dup.source} “{dup.title}” 与 "
                           f"{keeper.source} “{keeper.title}” 同曲，保留 {keeper.source}")
             self._log(f"  · 去重后候选 {len(order)} 个（合并 {len(duplicates)} 个重复）")
+            # A keeper can reveal a hidden Live tag only after downloading.
+            # Keep other URLs as delayed fallbacks, within the same attempt cap.
+            order.extend(duplicate for duplicate, _keeper in duplicates)
         flagged = mark_low_confidence(order)
         if flagged and flagged == len(order):
             self._log("  · ⚠ 所有候选匹配度都偏低，结果可能不准确")
@@ -1490,12 +1708,15 @@ class Pipeline:
             if not track.url:
                 try:
                     track = adapter.resolve(track, quality=self.settings.quality)
+                    self._bind_recording(track, requested)
+                    self._guard_recording(track, requested)
                 except MusicDecryptorError as exc:
                     self._log(f"    - [{track.source}] 直链不可用：{exc.message}")
                     _remember(track, ok=False)
                     continue
             try:
                 data = self._download(track)
+                self._guard_recording(track, requested, data)
             except MusicDecryptorError as exc:
                 self._log(f"    - [{track.source}] 下载失败：{exc.message}")
                 _remember(track, ok=False)
@@ -1534,8 +1755,10 @@ class Pipeline:
                           cover: bytes = b"", track_no: int = 0,
                           quiet_source: bool = False) -> JobResult:
         """落盘。``src=None`` 即「以名找歌」：没有源文件可依附，也不删任何东西。"""
+        self._check_cancelled()
         display = label or (src.name if src is not None else "")
         data, out_ext, fmt_note = self._final_format(data, v.ext, display)
+        self._check_cancelled()
         note = "；".join(x for x in (note, fmt_note) if x)
         out_dir = self._out_dir_for(src)
         base = self._safe_name(track.artist,
@@ -1620,6 +1843,7 @@ class Pipeline:
             with open(local, "rb") as handle:
                 head = handle.read(PROBE_BYTES)
             track.header_ok = bool(looks_like_audio(head))
+            self._guard_recording(track, self._requested_recording(track), head)
             duration = audio_duration(head, size)
             if duration is None and _needs_tail(head) and size > PROBE_BYTES:
                 with open(local, "rb") as handle:
@@ -1632,6 +1856,7 @@ class Pipeline:
                                       headers=headers)
         track.size = track.size or total
         track.header_ok = bool(looks_like_audio(head))
+        self._guard_recording(track, self._requested_recording(track), head)
         duration = audio_duration(head, total)
         if duration is None and _needs_tail(head):
             try:
@@ -1657,7 +1882,8 @@ class Pipeline:
             self._log(f"❌ {name}：{exc}", level="result")
             return JobResult(str(src), name, "failed", message=exc.message, detail=exc.detail)
 
-    def _search_and_gate(self, source, variant, readings, requested, alt_readings=()):
+    def _search_and_gate(self, source, variant, readings, requested, alt_readings=(),
+                         suggestion_candidates=None):
         """检索一个源的一个查询变体，并跑完三道门槛。
 
         返回 ``(可用候选, 歌名淘汰数, 歌手淘汰数, 版本淘汰数)``；
@@ -1683,6 +1909,8 @@ class Pipeline:
         index.note_search(source.name, text, found=bool(tracks),
                           seconds=time.monotonic() - started)
         tracks = [t for t in tracks if t.title or t.url]
+        if suggestion_candidates is not None and len(suggestion_candidates) < 256:
+            suggestion_candidates.extend(tracks[:256 - len(suggestion_candidates)])
         if not tracks:
             self._log(f"  · [{source.label}] 无结果")
             return [], 0, 0, 0
@@ -1690,12 +1918,15 @@ class Pipeline:
         # 人工补链：用户显式给的链接，跳过歌名/歌手门槛（下载仍会做完整校验）
         if getattr(source, "trusted_links", False):
             self._log(f"  · [{source.label}] 使用你提供的链接（已跳过歌名/歌手门槛）")
-            return tracks, 0, 0, 0
+            kept = [self._bind_recording(t, requested) for t in tracks
+                    if recording_version_ok(t, requested)]
+            return kept, 0, 0, len(tracks) - len(kept)
 
         dropped_ver = 0
         # 强制过滤：排除伴奏 / 纯器乐 / 现场 / 改编版（除非用户在文件名里点名要）
-        if not requested:
-            originals, dropped = split_originals(tracks)
+        if tracks:
+            originals = [t for t in tracks if recording_version_ok(t, requested)]
+            dropped = [(t, track_version_markers(t)) for t in tracks if t not in originals]
             if dropped:
                 dropped_ver = len(dropped)
                 sample = "、".join(f"“{t.title}”" for t, _m in dropped[:3])
@@ -1710,6 +1941,7 @@ class Pipeline:
         off_artist: "list[Track]" = []
         off_title: "list[Track]" = []
         fuzzy_hits = 0
+        required_artist = getattr(readings, "required_artist", "")
         for cand in tracks:
             ok, _reading, ts, as_ = best_reading_match(
                 readings, cand, min_title=MIN_TITLE_SIMILARITY,
@@ -1724,8 +1956,15 @@ class Pipeline:
                 if ok2:
                     ok, ts, as_ = ok2, ts2, as2
                     fuzzy_hits += 1
+            # Enforce the original explicit artist independently of every
+            # alternate/typo reading. Do this after title scoring so unrelated
+            # titles still receive the correct no-result classification.
+            if required_artist and (
+                    normalize_for_version(cand.artist) in ARTIST_UNKNOWN
+                    or artist_match_score([("", required_artist)], cand) < MIN_ARTIST_SIMILARITY):
+                ok, as_ = False, 0.0
             if ok:
-                kept.append(cand)
+                kept.append(self._bind_recording(cand, requested))
             elif ts >= MIN_TITLE_SIMILARITY and as_ < MIN_ARTIST_SIMILARITY:
                 off_artist.append(cand)
             else:
@@ -1741,6 +1980,7 @@ class Pipeline:
                       + "、".join(f"“{c.title}”" for c in off_title[:3]))
         if not kept:
             self._log(f"  · [{source.label}] 没有歌名与歌手同时匹配的版本")
+        kept = filter_title_alias_ambiguity(readings, kept)
         return kept, len(off_title), len(off_artist), dropped_ver
 
     def _probe_durations(self, tracks: "list[Track]") -> None:
@@ -1778,7 +2018,12 @@ class Pipeline:
                     break
                 resolves -= 1
                 try:
-                    adapter.resolve(track, quality=self.settings.quality)
+                    requested = self._requested_recording(track)
+                    resolved = adapter.resolve(track, quality=self.settings.quality)
+                    if resolved is not track:
+                        track.__dict__.update(resolved.__dict__)
+                    self._bind_recording(track, requested)
+                    self._guard_recording(track, requested)
                 except MusicDecryptorError as exc:
                     self._log(f"    - [{track.source}] “{track.title}” 时长探测失败：{exc.message}")
                     continue
@@ -1803,7 +2048,12 @@ class Pipeline:
                     if adapter is None:
                         continue
                     try:
-                        adapter.resolve(track, quality=self.settings.quality)
+                        requested = self._requested_recording(track)
+                        resolved = adapter.resolve(track, quality=self.settings.quality)
+                        if resolved is not track:
+                            track.__dict__.update(resolved.__dict__)
+                        self._bind_recording(track, requested)
+                        self._guard_recording(track, requested)
                     except MusicDecryptorError as exc:
                         self._log(f"    - [{track.source}] “{track.title}” 时长探测失败：{exc.message}")
                         continue

@@ -5,7 +5,7 @@ small, ordered list of variants.  Every variant carries the reason it exists,
 so the log can say which phrasing actually hit.
 
 P4（2026-10-22）追加：
-* **日语形态**：罗马音 → 片假名读音；纯假名 → 片假名形 / 罗马音。实测（2026-10-22）：
+* **日语形态**：罗马音 → 平/片假名；词表与唯一词典读音可补查书写原名。实测（2026-10-22）：
   酷狗对片假名读音有索引（「グレンゲ→紅蓮華」「センボンザクラ→千本桜」「ヨルシカ」
   均可命中），罗马音则对艺术家字段有效（yorushika / kenshi yonezu）。
 * **纠错候选**：模糊输入（邻键/换位/中文混淆字）纠错后的写法，排在常规变体之后，
@@ -44,8 +44,8 @@ def expand(query: str, readings: "Sequence[tuple[str, str]]" = (), *,
 
     顺序（越靠前越优先；每个源首轮消费前 2 个，全部无果才启用第二轮）：
 
-    1. ``原样``       用户/文件名的原文
-    2. ``日语形态``   歌手名读音 / 片假名读音 / 罗马音（有则插在最前，价值最高）
+    1. ``有依据的原名`` 表内原名 / 唯一词典书写形 / 精确简称（避免原样同音结果截断后续）
+    2. ``原样/日语形态`` 用户原文及分别扩展的歌名、歌手平/片假名
     3. ``去噪``       括号/质量标签去掉后的写法
     4. ``歌名 歌手``  读法里第一组"两个字段都全"的组合
     5. ``仅歌名``     只有歌名的写法（找回"歌手字段是空的"上传物）
@@ -65,34 +65,40 @@ def expand(query: str, readings: "Sequence[tuple[str, str]]" = (), *,
 
     add(query, "原样")
 
-    # 日语形态：先「歌手名字段」（拿回整张歌手页），再整条读音。
-    # 收紧（2026-10-22）：① 歌手名读音里若已有内置表认识的写法，就**只留认识的**
-    # （避免「半个标题」被当成歌手名去搜）；② 整条读音形超过 16 字基本无命中，直接省掉。
-    artist_items: "list[tuple[str, str]]" = []
-    for _t, artist in readings:
-        if (artist or "").strip():
-            kana = jp.artist_katakana(artist)
-            if kana:
-                artist_items.append((kana, "日文歌手名读音"))
-    known_artists = [(v, r) for v, r in artist_items if jp.known_kind(v)]
-    artist_items = known_artists or artist_items[:1]
-    jp_items: "list[tuple[str, str]]" = list(artist_items)
-    for value, reason in jp.search_variants(query):
-        # 拼接出的长串（多段空格/超过 16 字）命中率极低，直接省掉请求
-        if len(value) <= 16 and value.count(" ") <= 1:
-            jp_items.append((value, reason))
-    jp_items.sort(key=lambda item: (0 if jp.known_kind(item[0]) else 1, -len(item[0])))
-    inserted = 0
-    jp_seen: set[str] = set()
+    # Expand fields independently. A composed query is not a Japanese word:
+    # converting it as one string loses dictionary evidence and field identity.
+    # Still at most four requests/source (two existing sweeps); the first four
+    # slots prioritize originals, verified kanji, hiragana and katakana.
+    jp_items: "list[tuple[str, str]]" = []
+    orthographic_items: "list[tuple[str, str]]" = []
+    for title, artist in list(readings)[:2] or [(query, "")]:
+        titles = jp.search_variants(title, kind="song") if title else []
+        artists = jp.search_variants(artist, kind="artist") if artist else []
+        if artist:
+            preferred_artist = next((value for value, reason in artists
+                                     if reason == "表内原名"), "")
+            if not preferred_artist:
+                preferred_artist = next((value for value, reason in artists
+                                         if "平假名" in reason), artist)
+            for value, reason in titles:
+                jp_items.append((f"{value} {preferred_artist}", reason))
+            for value, reason in artists:
+                jp_items.append((" ".join(x for x in (title, value) if x), reason))
+        else:
+            jp_items.extend(titles)
+    if (not jp.has_kana(query) and not re.search(r"[A-Za-z]", query)
+            and len(query) > 1 and not jp.title_aliases(query)):
+        # Ordinary Chinese queries keep their existing cheap field order.
+        orthographic_items = [item for item in jp_items if item[1] == "汉字书写形"]
+        jp_items = [item for item in jp_items if item[1] != "汉字书写形"]
+    # Fallback for legacy callers without parsed fields.
+    if not jp_items and not readings:
+        jp_items.extend(jp.search_variants(query))
     for value, reason in jp_items:
-        key = normalize_for_version(value)
-        if not key or key in jp_seen or key in seen:
-            continue
-        jp_seen.add(key)
-        add(value, reason)
-        inserted += 1
-        if inserted >= 2:
+        if len(variants) >= MAX_PER_SOURCE * 2:
             break
+        if len(value) <= 100:
+            add(value, reason)
 
     # 纠错候选：只在「看起来是错字」（词表判据）时**提前**进入；
     # 干净查询干脆不掺入（省请求）；含较长拉丁词的查询保留在后位（罗马音拼错用）。
@@ -112,10 +118,18 @@ def expand(query: str, readings: "Sequence[tuple[str, str]]" = (), *,
     for title in [t for t, _a in readings if (t or "").strip()]:
         add(title, "仅歌名")
 
+    for value, reason in orthographic_items:
+        add(value, reason)
+
     if not early and corrections and _LATIN_TOKEN.search(query or ""):
         for idx, value in enumerate(corrections):
             add(value, "纠错候选" if idx == 0 else "纠错候选2")
 
     for artist in [a for _t, a in readings if (a or "").strip()]:
         add(artist, "仅歌手")
+    # A raw romaji homonym can already return unrelated Latin-titled tracks.
+    # Since the pipeline stops on a successful variant, attested written forms
+    # must be queried first, not left unreachable behind that success.
+    priority = {"表内原名", "词典原名", "表内简称原名"}
+    variants.sort(key=lambda v: 0 if v.reason in priority else 1)
     return variants[: max(1, limit)]

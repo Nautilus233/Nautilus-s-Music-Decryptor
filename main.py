@@ -208,7 +208,8 @@ def main(argv=None) -> int:
         QTimer.singleShot(3000, app.quit)
         app.exec()
         print("worker lifecycle: OK（若进程退出码非 0，说明线程收尾有问题）")
-        return 0
+        from ui.task_selfcheck import run as check_name_tasks
+        return 1 if check_name_tasks(app) else 0
     if args.check_transcode:
         _ensure_utf8_console()
         import io
@@ -263,6 +264,57 @@ def main(argv=None) -> int:
             and alternate("幻灯") == "幻燈" and alternate("发") == "发")
         gentou = local_album_alias("幻灯", "yorushika")
         _ck("album alias table", gentou is not None and gentou.titles[0] == "幻燈")
+        # Verify both writing systems and new lookup tables in the frozen bundle.
+        from mmusic.match import best_reading_match
+        from mmusic.model import Track
+        from mmusic.pipeline import Pipeline
+        from mmusic.search.query import expand
+        fish_variants = {value for value, _reason in jp.search_variants("sakana")}
+        _ck("romaji -> dictionary / hiragana / katakana",
+            {"魚", "さかな", "サカナ"} <= fish_variants, str(fish_variants))
+        _ck("fish orthography and verified reading",
+            bool(set(jp.match_forms("sakana")) & set(jp.match_forms("魚")))
+            and bool(set(jp.match_forms("鱼")) & set(jp.match_forms("魚"))))
+        _seed, readings, query, _requested = Pipeline._seed_for("sakana", "atarayo")
+        _ck("both kana forms reachable inside request budget",
+            any("さかな" in v.text for v in expand(query, readings)[:4])
+            and any("サカナ" in v.text for v in expand(query, readings)[:4]))
+        _ck("attested written query precedes raw homonyms",
+            expand(query, readings)[0].text == "魚 あたらよ")
+        ranked = Pipeline._rank_rematch_candidates(
+            [Track("test", "鱼", "あたらよ", ext="mp3"),
+             Track("test", "魚", "あたらよ", ext="flac")],
+            [("sakana", "atarayo")], [], set())
+        _ck("rematch uses returned ranking", bool(ranked) and ranked[0].title == "魚")
+        _ck("curated short title table bundled",
+            ("だから僕は音楽を辞めた", "ヨルシカ") in jp.title_aliases("音辞"))
+        for title in ("魚", "", "tayori"):
+            _seed, readings, _query, _requested = Pipeline._seed_for(title, "atarayo")
+            _ck("explicit artist cannot become song: " + repr(title),
+                not best_reading_match(readings, Track("test", "atarayo", "tayori"),
+                                       min_title=.6, min_artist=.6)[0])
+        for translated, original in (("卖春", "春ひさぎ"), ("说吧", "言って。"),
+                                     ("所以我放弃了音乐", "だから僕は音楽を辞めた")):
+            readings = Pipeline._seed_for(translated, "yorushika")[1]
+            _ck("verified translated title: " + translated,
+                best_reading_match(readings, Track("test", original, "ヨルシカ"),
+                                   min_title=.6, min_artist=.6)[0])
+            _ck("translation cannot cross performer: " + translated,
+                not best_reading_match(readings, Track("test", original, "Other Performer"),
+                                       min_title=.6, min_artist=.6)[0])
+        readings = Pipeline._seed_for("卖春", "yorushika")[1]
+        _ck("API query echo cannot prove a title alias",
+            not best_reading_match(readings, Track("test", "又三郎", "ヨルシカ",
+                                                   raw={"highlightStr": ["卖春", "yorushika"]}),
+                                   min_title=.6, min_artist=.6)[0])
+        from mmusic.suggestions import query_suggestions
+        _ck("near misses provide offline suggestions only",
+            query_suggestions([("Unfamiliar Long Melody", "yorushika")],
+                              [Track("test", "Unfamiliar Long Melodi", "ヨルシカ")])
+            == ["Unfamiliar Long Melodi（ヨルシカ）"])
+        _ck("short translated names do not use edit distance",
+            not query_suggestions([("卖花", "yorushika")],
+                                  [Track("test", "春ひさぎ", "ヨルシカ", raw={"alias": ["卖春"]})]))
         failed = [name for name, good, _extra in checks if not good]
         for name, good, extra in checks:
             print(("OK  " if good else "FAIL") + f" {name}" + (f"  {extra}" if extra and not good else ""))

@@ -6,6 +6,7 @@ import math
 import re
 import unicodedata
 from difflib import SequenceMatcher
+from itertools import islice
 from typing import Sequence
 
 from . import jp
@@ -24,7 +25,8 @@ __all__ = ["ARTIST_UNKNOWN", "artist_match_score", "best_reading_match",
            "rank_tracks", "rank_tracks_multi", "reading_scores",
            "title_match_score",
            "similarity", "split_originals", "tokenize",
-           "track_version_markers", "version_markers"]
+           "track_version_markers", "version_markers", "album_version_markers",
+           "recording_version_ok", "title_alias_evidence", "filter_title_alias_ambiguity"]
 
 # noise that streaming platforms sprinkle into filenames
 _BRACKET_NOISE = re.compile(r"[\[(（【][^\[\]()（）【】]*[\]）】)]")
@@ -110,6 +112,11 @@ _BLOCK_WORDS = frozenset({
     "抖音", "鬼畜", "恶搞", "教学", "教程", "弹唱", "混剪", "混搭",
     "cctv",                      # 「稻香 (2018 CCTV-15 …)」这类电视节目版
     "伴奏", "片段", "电台", "电视", "铃声", "彩铃",
+    # Japanese qualifiers are whole tokens, never arbitrary substrings of a
+    # legitimate song title (e.g. ライブのあとで remains a normal title).
+    "ライブ", "ライヴ", "カバー", "インスト", "インストゥルメンタル",
+    "アコースティック", "リミックス", "オフボーカル", "オフヴォーカル", "ピアノ",
+    "ライブ版", "ライヴ版", "カバー版", "ライブバージョン", "ライヴバージョン",
 })
 # 明确的原曲标记 —— 同曲多版本时用于"录音室版优先"
 _ORIGINAL_WORDS = frozenset({
@@ -119,8 +126,78 @@ _SEP_NORM = re.compile(r"[._\-+/\\|,:;!?\"'\u201c\u201d\u2018\u2019()\[\]{}<>\u0
 _BRACKET = re.compile(r"[\[(\uff08\u3010]")
 _RAW_NAME_KEYS = frozenset({
     "name", "title", "songname", "song_name", "filename", "file",
-    "filehashname", "tags", "tag", "text",
+    "filehashname", "tags", "tag", "text", "suffix", "songnamesuffix", "subtitle",
 })
+_RAW_ALBUM_KEYS = frozenset({"album", "albums", "albumname", "albumtitle", "albuminfo",
+                            "al", "专辑", "唱片集"})
+_LIVE_CONTEXT = re.compile(
+    r"(?<![a-z])live(?:\s*(?:版本|版|录音|錄音|专辑|專輯)"
+    r"|\s+(?:at|in|from|on|album|recording|version|tour|concert|ver\b)\b"
+    r"|\s+\d{4}(?:\b|年)|\s+vol\.?\s*\d|\s*[「『【(\[]|\s*$)"
+    r"|(?:^|[\[(【])\s*live\s*[)\]】]"
+    r"|演唱会|演唱會|现场(?:录音|錄音|版|专辑|專輯)|現場(?:錄音|版|專輯)"
+    r"|ライブ(?:盤|版|アルバム|音源|録音)|ライヴ(?:盤|版|アルバム|音源|録音)"
+    r"|(?:^|[\s「『【(\[])ライ[ブヴ](?=$|[\s「『」』】)\]\d])"
+    r"|(?:^|[\s「『【(\[])(?:现场|現場)(?=$|[\s「『」』】)\]])", re.IGNORECASE)
+
+
+def album_version_markers(text: str) -> set[str]:
+    """Album names need recording context, not ordinary title words like Alive.
+
+    In particular Live Through This and Live and Let Die are album titles,
+    whereas LIVE「月光」, Live at Wembley and (Live) identify a recording.
+    """
+    norm = unicodedata.normalize("NFKC", text or "").casefold()
+    hits = {"live"} if _LIVE_CONTEXT.search(norm) else set()
+    for word in ("伴奏", "カラオケ", "instrumental", "karaoke", "remix album",
+                 "翻唱专辑", "翻唱專輯", "カバーアルバム"):
+        if (word in norm if not word.isascii() else
+                re.search(r"(?<![a-z])" + re.escape(word) + r"(?![a-z])", norm)):
+            hits.add(word)
+    return hits
+
+
+def _recording_fields(raw):
+    """Walk only named metadata containers; never scan URLs, artists or lyrics."""
+    remaining = 128
+    stack = [(raw, 0, False)]
+    while stack and remaining:
+        obj, depth, in_album = stack.pop()
+        remaining -= 1
+        if depth > 4:
+            continue
+        if isinstance(obj, dict):
+            for key, value in list(obj.items())[:64]:
+                key = re.sub(r"[_\s-]", "", str(key).casefold())
+                album = key in _RAW_ALBUM_KEYS or (in_album and key in {"name", "title"})
+                if isinstance(value, str):
+                    if album:
+                        yield True, value
+                    elif not in_album and key in _RAW_NAME_KEYS:
+                        yield False, value
+                elif isinstance(value, (dict, list, tuple)) and (album or key in {
+                        "metadata", "meta", "tags", "tag", "song", "track", "data",
+                        "songinfo", "trackinfo", "recordingtags", "transparam"}):
+                    stack.append((value, depth + 1, album))
+        elif isinstance(obj, (list, tuple)):
+            for value in obj[:32]:
+                if isinstance(value, str) and in_album:
+                    yield True, value
+                elif isinstance(value, dict):
+                    stack.append((value, depth + 1, in_album))
+
+
+def _recording_identity(markers):
+    live = {"live", "concert", "现场", "現場", "演唱会", "演唱會", "巡演",
+            "ライブ", "ライヴ", "ライブ版", "ライヴ版", "ライブバージョン", "ライヴバージョン"}
+    return {"live" if m in live else m for m in markers}
+
+
+def recording_version_ok(track: Track, requested=()) -> bool:
+    """Do not mix requested recordings, even if their durations are close."""
+    actual = _recording_identity(track_version_markers(track))
+    wanted = _recording_identity(requested)
+    return actual == wanted
 
 
 def normalize_for_version(text: str) -> str:
@@ -137,7 +214,8 @@ def version_markers(text: str) -> "set[str]":
         return set()
     tokens = set(norm.split())
     hits = {w for w in _BLOCK_WORDS if w in tokens}
-    hits |= {p for p in _BLOCK_SUBSTRINGS if p in norm}
+    hits |= {p for p in _BLOCK_SUBSTRINGS if p in norm and
+             (not p[0].isascii() or re.search(r"(?<![a-z0-9])" + re.escape(p), norm))}
     return hits
 
 
@@ -172,14 +250,10 @@ def has_extra_qualifier(wanted: str, candidate: str) -> bool:
 
 
 def track_version_markers(track: Track) -> "set[str]":
-    """歌曲名/文件名/标签一类字段里命中的版本标记合集。"""
-    fields = [track.title]
-    for key, value in (track.raw or {}).items():
-        if isinstance(value, str) and str(key).casefold() in _RAW_NAME_KEYS:
-            fields.append(value)
-    hits: "set[str]" = set()
-    for field in fields:
-        hits |= version_markers(field)
+    """Recording identity across title, album and bounded source metadata."""
+    hits = version_markers(track.title) | album_version_markers(track.album)
+    for album, value in _recording_fields(track.raw or {}):
+        hits |= album_version_markers(value) if album else version_markers(value)
     return hits
 
 
@@ -507,7 +581,7 @@ def cross_similarity(a: str, b: str) -> float:
     只做确定性转换（假名/罗马音/内置表读音）：查不到读音的一侧不参与，
     因此不会凭空放大相似度。中文对中文等场景与 :func:`similarity` 完全一致。
     """
-    base = similarity(a, b)
+    base = max(similarity(a, b), similarity(jp.fold_written(a), jp.fold_written(b)))
     if not (jp.has_kana(a) or jp.has_kana(b) or _ascii_ish(a) or _ascii_ish(b)):
         return base
     try:
@@ -526,7 +600,10 @@ def cross_similarity(a: str, b: str) -> float:
 
 
 def _score_one(title: str, artist: str, track: Track, duration: int, prefer_ext: str) -> float:
-    score = 0.72 * cross_similarity(title, track.title) + 0.28 * cross_similarity(artist, track.artist)
+    verified_alias = _verified_title_alias(title, artist, track)
+    title_score = (1.0 if verified_alias
+                   else cross_similarity(title, track.title))
+    score = 0.72 * title_score + 0.28 * cross_similarity(artist, track.artist)
     if duration and track.duration:
         delta = abs(duration - track.duration)
         score += 0.12 * max(0.0, 1.0 - delta / 15.0)          # <=15s counts as a match
@@ -539,8 +616,13 @@ def _score_one(title: str, artist: str, track: Track, duration: int, prefer_ext:
     # 带多余修饰（括号/多词）的候选**扣分**，确保干净标题永远赢。
     if original_markers(track.title):
         score += 0.03
-    if has_extra_qualifier(title, track.title):
+    if not verified_alias and has_extra_qualifier(title, track.title):
         score -= 0.06
+    if verified_alias and cross_similarity(title, track.title) < _JP_STRICT_SIMILARITY:
+        # Alias identity is retrieval evidence, not an independent proof of
+        # recording length. In particular it must never create a >=.95 strong
+        # duration sample / early stop just by changing the title score.
+        score = min(score, .94)
     return score
 
 
@@ -559,6 +641,9 @@ def title_match_score(readings: "Sequence[tuple[str, str]]", track: Track) -> fl
     norm_title = normalize_for_version(_title_without_soundtrack_credit(track.title))
     best = 0.0
     for want, _artist in readings:
+        if _verified_title_alias(want, _artist, track):
+            best = max(best, 1.0)
+            continue
         wanted = normalize_for_version(_title_without_soundtrack_credit(want))
         if not wanted:
             continue
@@ -611,8 +696,19 @@ def _script_class(text: str) -> str:
     return "cjk" if cjk else ("latin" if latin else "")
 
 
+def _artist_text(text: str) -> str:
+    """Latin accents are writing variants; Japanese voicing marks remain intact."""
+    normalized = unicodedata.normalize("NFKC", text or "")
+    normalized = "".join(
+        "".join(c for c in unicodedata.normalize("NFD", ch)
+                if unicodedata.category(c) != "Mn")
+        if "LATIN" in unicodedata.name(ch, "") else ch
+        for ch in normalized)
+    return normalize_for_version(normalized)
+
+
 def _artist_tokens(text: str) -> set:
-    norm = normalize_for_version(text)
+    norm = _artist_text(text)
     return {p.strip() for p in _ARTIST_SEP.split(norm) if p and p.strip()}
 
 
@@ -628,7 +724,7 @@ def artist_match_score(readings: "Sequence[tuple[str, str]]", track: Track) -> f
     * 多歌手串里有同一个人（「周杰伦/费玉清」对「周杰伦」）-> 0.85
     * 其余按相似度打分；**不同演唱者的同名版本（翻唱）会得到接近 0 的分数**
     """
-    cand = normalize_for_version(track.artist)
+    cand = _artist_text(track.artist)
     if cand in ARTIST_UNKNOWN:
         return 1.0
     want_artists = [a for _t, a in readings if a and a.strip()]
@@ -640,7 +736,7 @@ def artist_match_score(readings: "Sequence[tuple[str, str]]", track: Track) -> f
     cand_script = _script_class(cand_norm)
     best = 0.0
     for artist in want_artists:
-        want = normalize_for_version(artist)
+        want = _artist_text(artist)
         if not want or want in ARTIST_UNKNOWN:
             continue
         if want == cand_norm:
@@ -653,7 +749,16 @@ def artist_match_score(readings: "Sequence[tuple[str, str]]", track: Track) -> f
         elif _artist_contains(cand_norm, want) or _artist_contains(want, cand_norm):
             best = max(best, 0.85)
         else:
-            best = max(best, cross_similarity(artist, track.artist))
+            fa = jp.match_forms(artist, kind="artist")
+            fb = jp.match_forms(track.artist, kind="artist")
+            if fa or fb:
+                # Reading identity has a much higher bar than general fuzzy
+                # text: atarayo/tayori share letters, but are different artists.
+                score = max((similarity(a, b) for a in fa for b in fb), default=0.0)
+                best = max(best, score if score >= _JP_STRICT_SIMILARITY else min(score, 0.59))
+            else:
+                best = max(best, max(similarity(artist, track.artist),
+                                     similarity(jp.fold_written(artist), jp.fold_written(track.artist))))
     return best
 
 
@@ -669,12 +774,16 @@ def title_gate_ok(want_title: str, want_artist: str, track: Track) -> bool:
 
     以前包含关系一律按 0.85 通过，于是一个歌名带 (R&B) 的改编版靠「包含」就过关。
     """
-    norm_want = normalize_for_version(_title_without_soundtrack_credit(want_title))
-    norm_cand = normalize_for_version(_title_without_soundtrack_credit(track.title))
+    norm_want = normalize_for_version(jp.fold_written(_title_without_soundtrack_credit(want_title)))
+    norm_cand = normalize_for_version(jp.fold_written(_title_without_soundtrack_credit(track.title)))
     if not norm_want or not norm_cand:
         return False
     if norm_want == norm_cand:
         return True
+    if _verified_title_alias(want_title, want_artist, track):
+        return True
+    if jp.title_aliases(want_title):
+        return False
     if norm_want not in norm_cand:
         return _jp_title_gate_ok(want_title, track.title, want_artist, track.artist)
     leftover = [tok for tok in norm_cand.replace(norm_want, " ").split() if tok]
@@ -684,6 +793,176 @@ def title_gate_ok(want_title: str, want_artist: str, track: Track) -> bool:
     if artist_tokens and all(any(tok in a or a in tok for a in artist_tokens) for tok in leftover):
         return True
     return _jp_title_gate_ok(want_title, track.title, want_artist, track.artist)
+
+
+_ALIAS_KEYS = frozenset({"alias", "aliases", "alia", "tns", "transnames",
+                         "transname", "translatedname", "translationname",
+                         "subtitle", "subtitles"})
+_TITLE_KEYS = frozenset({"name", "title", "songname", "orisongname", "originalname"})
+_ALIAS_BRACKET = re.compile(r"^(.*?)\s*[（(]([^()（）]{1,256})[)）]\s*$")
+
+
+def _metadata_key(value):
+    return re.sub(r"[_\s-]", "", str(value).casefold())
+
+
+def _alias_values(value):
+    if isinstance(value, str):
+        value = unicodedata.normalize("NFKC", value).strip()
+        if value.startswith("(") and value.endswith(")"):
+            value = value[1:-1].strip()
+        if value and len(value) <= 256:
+            yield value
+    elif isinstance(value, (list, tuple)):
+        for entry in value[:12]:
+            if isinstance(entry, str):
+                yield from _alias_values(entry)
+
+
+def _title_parts(text):
+    text = unicodedata.normalize("NFKC", text or "").strip()
+    found = _ALIAS_BRACKET.fullmatch(text)
+    return (found[1].strip(), found[2].strip()) if found else (text, "")
+
+
+def _bound_title(left, right):
+    if jp.title_alias_key(left) == jp.title_alias_key(right):
+        return bool(jp.title_alias_key(left))
+    # Binding may cross kana/romaji, but may not erase version qualifiers.
+    return (not _BRACKET.search(left) and not _BRACKET.search(right)
+            and not version_markers(left) and not version_markers(right)
+            and bool(set(jp.match_forms(left)) & set(jp.match_forms(right))))
+
+
+def title_alias_evidence(track: Track) -> tuple[str, ...]:
+    """Bounded whitelist of aliases attached to THIS API song record.
+
+    No recursive text mining: lyrics/tags, highlights, search-query echoes,
+    album/artist aliases and unrelated result objects cannot prove song identity.
+    Kugou suffixes/filename annotations additionally require a bound song name.
+    """
+    core, annotation = _title_parts(track.title)
+    out = []
+    stack = [(track.raw, 0, True)]
+    visited = 0
+    while stack and visited < 12 and len(out) < 24:
+        obj, depth, root = stack.pop()
+        visited += 1
+        if not isinstance(obj, dict) or depth > 2:
+            continue
+        fields = {_metadata_key(k): v for k, v in islice(obj.items(), 64)}
+        names = [v for k, v in fields.items() if k in _TITLE_KEYS and isinstance(v, str)]
+        bound = any(_bound_title(name, track.title) or _bound_title(name, core) for name in names)
+        if names and not bound:
+            continue
+        if root or bound:
+            for key in _ALIAS_KEYS:
+                for value in _alias_values(fields.get(key)):
+                    if value not in out:
+                        out.append(value)
+        if bound:
+            suffixes = [fields.get("suffix")]
+            trans = fields.get("transparam")
+            if isinstance(trans, dict):
+                suffixes.extend(v for k, v in islice(trans.items(), 16)
+                                if _metadata_key(k) == "songnamesuffix")
+            for item in suffixes:
+                for value in _alias_values(item):
+                    if value not in out:
+                        out.append(value)
+            filename = fields.get("filename")
+            if isinstance(filename, str) and len(filename) <= 512:
+                filename = re.sub(r"\.(?:mp3|flac|ogg|wav|m4a)$", "", filename, flags=re.I)
+                file_title, sep, possible_title = filename.rpartition(" - ")
+                if sep:
+                    if (normalize_for_version(track.artist) in ARTIST_UNKNOWN
+                            or artist_match_score([("", file_title)], track) < .999):
+                        possible_title = ""
+                else:
+                    possible_title = filename
+                file_core, file_alias = _title_parts(possible_title)
+                if file_alias and _bound_title(file_core, core) and file_alias not in out:
+                    out.append(file_alias)
+        for key in ("song", "songinfo", "track", "trackinfo", "metadata"):
+            child = fields.get(key)
+            if isinstance(child, dict):
+                stack.append((child, depth + 1, False))
+    return tuple(out[:24])
+
+
+def _local_title_member(track, original, performer):
+    if artist_match_score([("", performer)], track) < .999:
+        return False
+    names = [original] + [a for a, o, p, _ in jp.title_alias_records()
+                          if o == original and p == performer]
+    core, annotation = _title_parts(track.title)
+    def member(value):
+        # Only the original spelling has a verified reading. Reading an
+        # abbreviation/translation as Japanese could turn 音辞 into ネジ.
+        return (_bound_title(value, original)
+                or any(jp.title_alias_key(value) == jp.title_alias_key(n) for n in names))
+    if not member(track.title):
+        if not annotation or not member(core):
+            return False
+        if not any(jp.title_alias_similarity(annotation, n) == 1 for n in names):
+            return False
+    return True
+
+
+def _title_alias_strength(title: str, artist: str, track: Track) -> float:
+    if (normalize_for_version(track.artist) in ARTIST_UNKNOWN
+            or (artist and artist_match_score([("", artist)], track) < .999)
+            or not recording_version_ok(track, version_markers(title))):
+        return 0.0
+    local = jp.title_aliases(title)
+    if local:
+        for original, performer in local:
+            if _local_title_member(track, original, performer):
+                names = [original] + [a for a, o, p, _ in jp.title_alias_records()
+                                      if o == original and p == performer]
+                return max(jp.title_alias_similarity(title, name) for name in names)
+        # A known short name must not be reinterpreted by an unrelated API hit.
+        return 0.0
+    # Bidirectional API evidence: canonical title and explicit translated name
+    # form one identity. Never use an API's whole result list as title evidence.
+    aliases = title_alias_evidence(track)
+    core, annotation = _title_parts(track.title)
+    if annotation and not (
+            _bound_title(core, annotation)
+            or any(jp.title_alias_similarity(annotation, alias) == 1 for alias in aliases)):
+        return 0.0
+    strength = max((jp.title_alias_similarity(title, alias) for alias in aliases), default=0.0)
+    return strength if strength == 1 or artist else 0.0
+
+
+def _verified_title_alias(title: str, artist: str, track: Track) -> bool:
+    return bool(_title_alias_strength(title, artist, track))
+
+
+def filter_title_alias_ambiguity(readings, tracks):
+    """Reject approximate aliases pointing at different works; no blind top hit.
+
+    Exact matches remain available. Applied before per-source truncation and
+    after merging sources; the helper never changes Track.score or metadata.
+    """
+    ambiguous = set()
+    for title, artist in list(readings)[:4]:
+        works = {}
+        fuzzy_ids = set()
+        for track in tracks:
+            strength = _title_alias_strength(title, artist, track)
+            if not strength:
+                continue
+            local = jp.title_aliases(track.title)
+            identity = ((local[0][0], local[0][1]) if len(local) == 1 else
+                        (_title_parts(track.title)[0], track.artist))
+            key = tuple(jp.title_alias_key(v) for v in identity)
+            works.setdefault(key, []).append(id(track))
+            if strength < 1:
+                fuzzy_ids.add(id(track))
+        if len(works) > 1:
+            ambiguous.update(fuzzy_ids)
+    return [track for track in tracks if id(track) not in ambiguous]
 
 
 #: 跨书写系统「就是这首歌」的高相似兜底阈值（读音形态、空格/长音折叠后比对）。
@@ -699,9 +978,21 @@ def _jp_title_gate_ok(want_title: str, cand_title: str, want_artist: str,
     适用前提：至少一侧含假名、或至少一侧是纯拉丁（罗马音输入）。
     一侧读不出读音（表里没有的汉字）时不参与 —— 不猜。
     """
+    if version_markers(cand_title) - version_markers(want_title):
+        return False
     if not (jp.has_kana(want_title) or jp.has_kana(cand_title)
             or _ascii_ish(want_title) or _ascii_ish(cand_title)):
         return False
+    # Reading conversion drops brackets; never let that erase an unrequested
+    # version/qualifier. Only attested reading annotations may be ignored here.
+    annotated = _title_without_soundtrack_credit(cand_title)
+    brackets = list(_BRACKET_NOISE.finditer(annotated))
+    if brackets:
+        core = _BRACKET_NOISE.sub(" ", annotated).strip()
+        core_forms = set(jp.match_forms(core))
+        if any(not core_forms.intersection(jp.match_forms(m.group()[1:-1].strip()))
+               for m in brackets):
+            return False
     try:
         fa, fb = jp.match_forms(want_title), jp.match_forms(cand_title)
     except Exception:                                    # noqa: BLE001
@@ -762,7 +1053,9 @@ def best_reading_match(readings: "Sequence[tuple[str, str]]", track: Track, *,
         if not title_ok and strict_title and expected_album:
             title_ok = _album_supported_title(want_t, want_a, track,
                                              expected_album, reference_duration)
-        if title_ok and as_ >= min_artist:
+        known_artist = (not getattr(readings, "required_artist", "")
+                        or normalize_for_version(track.artist) not in ARTIST_UNKNOWN)
+        if title_ok and as_ >= min_artist and known_artist:
             if ts + as_ > best_ok_sum:
                 best_ok, best_ok_sum = pair, ts + as_
         if ts + as_ > best_any_sum:
@@ -819,9 +1112,16 @@ def rank_tracks_multi(readings: Sequence[tuple[str, str]], tracks: Sequence[Trac
                       *, duration: int = 0, prefer_ext: str = "") -> list[Track]:
     """Rank `tracks` by each track's *best* score across all filename readings."""
     readings = [r for r in readings if r[0] or r[1]] or [("", "")]
+    written = {normalize_for_version(value)
+               for title, _artist in readings if not jp.has_kanji(title)
+               for value in (jp.known_titles(title, kind="song") or jp.dictionary_spellings(title))}
     for t in tracks:
         t.score = round(max(_score_one(rt, ra, t, duration, prefer_ext) for rt, ra in readings), 4)
-    return sorted(tracks, key=lambda t: t.score, reverse=True)
+    # Retrieval preference is independent of confidence: Track.score also
+    # decides reference-duration sampling and must not receive spelling bonuses.
+    return sorted(tracks, key=lambda t: (
+        normalize_for_version(_title_without_soundtrack_credit(t.title)) in written,
+        t.score), reverse=True)
 
 
 def rank_tracks(query_title: str, query_artist: str, tracks: Sequence[Track],

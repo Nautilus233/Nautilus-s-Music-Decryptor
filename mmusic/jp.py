@@ -15,14 +15,18 @@ from __future__ import annotations
 import functools
 import re
 import unicodedata
+from difflib import SequenceMatcher
 
 from .paths import resource_path
+from .search.album_text import folded as fold_written, alternate as alternate_written
 
 __all__ = [
     "has_kana", "has_kanji", "hiraganize", "katakanaize",
     "romaji_to_kana", "kana_to_romaji", "looks_japanese",
     "match_forms", "reading_combos", "search_variants", "known_titles",
     "artist_katakana", "lookup_known", "known_kind",
+    "dictionary_spellings", "title_aliases", "title_alias_key",
+    "title_alias_similarity", "title_alias_records", "fold_written",
 ]
 
 _KANJI_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]")
@@ -75,11 +79,20 @@ _R2K_EXTRA = {
     "la": "ら", "li": "り", "lu": "る", "le": "れ", "lo": "ろ",
     "lya": "りゃ", "lyu": "りゅ", "lyo": "りょ",
     "xtu": "っ", "xtsu": "っ", "ltu": "っ", "ltsu": "っ",
+    "va": "ゔぁ", "vi": "ゔぃ", "ve": "ゔぇ", "vo": "ゔぉ",
+    "she": "しぇ", "che": "ちぇ", "je": "じぇ",
+    "thi": "てぃ", "dhi": "でぃ", "thu": "てゅ", "dhu": "でゅ",
+    "tsa": "つぁ", "tsi": "つぃ", "tse": "つぇ", "tso": "つぉ",
+    "kye": "きぇ", "gye": "ぎぇ", "nye": "にぇ", "hye": "ひぇ",
+    "bye": "びぇ", "pye": "ぴぇ", "mye": "みぇ", "rye": "りぇ",
+    "xa": "ぁ", "xi": "ぃ", "xu": "ぅ", "xe": "ぇ", "xo": "ぉ",
+    "xya": "ゃ", "xyu": "ゅ", "xyo": "ょ", "xwa": "ゎ",
 }
 _R2K: "dict[str, str]" = {}
 for _r, _k in _SYLLABLES:
     _R2K[_r] = _k
 _R2K.update(_R2K_EXTRA)
+_R2K_LENGTHS = tuple(sorted({len(key) for key in _R2K}, reverse=True))
 _K2R: "dict[str, str]" = {}
 for _r, _k in _SYLLABLES:
     _K2R.setdefault(_k, _r)
@@ -99,16 +112,19 @@ def has_kana(text: str) -> bool:
 
 
 def hiraganize(text: str) -> str:
-    return "".join(chr(ord(c) - 0x60) if 0x30A1 <= ord(c) <= 0x30F6 else c for c in (text or ""))
+    text = unicodedata.normalize("NFKC", text or "")
+    return "".join(chr(ord(c) - 0x60) if 0x30A1 <= ord(c) <= 0x30F6 else c for c in text)
 
 
 def katakanaize(text: str) -> str:
-    return "".join(chr(ord(c) + 0x60) if 0x3041 <= ord(c) <= 0x3096 else c for c in (text or ""))
+    text = unicodedata.normalize("NFKC", text or "")
+    return "".join(chr(ord(c) + 0x60) if 0x3041 <= ord(c) <= 0x3096 else c for c in text)
 
 
 def romaji_to_kana(text: str) -> "str | None":
     """ASCII 罗马音 → 平假名（确定性，多拼法兼容）。含无法映射字符时返回 None。"""
     s = unicodedata.normalize("NFKC", text or "").casefold().replace("\u2019", "'")
+    s = s.translate(str.maketrans({"ā": "aa", "ī": "ii", "ū": "uu", "ē": "ee", "ō": "ou"}))
     out: "list[str]" = []
     i, n = 0, len(s)
     while i < n:
@@ -123,6 +139,17 @@ def romaji_to_kana(text: str) -> "str | None":
         if ch in ".,!?;:()[]{}\"":
             i += 1
             continue
+        if ch == "n" and i + 1 < n:
+            nxt = s[i + 1]
+            if nxt == "'":
+                out.append("ん")
+                i += 2
+                continue
+            if nxt == "n":
+                out.append("ん")
+                # konnichiwa = kon + ni; terminal nn is a single moraic n.
+                i += 1 if i + 2 < n and s[i + 2] in "aeiouy" else 2
+                continue
         # 促音：双写辅音（n 与元音除外）；tch/cch 特例
         if i + 1 < n and ch == s[i + 1] and ch.isalpha() and ch not in "aeioun":
             out.append("っ")
@@ -132,7 +159,7 @@ def romaji_to_kana(text: str) -> "str | None":
             out.append("っ")
             i += 1
             continue
-        for length in (3, 2, 1):
+        for length in _R2K_LENGTHS:
             sub = s[i : i + length]
             kana = _R2K.get(sub)
             if kana:
@@ -298,7 +325,7 @@ _BRACKET_NOISE = re.compile(r"[\[(\uff08\u3010][^\[\]()\uff08\uff09\u3010\u3011]
 
 def _ascii_convertible(text: str) -> bool:
     t = unicodedata.normalize("NFKC", text or "").strip()
-    if len(t) < 2 or not re.fullmatch(r"[A-Za-z][A-Za-z' \-]*[A-Za-z]", t):
+    if len(t) < 2 or not re.fullmatch(r"[A-Za-zāīūēōĀĪŪĒŌ][A-Za-zāīūēōĀĪŪĒŌ' \-]*[A-Za-zāīūēōĀĪŪĒŌ]", t):
         return False
     return romaji_to_kana(t) is not None
 
@@ -320,10 +347,12 @@ def _kana_bare(text: str) -> str:
     return t.replace(" ", "").replace("\u3000", "")
 
 
-@functools.lru_cache(maxsize=1)
-def _known_index() -> "dict[str, tuple[str, str]]":
+@functools.lru_cache(maxsize=3)
+def _known_index(kind: str = "") -> "dict[str, tuple[str, str]]":
     idx: "dict[str, tuple[str, str]]" = {}
-    for name in ("jp_songs.tsv", "jp_artists.tsv"):
+    names = (("jp_artists.tsv",) if kind == "artist" else
+             ("jp_songs.tsv",) if kind == "song" else ("jp_songs.tsv", "jp_artists.tsv"))
+    for name in names:
         for parts in _read_rows(name):
             if len(parts) < 2:
                 continue
@@ -389,7 +418,7 @@ def lookup_known(text: str) -> "str | None":
     return None
 
 
-def known_titles(text: str) -> "list[str]":
+def known_titles(text: str, *, kind: str = "") -> "list[str]":
     """罗马音/假名输入 → 内置表里的**书写形**（原名）。
 
     为什么需要（2026-10-23 用户实测）：四平台的专辑检索都按**书写形**索引，读音形
@@ -398,7 +427,7 @@ def known_titles(text: str) -> "list[str]":
         `dakarabokuha ongakuwo yameta` → `[だから僕は音楽を辞めた]`
         `ただきみにはれ`（平假名读音）→ `[ただ君に晴れ]`
     """
-    idx = _known_index()
+    idx = _known_index(kind)
     out: "list[str]" = []
     for key in _known_keys(text):
         entry = idx.get(key)
@@ -415,9 +444,89 @@ def known_kind(text: str) -> "str | None":
     for table, kind in ((_artists(), "artist"), (_songs(), "song")):
         if _key(t) in table or _key(hiraganize(t)) in table:
             return kind
-    if lookup_known(t):
-        return "artist"
+    for kind in ("artist", "song"):
+        if any(key in _known_index(kind) for key in _known_keys(t)):
+            return kind
     return None
+
+
+@functools.lru_cache(maxsize=128)
+def dictionary_spellings(text: str) -> "tuple[str, ...]":
+    """Exact JMdict reading lookup, not a kanji pronunciation guess.
+
+    Only a single orthographic family is returned. Ambiguous homophones (e.g.
+    hana: 花/鼻/華/…) produce no kanji query, leaving kana search available.
+    Scan the already loaded table once per reading; avoid a large reverse map.
+    """
+    kana = romaji_to_kana(text) if _ascii_convertible(text) else hiraganize(text)
+    if not kana or has_kanji(kana) or " " in kana or not 2 <= len(kana) <= 16:
+        return ()
+    families: "dict[str, str]" = {}
+    for written, readings in _words().items():
+        if kana in readings:
+            families.setdefault(fold_written(written), written)
+            if len(families) > 1:
+                return ()
+    return tuple(families.values())
+
+
+@functools.lru_cache(maxsize=1)
+def title_alias_records() -> "tuple[tuple[str, str, str, str], ...]":
+    """Attested (translation/abbreviation, original, performer, provenance).
+
+    The fourth column is optional for the legacy abbreviation table. These
+    are work identities, not a general-purpose machine translation dictionary.
+    """
+    return tuple((p[0], p[1], p[2], p[3] if len(p) > 3 else "legacy curated")
+                 for p in _read_rows("jp_title_aliases.tsv")[:1024]
+                 if len(p) >= 3 and all(p[:3]))
+
+
+def title_alias_key(text: str) -> str:
+    """Fold punctuation/spacing and attested script forms, never delete words."""
+    if not isinstance(text, str) or len(text) > 256:
+        return ""
+    norm = unicodedata.normalize("NFKC", fold_written(text or "")).casefold()
+    return "".join(ch for ch in norm if unicodedata.category(ch)[0] in "LN")
+
+
+def title_alias_similarity(left: str, right: str) -> float:
+    """Exact short aliases; bounded near-exact tolerance for long translations."""
+    a, b = title_alias_key(left), title_alias_key(right)
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    if min(len(a), len(b)) < 6 or abs(len(a) - len(b)) > 2:
+        return 0.0
+    if min(len(a), len(b)) / max(len(a), len(b)) < .85:
+        return 0.0
+    ratio = SequenceMatcher(None, a, b, autojunk=False).ratio()
+    return ratio if ratio >= .92 else 0.0
+
+
+@functools.lru_cache(maxsize=1)
+def _title_alias_table() -> "dict[str, tuple[tuple[str, str], ...]]":
+    rows: "dict[str, list[tuple[str, str]]]" = {}
+    for alias, original, artist, _source in title_alias_records():
+        for value in (alias, original):
+            row = (original, artist)
+            values = rows.setdefault(title_alias_key(value), [])
+            if row not in values:
+                values.append(row)
+    return {key: tuple(values[:4]) for key, values in rows.items()}
+
+
+@functools.lru_cache(maxsize=4096)
+def title_aliases(text: str) -> "tuple[tuple[str, str], ...]":
+    """Attested names → originals, with no fuzzy choice between distinct works."""
+    key = title_alias_key(text)
+    exact = _title_alias_table().get(key, ())
+    if exact:
+        return exact
+    possible = {row for alias, rows in _title_alias_table().items()
+                if title_alias_similarity(key, alias) for row in rows}
+    return tuple(possible) if len(possible) == 1 else ()
 
 
 # --------------------------------------------------------------------------- #
@@ -453,6 +562,11 @@ def _reading_combos_cached(text: str, limit: int) -> "tuple[tuple[str, ...], ...
         if hit is not None:
             return hit
         t = stripped
+    # Prefer the source spelling; use an unambiguous alternate only if the
+    # source word is absent (魚/鱼, 楽/樂/乐 etc.). Do not rewrite output tags.
+    if has_kanji(t):
+        t = "".join(alternate_written(ch) if ch not in _words()
+                    and alternate_written(ch) in _words() else ch for ch in t)
     words = _words()
     maxkey = _words_maxkey()
     segments: "list[list[str]]" = []
@@ -505,11 +619,34 @@ def _reading_combos_cached(text: str, limit: int) -> "tuple[tuple[str, ...], ...
     return tuple(combos[:limit])
 
 
-def match_forms(text: str) -> "tuple[str, ...]":
+def match_forms(text: str, *, kind: str = "") -> "tuple[str, ...]":
     """供相似度比对的确定性形态（罗马音折叠形）。无日文内容 / 无法转换时为空。"""
     if not text:
         return ()
+    if kind == "artist":
+        return _artist_match_forms_cached(_key(text))
     return _match_forms_cached(_key(text))
+
+
+@functools.lru_cache(maxsize=512)
+def _artist_match_forms_cached(t: str) -> "tuple[str, ...]":
+    # Personal-name kanji readings must come from the artist table, not a song
+    # title table or a dictionary's ordinary word pronunciation.
+    reading = _artists().get(_key(t)) or _artists().get(_key(hiraganize(t)))
+    if reading:
+        roman = kana_to_romaji(reading)
+    elif has_kanji(t):
+        return ()
+    elif has_kana(t):
+        roman = kana_to_romaji(t)
+    elif _ascii_convertible(t):
+        roman = kana_to_romaji(romaji_to_kana(t) or "")
+    else:
+        return ()
+    if not roman:
+        return ()
+    c = _collapse(roman)
+    return tuple(dict.fromkeys((c.replace(" ", ""), c, " ".join(sorted(c.split())))))
 
 
 @functools.lru_cache(maxsize=4096)
@@ -551,14 +688,15 @@ def _match_forms_cached(t: str) -> "tuple[str, ...]":
 # --------------------------------------------------------------------------- #
 # 检索变体 / 歌手名形态
 # --------------------------------------------------------------------------- #
-def search_variants(text: str) -> "list[tuple[str, str]]":
+def search_variants(text: str, *, kind: str = "") -> "list[tuple[str, str]]":
     """为检索生成「同一首歌的另一种文字形态」，按价值排序（不含原样）。
 
-    * 含假名/汉字混合 → 整条读音的**片假名**形；
-    * 纯假名 → 内置表的**书写形**（如 `ただきみにはれ`→`ただ君に晴れ`）＋片假名形＋罗马音；
+    * 含假名/汉字混合 → 有词表证据的片假名/平假名读音；
+    * 纯假名 → 表内原名、无歧义词典原名、平/片假名及罗马音；
     * 纯罗马音 → 内置表的**书写形**优先（`dakarabokuha ongakuwo yameta`→`だから僕は音楽を辞めた`），
-      表外才退回片假名读音形；
-    * 纯汉字 → 不生成（可能是中文，不做迷信转换）。
+      表外优先尝试唯一词典词面，然后平/片假名读音；
+    * 汉字 → 有依据的书写形或精确简称原名，不根据汉字猜读；
+    * kind='artist' 不反查普通词/歌曲词表，避免把曲名当作歌手别名。
     """
     t = _key(text)
     if not t:
@@ -571,25 +709,62 @@ def search_variants(text: str) -> "list[tuple[str, str]]":
             seen.add(value)
             out.append((value, reason))
 
+    if kind != "artist":
+        for title, _artist in title_aliases(t):
+            add(title, "表内简称原名")
+        # Original → official translations helps sources indexing only a
+        # localized name. The matching layer still requires the table's artist.
+        groups = set(title_aliases(t))
+        for alias, original, artist, _source in title_alias_records():
+            if (original, artist) in groups:
+                add(alias, "表内译名")
+                if len(out) >= 4:
+                    break
+    if has_kanji(t):
+        simplified = fold_written(t)
+        # OpenCC's reverse character map is not a word dictionary: 曲→麯 is
+        # inappropriate for 夜曲. Only reverse a missing source character to
+        # an attested Japanese word; forward folding remains exact evidence.
+        alternate = (simplified if simplified != t else "".join(
+            alternate_written(ch) if ch not in _words()
+            and alternate_written(ch) in _words() else ch for ch in t))
+        add(alternate, "汉字书写形")
+
     if has_kana(t):
         if has_kanji(t):
-            combos = reading_combos(t, limit=1)
+            artist_reading = _artists().get(_key(t)) if kind == "artist" else None
+            combos = (((artist_reading,),) if artist_reading else ()) if kind == "artist" else reading_combos(t, limit=1)
             if combos:
                 add(katakanaize("".join(combos[0])), "日文片假名读音")
+                add(hiraganize("".join(combos[0])), "日文平假名读音")
         else:
             # 纯假名：若这是内置表里的**读音**，先给"书写形"（汉字原名可直接检索）
-            for title in known_titles(t):
+            for title in known_titles(t, kind=kind):
                 add(title, "表内原名")
             h = hiraganize(t)
+            if not known_titles(t, kind=kind) and kind != "artist":
+                for title in dictionary_spellings(h):
+                    add(title, "词典原名")
             add(katakanaize(h), "片假名形")
             add(kana_to_romaji(h), "罗马音")
+            add(h, "平假名形")
     elif not has_kanji(t) and _ascii_convertible(t):
         # 罗马音：内置表里的**书写形**优先（读音形平台检索不到，2026-10-23 实测修复）
-        for title in known_titles(t):
+        written = known_titles(t, kind=kind)
+        for title in written:
             add(title, "表内原名")
-        known = lookup_known(t)
+        if not written and kind != "artist":
+            for title in dictionary_spellings(t):
+                add(title, "词典原名")
+        # A song reading must never become an artist alias.
+        known = (lookup_known(t) if not kind or written else None)
         kana = known if known else romaji_to_kana(t)
+        # A hiragana performer name (atarayo → あたらよ) is a useful first
+        # fallback; named table originals stay first for existing callers.
+        if kind == "artist":
+            add(hiraganize(kana or ""), "日文平假名读音")
         add(katakanaize(kana or ""), "日文片假名读音")
+        add(hiraganize(kana or ""), "日文平假名读音")
     return out
 
 
@@ -601,17 +776,14 @@ def artist_katakana(text: str) -> "str | None":
     if has_kana(t):
         return katakanaize(hiraganize(t))
     if has_kanji(t) and not has_kana(t):
-        for table in (_artists(), _songs()):
+        for table in (_artists(),):
             hit = table.get(_key(t)) or table.get(_key(hiraganize(t)))
             if hit:
                 return katakanaize(hit)
     if not has_kanji(t) and _ascii_convertible(t):
-        known = lookup_known(t)
+        known = lookup_known(t) if known_titles(t, kind="artist") else None
         if known:
             return katakanaize(known)
         kana = romaji_to_kana(t)
         return katakanaize(kana) if kana else None
-    combos = reading_combos(t, limit=1)
-    if combos:
-        return katakanaize(" ".join(combos[0]))
     return None

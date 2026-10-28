@@ -47,6 +47,7 @@ class NameSearchDialog(QDialog):
         self._on_sync = on_sync
         self._fitted = False
         self._worker = None
+        self._pending_done = None
         self._retired: "list" = []
         self._rows: "dict[str, int]" = {}
         self._candidates: "list" = []
@@ -81,16 +82,16 @@ class NameSearchDialog(QDialog):
         form.addRow("歌手", self.artist)
         root.addLayout(form)
 
-        opts = QHBoxLayout()
+        # Keep the old mode interface for callers/selfchecks. Both workflows now
+        # have a visible button; a checkbox is no longer needed to discover them.
         self.chk_auto = QCheckBox("自动选择并下载")
-        self.chk_auto.setToolTip("取消勾选后，先搜索第一首歌的可用结果，由你选一条下载。")
+        self.chk_auto.setParent(self)
         self.chk_auto.setChecked(True)
-        opts.addWidget(self.chk_auto)
-        opts.addStretch(1)
-        mode_help = QLabel("取消勾选可先搜索，再手动选择")
+        self.chk_auto.hide()
+        mode_help = QLabel("先搜索查看结果并选择下载，或自动匹配下载（支持每行一首）。")
+        mode_help.setWordWrap(True)
         mode_help.setProperty("role", "muted")
-        opts.addWidget(mode_help)
-        root.addLayout(opts)
+        root.addWidget(mode_help)
         save_row = QHBoxLayout()
         save_row.addWidget(QLabel("保存位置"))
         save_row.addStretch(1)
@@ -119,16 +120,19 @@ class NameSearchDialog(QDialog):
         root.addWidget(self.table, 3)
 
         act = QHBoxLayout()
-        self.btn_start = QPushButton("搜索并下载")
-        self.btn_start.setProperty("role", "primary")
+        self.btn_search = QPushButton("搜索歌曲")
+        self.btn_search.setProperty("role", "primary")
+        self.btn_search.setToolTip("只搜索第一首歌并列出可下载结果，不下载音频。")
+        self.btn_start = QPushButton("自动搜索并下载")
         self.btn_stop = QPushButton("停止")
         self.btn_stop.setEnabled(False)
         self.btn_pick = QPushButton("下载选中")
         self.btn_pick.setToolTip("直接下载你选中的这一条（不再重新检索；仍做校验与完整度门禁）")
         self.btn_pick.setEnabled(False)
+        act.addWidget(self.btn_search)
+        act.addWidget(self.btn_pick)
         act.addWidget(self.btn_start)
         act.addWidget(self.btn_stop)
-        act.addWidget(self.btn_pick)
         act.addStretch(1)
         self.status = QLabel("就绪")
         self.status.setProperty("role", "muted")
@@ -156,6 +160,7 @@ class NameSearchDialog(QDialog):
         root.addWidget(box)
 
         self.btn_start.clicked.connect(self.start)
+        self.btn_search.clicked.connect(self.search)
         self.btn_stop.clicked.connect(self.stop)
         self.btn_pick.clicked.connect(self.download_selected)
         self.btn_out_dir.clicked.connect(self._pick_out_dir)
@@ -163,6 +168,9 @@ class NameSearchDialog(QDialog):
         self.btn_open_out.clicked.connect(self._open_out_dir)
         self.chk_auto.toggled.connect(self._on_mode_toggled)
         self.chk_detail.toggled.connect(self._on_detail_toggled)
+        self.table.itemSelectionChanged.connect(self._update_actions)
+        self.names.textChanged.connect(self._invalidate_candidates)
+        self.artist.textChanged.connect(self._invalidate_candidates)
         self._refresh_out_hint()
 
     # ---------------- 生命周期 ---------------- #
@@ -174,31 +182,31 @@ class NameSearchDialog(QDialog):
                          center_on=self.parentWidget())
 
     def closeEvent(self, event) -> None:  # noqa: N802
-        # 与主窗口同一条纪律：关窗前有界等待线程收尾，绝不让线程活过窗口/进程
-        pending = [w for w in ([self._worker] + list(self._retired)) if w is not None]
-        for w in pending:
-            try:
-                w.cancel()
-                if w.isRunning():
-                    w.wait(5000)
-            except Exception:  # noqa: BLE001
-                pass
-        for w in pending:
-            self._release_worker(w)
-        self._worker = None
+        if self._worker is not None:
+            event.ignore()
+            self.done(QDialog.DialogCode.Rejected)
+            return
         super().closeEvent(event)
+
+    def done(self, result) -> None:
+        # Escape / titlebar close / Return all use this asynchronous drain.
+        # Keep the dialog and QThread alive until finished; never GUI wait().
+        if self._worker is not None:
+            self._pending_done = result
+            self.stop()
+            return
+        super().done(result)
 
     def _retire_worker(self, worker) -> None:
         if worker is None:
             return
-        self._worker = None
-        try:
-            worker.finished.connect(lambda w=worker: self._release_worker(w))
-            self._retired.append(worker)
-        except Exception:  # noqa: BLE001
-            pass
+        if self._worker is worker:
+            self._worker = None
+        self._release_worker(worker)
 
     def _release_worker(self, worker) -> None:
+        if worker.isRunning():
+            return
         try:
             if worker in self._retired:
                 self._retired.remove(worker)
@@ -263,11 +271,29 @@ class NameSearchDialog(QDialog):
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
     def _on_mode_toggled(self, auto: bool) -> None:
-        self.btn_start.setText("搜索并下载" if auto else "搜索歌曲")
-        self.btn_pick.setEnabled(not auto and bool(self._candidates))
-        if not auto:
-            self._log("· 已切换为「先列出候选」：会逐条解析直链（不下载音频），"
-                      "**下不了的候选不列出**；选中一条再点「下载选中」", "detail")
+        self.btn_start.setText("自动搜索并下载" if auto else "搜索歌曲")
+        self._update_actions()
+
+    def _update_actions(self) -> None:
+        idle = self._worker is None
+        self.btn_search.setEnabled(idle)
+        self.btn_start.setEnabled(idle)
+        self.btn_pick.setEnabled(idle and 0 <= self.table.currentRow() < len(self._candidates))
+        for widget in (self.names, self.artist, self.chk_auto, self.btn_out_dir,
+                       self.btn_follow_main):
+            widget.setEnabled(idle)
+
+    def _invalidate_candidates(self) -> None:
+        self._candidates = []
+        self._candidate_reference = None
+        self._pick_row = -1
+        self.table.setRowCount(0)
+        self._rows.clear()
+        self._update_actions()
+
+    def _accept_worker_signal(self) -> bool:
+        sender = self.sender()
+        return sender is None or (sender is self._worker and not sender.cancel_requested)
 
     def _on_detail_toggled(self, checked: bool) -> None:
         if checked:
@@ -311,7 +337,15 @@ class NameSearchDialog(QDialog):
 
     # ---------------- 跑任务 ---------------- #
     def start(self) -> None:
-        if self._worker is not None and self._worker.isRunning():
+        self._begin(NameSearchWorker.MODE_AUTO if self.chk_auto.isChecked()
+                    else NameSearchWorker.MODE_LIST)
+
+    def search(self) -> None:
+        """Always list first, independent of the legacy auto-mode checkbox."""
+        self._begin(NameSearchWorker.MODE_LIST)
+
+    def _begin(self, mode) -> None:
+        if self._worker is not None:
             return
         if self._on_sync is not None:
             try:
@@ -324,7 +358,8 @@ class NameSearchDialog(QDialog):
             self.status.setText("请先填歌名")
             return
         artist = self.artist.text().strip()
-        if not self.chk_auto.isChecked():
+        self._invalidate_candidates()
+        if mode == NameSearchWorker.MODE_LIST:
             self._start_worker(NameSearchWorker(self.settings, cache_path=self.config.cache_path,
                                                 mode=NameSearchWorker.MODE_LIST,
                                                 query=names[0], artist=artist, parent=self))
@@ -337,6 +372,8 @@ class NameSearchDialog(QDialog):
                                             items=items, parent=self))
 
     def download_selected(self) -> None:
+        if self._worker is not None:
+            return
         row = self.table.currentRow()
         if row < 0 or row >= len(self._candidates):
             self.status.setText("请先在列表里选一条")
@@ -355,22 +392,52 @@ class NameSearchDialog(QDialog):
     def stop(self) -> None:
         if self._worker is not None:
             self._worker.cancel()
+            self.btn_stop.setEnabled(False)
             self.status.setText("正在停止…")
 
     def _start_worker(self, worker) -> None:
         self._worker = worker
-        worker.logged.connect(self._log)
+        worker.logged.connect(self._on_worker_log)
         worker.progressed.connect(self._on_progress)
         worker.file_done.connect(self._on_file_done)
         worker.completed.connect(self._on_completed)
         worker.failed.connect(self._on_failed)
         worker.candidates.connect(self._on_candidates)
-        self.btn_start.setEnabled(False)
+        worker.cancelled.connect(self._on_cancelled)
+        worker.finished.connect(self._on_worker_finished)
+        self._update_actions()
         self.btn_stop.setEnabled(True)
         self.status.setText("运行中…")
         worker.start()
 
+    def _on_worker_log(self, message, level) -> None:
+        if self._accept_worker_signal():
+            self._log(message, level)
+
+    def _on_cancelled(self) -> None:
+        if self.sender() is not self._worker:
+            return
+        self.status.setText("已停止")
+        self._mark_picked("已停止")
+        self._pick_row = -1
+        self._log("⛔ 已停止")
+
+    def _on_worker_finished(self) -> None:
+        worker = self.sender()
+        if worker is not self._worker:
+            return
+        if worker.cancel_requested and self.status.text() != "已停止":
+            self._on_cancelled()          # also covers cancel during final cleanup
+        self._retire_worker(worker)
+        self.btn_stop.setEnabled(False)
+        self._update_actions()
+        if self._pending_done is not None:
+            result, self._pending_done = self._pending_done, None
+            super().done(result)
+
     def _on_candidates(self, query: str, tracks, reference=None) -> None:
+        if not self._accept_worker_signal():
+            return
         self._candidates = list(tracks)
         self._candidate_reference = reference
         self.table.setRowCount(0)
@@ -389,12 +456,19 @@ class NameSearchDialog(QDialog):
         self._log(f"· 已列出 {len(self._candidates)} 个**可下载**候选"
                   f"（已过硬门槛、已逐条解析直链、按匹配度排序{ref}）"
                   "；点「下载选中」＝直接下这一条（不再重搜）", "detail")
-        self.btn_pick.setEnabled(bool(self._candidates))
+        if self._candidates:
+            self.table.selectRow(0)
+            self.status.setText(f"找到 {len(self._candidates)} 条；选中后点击「下载选中」")
+        self._update_actions()
 
     def _on_progress(self, done: int, total: int) -> None:
+        if not self._accept_worker_signal():
+            return
         self.status.setText(f"进度 {done}/{total}")
 
     def _on_file_done(self, res) -> None:
+        if not self._accept_worker_signal():
+            return
         if self._pick_row >= 0 and str(res.path).startswith(SEARCH_PREFIX):
             self._mark_picked("已完成" if res.ok else "失败")
         else:
@@ -408,9 +482,10 @@ class NameSearchDialog(QDialog):
             self._set_row(f"cand:{self._pick_row}", tag)
 
     def _on_completed(self, results) -> None:
-        self._retire_worker(self._worker)
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
+        if not self._accept_worker_signal():
+            return
+        if self._worker is not None and self._worker.mode == NameSearchWorker.MODE_LIST:
+            return                      # keep the list count, not "success 0"
         ok = sum(1 for r in results if r.ok)
         fail = sum(1 for r in results if r.status == "failed")
         if self._pick_row >= 0 and results:
@@ -422,9 +497,8 @@ class NameSearchDialog(QDialog):
         self._pick_row = -1
 
     def _on_failed(self, message: str) -> None:
-        self._retire_worker(self._worker)
-        self.btn_start.setEnabled(True)
-        self.btn_stop.setEnabled(False)
+        if not self._accept_worker_signal():
+            return
         self.status.setText("失败（原因见日志；可换一条候选再试）")
         self._mark_picked("失败")
         self._log(f"❌ {message}")

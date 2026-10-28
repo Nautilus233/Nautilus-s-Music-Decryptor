@@ -198,6 +198,11 @@ def run(app, *, verbose: bool = True) -> int:
         check("dialog(以名找歌): 开始/停止/下载选中 一行不被截断",
               ns.btn_start.isVisible() and row_bottom <= ns.height(),
               f"row ends at y={row_bottom}, height={ns.height()}")
+        check("dialog(以名找歌): 独立搜索与点名下载入口可见且完整",
+              all(button.isVisible()
+                  and button.mapTo(ns, QPoint(0, 0)).x() + button.width() <= ns.width()
+                  and button.mapTo(ns, QPoint(0, 0)).y() + button.height() <= ns.height()
+                  for button in (ns.btn_search, ns.btn_pick, ns.btn_start, ns.btn_stop)))
         check("dialog(以名找歌): 候选表格可见且有可用高度",
               ns.table.isVisible() and ns.table.height() >= 60, f"table h={ns.table.height()}")
         check("dialog(以名找歌): 日志区可见",
