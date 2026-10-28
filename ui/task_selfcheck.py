@@ -91,6 +91,57 @@ def run(app) -> int:
         app.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         app.processEvents()
 
+        # Failed search -> structured suggestion -> explicit click -> list only.
+        # Do not let a source-only / frozen signal regression hide the hints.
+        from . import worker as worker_module
+
+        class HintSource(SearchSource):
+            name = label = "hint_fixture"
+            offline = True
+
+            def search(self, query, **kwargs):
+                return [Track(self.name, "Unfamiliar Long Melodi", "Test Artist",
+                              duration=60, ext="wav")]
+
+            def resolve(self, track, **kwargs):
+                track.url = (library / "Test Artist - Worker Test.wav").as_uri()
+                return track
+
+        real_pipeline = worker_module.Pipeline
+        worker_module.Pipeline = lambda settings, **kwargs: real_pipeline(
+            settings, sources=[HintSource(None)], **kwargs)
+        cfg.settings.search_output_dir = str(root / "hint-out")
+        hint_dialog = NameSearchDialog(cfg.settings, cfg)
+        try:
+            hint_dialog.show()
+            hint_dialog.names.setPlainText("Unfamiliar Long Melody")
+            hint_dialog.artist.setText("Test Artist")
+            hint_dialog.btn_search.click()
+            failed_search = until(lambda: hint_dialog._worker is None)
+            check("failed search: suggestion survives real queued worker signals",
+                  failed_search and hint_dialog._suggestion_choices == [
+                      ("Unfamiliar Long Melodi", "Test Artist")]
+                  and hint_dialog._suggestion_buttons[0].isEnabled()
+                  and not hint_dialog.btn_pick.isEnabled())
+            check("failed search: no nonexistent candidate/download prompt",
+                  hint_dialog.table.rowCount() == 0
+                  and "是否需要下载" not in hint_dialog.log.toPlainText()
+                  and "可换一条" not in hint_dialog.status.text())
+            if hint_dialog._suggestion_choices:
+                hint_dialog._suggestion_buttons[0].click()
+                searched = until(lambda: hint_dialog._worker is None)
+                check("suggestion click: fills exact fields and searches without downloading",
+                      searched and hint_dialog.names.toPlainText() == "Unfamiliar Long Melodi"
+                      and hint_dialog.artist.text() == "Test Artist"
+                      and len(hint_dialog._candidates) == 1
+                      and hint_dialog.btn_pick.isEnabled()
+                      and not (root / "hint-out").exists())
+        finally:
+            hint_dialog.close()
+            until(lambda: hint_dialog._worker is None)
+            worker_module.Pipeline = real_pipeline
+            hint_dialog.deleteLater()
+
         # Same title/artist, two different recordings: the concert duration
         # must never reject a complete studio file. Exercise the frozen core.
         studio_file = root / "studio.wav"

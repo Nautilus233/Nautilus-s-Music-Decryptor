@@ -13,10 +13,39 @@ from __future__ import annotations
 
 import functools
 import unicodedata
+from itertools import islice
 
 from .paths import resource_path
 
-__all__ = ["corrections_for", "corrected_readings", "looks_typo"]
+__all__ = ["corrections_for", "corrected_readings", "looks_typo", "suggestion_queries"]
+
+
+def suggestion_queries(readings, limit=2):
+    """Attested CJK deletion queries for FAILED-search hints only.
+
+    Never feeds corrected_readings or audio acceptance. At most two identities,
+    bounded to short CJK titles and existing vocabulary; no guessed insertion,
+    translation or artist change. A real catalog response is still required.
+    """
+    if not isinstance(limit, int) or limit <= 0:
+        return []
+    words = _words()
+    output = []
+    for title, artist in islice(readings or (), 8):
+        text = unicodedata.normalize("NFKC", title or "").strip()
+        if not 3 <= len(text) <= 8 or not all("\u4e00" <= c <= "\u9fff" for c in text):
+            continue
+        if text in words:
+            continue
+        choices = {text[:i] + text[i+1:] for i in range(len(text))}
+        ranked = sorted((v for v in choices if v in words), key=lambda v: (-words[v], v))
+        for value in ranked:
+            query = " ".join(p for p in (value, artist) if p).strip()
+            if query not in output:
+                output.append(query)
+            if len(output) >= min(limit, 2):
+                return output
+    return output
 
 _KEYBOARD = {
     "q": "wa", "w": "qeas", "e": "wrsd", "r": "etdf", "t": "ryfg",

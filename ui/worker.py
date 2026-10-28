@@ -73,6 +73,7 @@ class NameSearchWorker(QThread):
     completed = Signal(list)
     failed = Signal(str)
     candidates = Signal(str, object, object)   # (查询标签, list[Track], 跨平台参考时长)
+    suggestions = Signal(object)             # list[(真实歌名, 歌手)], search-only, never download URLs
     cancelled = Signal()
 
     MODE_AUTO, MODE_LIST, MODE_PICK = "auto", "list", "pick"
@@ -104,7 +105,7 @@ class NameSearchWorker(QThread):
             pipe = Pipeline(self.settings, cache_path=self.cache_path,
                             on_log=make_log_sink(self.logged),
                             on_progress=self.progressed.emit,
-                            on_file=self.file_done.emit)
+                            on_file=self._emit_file)
             self._pipe = pipe
             # cancel() may run while Pipeline is being constructed.
             if self.cancel_requested:
@@ -133,6 +134,7 @@ class NameSearchWorker(QThread):
             if self.cancel_requested:
                 self.cancelled.emit()
             else:
+                self.suggestions.emit(list(getattr(exc, "suggestions", ())))
                 self.failed.emit(str(exc))
         finally:
             try:
@@ -140,6 +142,13 @@ class NameSearchWorker(QThread):
                     pipe.close()
             finally:
                 self._pipe = None
+
+    def _emit_file(self, result) -> None:
+        if self.cancel_requested:
+            return
+        if result.status == "failed":
+            self.suggestions.emit(list(getattr(result, "suggestions", ())))
+        self.file_done.emit(result)
 
     def cancel(self) -> None:
         self._cancel_requested.set()

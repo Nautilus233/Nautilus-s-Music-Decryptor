@@ -13,10 +13,12 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QDialog,
                                QDialogButtonBox, QFileDialog, QFormLayout, QHBoxLayout,
                                QLabel, QLineEdit, QPlainTextEdit, QPushButton,
-                               QTableWidget, QTableWidgetItem, QVBoxLayout)
+                               QSizePolicy, QTableWidget, QTableWidgetItem, QVBoxLayout,
+                               QWidget)
 
 from mmusic.duration import format_seconds
 from mmusic.pipeline import SEARCH_PREFIX, default_search_dir
@@ -55,6 +57,7 @@ class NameSearchDialog(QDialog):
         self._pick_row = -1
         self._log_lines: "list[tuple[str, str]]" = []
         self._hidden_details = 0
+        self._suggestion_choices: list[tuple[str, str]] = []
 
         self.setWindowTitle("单曲下载")
         self.setMinimumSize(*MIN_SIZE)
@@ -119,6 +122,27 @@ class NameSearchDialog(QDialog):
         self.table.setAlternatingRowColors(True)
         root.addWidget(self.table, 3)
 
+        self._suggestion_area = QWidget()
+        suggestion_layout = QVBoxLayout(self._suggestion_area)
+        suggestion_layout.setContentsMargins(0, 0, 0, 0)
+        suggestion_layout.setSpacing(4)
+        suggestion_label = QLabel("可能想找的歌曲（点击重新搜索，不会直接下载）")
+        suggestion_label.setTextFormat(Qt.TextFormat.PlainText)
+        suggestion_label.setWordWrap(True)
+        suggestion_layout.addWidget(suggestion_label)
+        suggestion_row = QHBoxLayout()
+        self._suggestion_buttons: list[QPushButton] = []
+        for i in range(3):
+            button = QPushButton()
+            button.setAutoDefault(False)
+            button.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+            button.clicked.connect(lambda _checked=False, index=i: self._search_suggestion(index))
+            suggestion_row.addWidget(button)
+            self._suggestion_buttons.append(button)
+        suggestion_layout.addLayout(suggestion_row)
+        root.addWidget(self._suggestion_area)
+        self._suggestion_area.hide()
+
         act = QHBoxLayout()
         self.btn_search = QPushButton("搜索歌曲")
         self.btn_search.setProperty("role", "primary")
@@ -136,6 +160,8 @@ class NameSearchDialog(QDialog):
         act.addStretch(1)
         self.status = QLabel("就绪")
         self.status.setProperty("role", "muted")
+        self.status.setWordWrap(True)
+        self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
         act.addWidget(self.status)
         root.addLayout(act)
 
@@ -279,17 +305,73 @@ class NameSearchDialog(QDialog):
         self.btn_search.setEnabled(idle)
         self.btn_start.setEnabled(idle)
         self.btn_pick.setEnabled(idle and 0 <= self.table.currentRow() < len(self._candidates))
+        for i, button in enumerate(self._suggestion_buttons):
+            button.setEnabled(idle and i < len(self._suggestion_choices))
         for widget in (self.names, self.artist, self.chk_auto, self.btn_out_dir,
                        self.btn_follow_main):
             widget.setEnabled(idle)
 
     def _invalidate_candidates(self) -> None:
+        self._clear_suggestions()
         self._candidates = []
         self._candidate_reference = None
         self._pick_row = -1
         self.table.setRowCount(0)
         self._rows.clear()
+        if self._worker is None:
+            self.status.setText("就绪")
         self._update_actions()
+
+    def _clear_suggestions(self) -> None:
+        self._suggestion_choices.clear()
+        self._suggestion_area.hide()
+        for button in self._suggestion_buttons:
+            button.setText("")
+            button.setToolTip("")
+            button.setEnabled(False)
+            button.hide()
+
+    def _on_suggestions(self, suggestions) -> None:
+        if not self._accept_worker_signal():
+            return
+        self._clear_suggestions()
+        for item in suggestions or ():
+            if not isinstance(item, (tuple, list)) or len(item) != 2:
+                continue
+            title, artist = item
+            if not isinstance(title, str) or not title.strip() or not isinstance(artist, str):
+                continue
+            if (title, artist) not in self._suggestion_choices:
+                self._suggestion_choices.append((title, artist))
+            if len(self._suggestion_choices) == 3:
+                break
+        for button, (title, artist) in zip(self._suggestion_buttons, self._suggestion_choices):
+            # QPushButton is plain text, but '&' otherwise creates a mnemonic.
+            button.setText((title + (f"\n{artist}" if artist else "")).replace("&", "&&"))
+            # Force a plain tooltip, including literal markup in metadata.
+            button.setToolTip("<qt>" + self._suggestion_tooltip(title, artist) + "</qt>")
+            button.show()
+        self._suggestion_area.setVisible(bool(self._suggestion_choices))
+        self._update_actions()
+        if self._suggestion_choices:
+            names = "；".join(title + (f"（{artist}）" if artist else "")
+                             for title, artist in self._suggestion_choices)
+            self._log(f"你可能想找的歌是：{names}？")
+
+    @staticmethod
+    def _suggestion_tooltip(title: str, artist: str) -> str:
+        from html import escape
+        return escape(f"重新搜索：{title}" + (f"（{artist}）" if artist else "")
+                      + "；仅列出候选，不会直接下载。")
+
+    def _search_suggestion(self, index: int) -> None:
+        if self._worker is not None or not 0 <= index < len(self._suggestion_choices):
+            return
+        title, artist = self._suggestion_choices[index]
+        # Capture both values before textChanged clears the old suggestions.
+        self.names.setPlainText(title)
+        self.artist.setText(artist)
+        self.search()
 
     def _accept_worker_signal(self) -> bool:
         sender = self.sender()
@@ -312,9 +394,23 @@ class NameSearchDialog(QDialog):
             self.log_hint.setText(f"已折叠 {self._hidden_details} 行明细")
 
     def _log(self, message: str, level: str = "result") -> None:
+        # Suggestions are results even if a worker reports them as detail, or
+        # attaches them after a long diagnostic. Never truncate the suffix.
+        for marker in ("你可能想找的歌是：", "你可能想搜："):
+            pos = message.find(marker)
+            if pos >= 0:
+                if pos:
+                    self._log(message[:pos].rstrip(), level)
+                message, level = message[pos:], "result"
+                break
         self._log_lines.append((message, level))
         if len(self._log_lines) > 4000:
-            del self._log_lines[:len(self._log_lines) - 4000]
+            # Verbose diagnostics must not evict the current failure suggestion.
+            drop = next((i for i, (_, lv) in enumerate(self._log_lines)
+                         if lv != "result"), 0)
+            _, removed_level = self._log_lines.pop(drop)
+            if removed_level != "result" and not self.chk_detail.isChecked():
+                self._hidden_details -= 1
         if level == "result" or self.chk_detail.isChecked():
             self.log.appendPlainText(message)
         else:
@@ -359,6 +455,10 @@ class NameSearchDialog(QDialog):
             return
         artist = self.artist.text().strip()
         self._invalidate_candidates()
+        self._log_lines.clear()
+        self._hidden_details = 0
+        self.log.clear()
+        self._update_hint()
         if mode == NameSearchWorker.MODE_LIST:
             self._start_worker(NameSearchWorker(self.settings, cache_path=self.config.cache_path,
                                                 mode=NameSearchWorker.MODE_LIST,
@@ -376,7 +476,8 @@ class NameSearchDialog(QDialog):
             return
         row = self.table.currentRow()
         if row < 0 or row >= len(self._candidates):
-            self.status.setText("请先在列表里选一条")
+            self.status.setText("没有可下载的候选" if not self._candidates
+                                else "请先在列表里选一条")
             return
         self._pick_row = row
         track = self._candidates[row]
@@ -390,6 +491,7 @@ class NameSearchDialog(QDialog):
                                             parent=self))
 
     def stop(self) -> None:
+        self._clear_suggestions()
         if self._worker is not None:
             self._worker.cancel()
             self.btn_stop.setEnabled(False)
@@ -402,6 +504,7 @@ class NameSearchDialog(QDialog):
         worker.file_done.connect(self._on_file_done)
         worker.completed.connect(self._on_completed)
         worker.failed.connect(self._on_failed)
+        worker.suggestions.connect(self._on_suggestions)
         worker.candidates.connect(self._on_candidates)
         worker.cancelled.connect(self._on_cancelled)
         worker.finished.connect(self._on_worker_finished)
@@ -418,6 +521,7 @@ class NameSearchDialog(QDialog):
         if self.sender() is not self._worker:
             return
         self.status.setText("已停止")
+        self._clear_suggestions()
         self._mark_picked("已停止")
         self._pick_row = -1
         self._log("⛔ 已停止")
@@ -451,12 +555,14 @@ class NameSearchDialog(QDialog):
         ref = (f"，跨平台参考时长 {format_seconds(self._candidate_reference)}"
                if self._candidate_reference else "")
         if not self._candidates:
-            self._log("⚠ 没有可下载的候选：直链解析失败，或已全部被剔除（逐条原因见上方明细）")
+            self._clear_suggestions()
+            self._log("⚠ 没有可下载的候选")
             self.status.setText("没有可下载的候选")
-        self._log(f"· 已列出 {len(self._candidates)} 个**可下载**候选"
-                  f"（已过硬门槛、已逐条解析直链、按匹配度排序{ref}）"
-                  "；点「下载选中」＝直接下这一条（不再重搜）", "detail")
         if self._candidates:
+            self._clear_suggestions()
+            self._log(f"· 已列出 {len(self._candidates)} 个可下载候选"
+                      f"（已过硬门槛、已逐条解析直链、按匹配度排序{ref}）"
+                      "；点「下载选中」＝直接下这一条（不再重搜）", "detail")
             self.table.selectRow(0)
             self.status.setText(f"找到 {len(self._candidates)} 条；选中后点击「下载选中」")
         self._update_actions()
@@ -469,6 +575,8 @@ class NameSearchDialog(QDialog):
     def _on_file_done(self, res) -> None:
         if not self._accept_worker_signal():
             return
+        if res.ok:
+            self._clear_suggestions()
         if self._pick_row >= 0 and str(res.path).startswith(SEARCH_PREFIX):
             self._mark_picked("已完成" if res.ok else "失败")
         else:
@@ -491,15 +599,21 @@ class NameSearchDialog(QDialog):
         if self._pick_row >= 0 and results:
             # 「下载选中」走的是 completed（不是逐文件 file_done）→ 在这里把那一行标好
             self._mark_picked("已完成" if results[0].ok else "失败")
+            if results[0].ok:
+                self._clear_suggestions()
         skipped = sum(1 for r in results if r.status == "skipped")
         self.status.setText(f"完成：成功 {ok} · 跳过 {skipped} · 失败 {fail}"
                             if skipped else f"完成：成功 {ok} · 失败 {fail}")
+        if fail and self._pick_row >= 0 and len(self._candidates) > 1:
+            self.status.setText(self.status.text() + "；可换一条候选再试")
         self._pick_row = -1
 
     def _on_failed(self, message: str) -> None:
         if not self._accept_worker_signal():
             return
-        self.status.setText("失败（原因见日志；可换一条候选再试）")
+        self.status.setText("失败（原因见下载结果；可换一条候选再试）"
+                            if len(self._candidates) > 1
+                            else "失败（原因见下载结果）")
         self._mark_picked("失败")
         self._log(f"❌ {message}")
         self._pick_row = -1

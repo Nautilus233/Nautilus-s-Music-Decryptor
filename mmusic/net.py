@@ -199,6 +199,16 @@ class HttpClient:
             raise exc
 
     # ------------------------------------------------------------------ #
+    @contextmanager
+    def request_limits(self, *, timeout=3.0, retries=0):
+        """Thread-local limits for optional metadata work; restore on failure."""
+        previous = getattr(self._request_state, "limits", None)
+        self._request_state.limits = (timeout, retries)
+        try:
+            yield
+        finally:
+            self._request_state.limits = previous
+
     def _headers(self, extra: Optional[dict]) -> dict:
         h = dict(self.base_headers)
         if extra:
@@ -213,6 +223,9 @@ class HttpClient:
         (404/403/...) are returned so the caller can switch source."""
         attempts = self.retries if retries is None else retries
         to = self.timeout if timeout is None else timeout
+        limits = getattr(self._request_state, "limits", None)
+        if limits is not None:
+            to, attempts = min(to, limits[0]), min(attempts, limits[1])
         last: "Exception | None" = None
 
         for i in range(attempts + 1):

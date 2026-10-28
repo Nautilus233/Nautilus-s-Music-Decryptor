@@ -315,6 +315,15 @@ def main(argv=None) -> int:
         _ck("short translated names do not use edit distance",
             not query_suggestions([("卖花", "yorushika")],
                                   [Track("test", "春ひさぎ", "ヨルシカ", raw={"alias": ["卖春"]})]))
+        from mmusic.suggestions import query_suggestion_choices
+        _ck("short typo hint needs supporting catalog identities",
+            query_suggestion_choices([("夜曲子", "")], [
+                Track("test-a", "夜曲", "周杰伦"), Track("test-b", "夜曲", "周杰伦")])
+            == [("夜曲", "周杰伦")])
+        _ck("short suggestion cannot cross explicit performer",
+            not query_suggestion_choices([("夜曲子", "周杰伦")], [
+                Track("test-a", "夜曲", "Other Artist"),
+                Track("test-b", "夜曲", "Other Artist")]))
         failed = [name for name, good, _extra in checks if not good]
         for name, good, extra in checks:
             print(("OK  " if good else "FAIL") + f" {name}" + (f"  {extra}" if extra and not good else ""))

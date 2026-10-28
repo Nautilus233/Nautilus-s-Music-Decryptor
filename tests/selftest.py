@@ -1222,7 +1222,8 @@ def test_artist_gate() -> None:
         check("artist: with only a cover available, nothing is written",
               res2.status == "failed" and not produced, f"{res2.status} {produced}")
         check("artist: the failure says why",
-              "演唱者" in (res2.message or "") or "翻唱" in (res2.message or ""),
+              "歌手不符" in (res2.message or "") or "演唱者" in (res2.message or "")
+              or "翻唱" in (res2.message or ""),
               res2.message)
 
 

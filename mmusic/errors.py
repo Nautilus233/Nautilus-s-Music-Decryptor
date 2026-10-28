@@ -36,6 +36,12 @@ class NeedsOnlineError(MusicDecryptorError):
 class SearchNoResultError(MusicDecryptorError):
     """Every configured search source came back empty."""
 
+    def __init__(self, message: str, *, detail: str = "", suggestions=()) -> None:
+        super().__init__(message, detail=detail)
+        # Search identities only, never URLs or permission to download. Keep
+        # them separate from the human-facing message and accepted candidates.
+        self.suggestions = tuple(suggestions)[:3]
+
 
 class DownloadValidationError(MusicDecryptorError):
     """A downloaded file failed header / bitrate / size validation."""

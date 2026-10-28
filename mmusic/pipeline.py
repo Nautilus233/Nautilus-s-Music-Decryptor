@@ -18,6 +18,7 @@ import inspect
 import os
 import re
 import time
+from contextlib import nullcontext
 from itertools import chain, islice
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,7 +47,7 @@ from .match import (ARTIST_UNKNOWN, artist_match_score, best_reading_match, clea
 from .metadata import read_source_meta, write_tags
 from .model import AudioResult, Track
 from .net import HttpClient
-from .suggestions import query_suggestions
+from .suggestions import query_suggestion_choices
 from .search.fusion import (collapse_duplicates, dedupe_key,
                             mark_low_confidence)
 from .search.index import ResourceIndex
@@ -407,6 +408,7 @@ class JobResult:
     source: str = ""
     message: str = ""
     detail: str = ""
+    suggestions: tuple[tuple[str, str], ...] = ()  # failed-search identities, never download candidates
 
     @property
     def ok(self) -> bool:
@@ -1363,7 +1365,8 @@ class Pipeline:
                 # 失败也要有可读日志（结果级）：之前的批量以名找歌是静默失败
                 self._log(f"❌ {label}：{exc.message}", level="result")
                 res = JobResult(f"{SEARCH_PREFIX}{label}", label, "failed",
-                                message=exc.message, detail=exc.detail)
+                                message=exc.message, detail=exc.detail,
+                                suggestions=getattr(exc, "suggestions", ()))
             except Exception as exc:  # noqa: BLE001 - 一条失败不拖垮整批
                 self._log(f"❌ {label}：未预期的错误（{str(exc)[:120]}）", level="result")
                 res = JobResult(f"{SEARCH_PREFIX}{label}", label, "failed",
@@ -1404,6 +1407,8 @@ class Pipeline:
         pool: list[Track] = []          # 跨音源的"干净"候选池
         alias_observations: list[Track] = []
         suggestion_candidates: list[Track] = []
+        query_counts: dict[str, int] = {}
+        attempted: set[tuple[str, str]] = set()
         dropped_total = 0
         dropped_artist = 0
 
@@ -1447,6 +1452,8 @@ class Pipeline:
                     continue
                 kept: "list[Track]" = []
                 for variant in batch:
+                    query_counts[source.name] = query_counts.get(source.name, 0) + 1
+                    attempted.add((source.name, variant.text))
                     kept, off_title_n, off_artist_n, dropped_ver = self._search_and_gate(
                         source, variant, readings, requested, alt_readings=alt_readings,
                         suggestion_candidates=suggestion_candidates)
@@ -1483,18 +1490,53 @@ class Pipeline:
         unambiguous_ids = {id(t) for t in filter_title_alias_ambiguity(readings, alias_observations)}
         pool = [t for t in pool if id(t) in unambiguous_ids]
         if not pool:
-            hints = query_suggestions(readings, suggestion_candidates, requested=requested)
-            suffix = ("\n你可能想搜：" + "；".join(hints) + "。这些候选尚未通过下载校验。"
-                      if hints else "")
+            # Retrieval can return no close title at all for one extra CJK
+            # character. A tiny failure-only metadata rescue can expose an
+            # attested name for suggestions, never for acceptance/download.
+            choices = query_suggestion_choices(readings, suggestion_candidates, requested=requested)
+            rescue = fuzzy.suggestion_queries(readings) if not choices else []
+            rescue_budget = 2 if rescue else 0
+            for source in search_order:
+                if rescue_budget <= 0:
+                    break
+                if (source.name not in {"migu", "kugou", "kuwo", "aggregator"}
+                        or query_counts.get(source.name, 0) >= MAX_VARIANTS_PER_SOURCE * 2):
+                    continue
+                text = next((q for q in rescue if (source.name, q) not in attempted), "")
+                if not text:
+                    continue
+                self._check_cancelled()
+                rescue_budget -= 1
+                self._log(f"  · [{source.label}] 仅为检索建议补查「{text}」（不下载）")
+                try:
+                    client = getattr(source, "http", None)
+                    budget_context = (client.request_limits(timeout=3.0, retries=0)
+                                      if isinstance(client, HttpClient) else nullcontext())
+                    with budget_context:
+                        observed = source.search(text, quality=self.settings.quality, limit=8)
+                except CancelledError:
+                    raise
+                except MusicDecryptorError:
+                    continue
+                except Exception as exc:  # Optional metadata must never turn failure into a crash.
+                    self._log(f"  · [{source.label}] 建议补查已跳过（{type(exc).__name__}）")
+                    continue
+                suggestion_candidates.extend(observed[:max(0, 256 - len(suggestion_candidates))])
+            self._check_cancelled()
+            choices = query_suggestion_choices(readings, suggestion_candidates, requested=requested)
+            labels = [f"{title}（{artist}）" for title, artist in choices]
+            suffix = ("\n你可能想找的歌是：" + "；".join(labels) + "？"
+                      "\n以上仅为检索建议，尚未通过下载校验。" if choices else "")
             if dropped_artist:
                 raise SearchNoResultError(
-                    "未找到原曲：仅找到同名但演唱者不同的版本（翻唱/翻录），已全部排除。" + suffix,
-                    detail=f"已排除 {dropped_artist} 个歌手不符的候选")
+                    "未找到符合要求的歌曲，歌手不符的候选已排除。" + suffix,
+                    detail=f"已排除 {dropped_artist} 个歌手不符的候选", suggestions=choices)
             if dropped_total and not requested:
                 raise SearchNoResultError(
-                    "未找到原曲，当前仅有伴奏/改编版，请确认是否需要下载。" + suffix,
-                    detail=f"已排除 {dropped_total} 个伴奏/改编版本")
-            raise SearchNoResultError("搜索无结果，请检查网络或歌曲名" + suffix)
+                    "未找到符合要求的歌曲，伴奏、现场或其他非目标版本已排除。" + suffix,
+                    detail=f"已排除 {dropped_total} 个非目标录音版本", suggestions=choices)
+            raise SearchNoResultError("搜索无结果，请检查网络或歌曲名" + suffix,
+                                      suggestions=choices)
 
         # 跨音源择优：不再"第一个能用的音源就算"，而是所有音源一起比，分高者先下
         pool = rank_tracks_multi(readings, pool, prefer_ext=self.settings.quality)
@@ -1646,7 +1688,7 @@ class Pipeline:
         elif not verified:
             if shortened or too_short or short_meta or too_long:
                 note = "时长存疑"
-                self._log("  · ⚠ 可下载候选均短于参考时长，已按可疑版本处理")
+                self._log("  · ⚠ 部分候选时长与参考值不符，已按可疑资源处理")
             else:
                 note = "时长未比对"
                 self._log("  · 未能取得音频时长，本结果未做时长比对")
@@ -1666,7 +1708,7 @@ class Pipeline:
                 excluded = len(short_meta) + len(known_bad)
                 if excluded:
                     raise SearchNoResultError(
-                        "未找到原曲，当前仅有伴奏/改编版，请确认是否需要下载。",
+                        "候选均未通过时长或完整度校验，未下载任何文件。",
                         detail=f"已排除 {excluded} 个时长不符的候选（偏短/偏长）")
                 raise SearchNoResultError(
                     "候选音源均不可用（无版权/校验失败/反爬），请更换关键词或手动补全直链",
@@ -1880,7 +1922,8 @@ class Pipeline:
             raise
         except MusicDecryptorError as exc:
             self._log(f"❌ {name}：{exc}", level="result")
-            return JobResult(str(src), name, "failed", message=exc.message, detail=exc.detail)
+            return JobResult(str(src), name, "failed", message=exc.message, detail=exc.detail,
+                             suggestions=getattr(exc, "suggestions", ()))
 
     def _search_and_gate(self, source, variant, readings, requested, alt_readings=(),
                          suggestion_candidates=None):
